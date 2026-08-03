@@ -17,9 +17,9 @@ from alembic.script import ScriptDirectory
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app import __version__
+from app.contracts.canonical import canonical_bytes as canonical_contract_bytes
 from app.core.config import Role
 
-CANONICAL_SEPARATOR = (",", ":")
 MANIFEST_SCHEMA_VERSION = 1
 ManifestMode = Literal["draft", "release"]
 EVIDENCE_PLACEHOLDER = "not_generated"
@@ -157,10 +157,12 @@ def _sha256(data: bytes) -> str:
 
 
 def _canonical_payload(manifest: RuntimeBuildManifest | dict[str, Any]) -> dict[str, Any]:
-    if isinstance(manifest, RuntimeBuildManifest):
+    if type(manifest) is RuntimeBuildManifest:
         data = manifest.model_dump(mode="json")
-    else:
+    elif type(manifest) is dict:
         data = dict(manifest)
+    else:
+        raise TypeError("runtime build manifest must be an exact RuntimeBuildManifest or dict")
     data.pop("manifest_hash", None)
     return data
 
@@ -169,7 +171,7 @@ def canonical_bytes(manifest: RuntimeBuildManifest | dict[str, Any]) -> bytes:
     """Serialize a manifest without timestamps, paths, or non-deterministic whitespace."""
 
     payload = _canonical_payload(manifest)
-    return (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=CANONICAL_SEPARATOR) + "\n").encode()
+    return canonical_contract_bytes(payload, exclude_fields=("manifest_hash",))
 
 
 def _manifest_with_hash(payload: dict[str, Any]) -> dict[str, Any]:
@@ -193,9 +195,12 @@ def verify_manifest(
     """Verify schema and content hash; optionally raise a precise error for CLI use."""
 
     try:
-        parsed = (
-            manifest if isinstance(manifest, RuntimeBuildManifest) else RuntimeBuildManifest.model_validate(manifest)
-        )
+        if type(manifest) is RuntimeBuildManifest:
+            parsed = manifest
+        elif type(manifest) is dict:
+            parsed = RuntimeBuildManifest.model_validate(manifest)
+        else:
+            raise ManifestError("runtime build manifest must be an exact RuntimeBuildManifest or dict")
         if require_release:
             if parsed.source.dirty:
                 raise ManifestError(

@@ -14,7 +14,7 @@ verify:
 	uv run ruff check app scripts tests
 	uv run ruff format --check app scripts tests
 	uv run mypy .
-	uv run pytest tests -m "not integration" --cov=app --cov-branch --cov-report=term-missing --cov-fail-under=87.91 -ra
+	uv run pytest tests -m "not integration" --cov=app --cov-branch --cov-report=term-missing --cov-fail-under=91.84 -ra
 
 manifest-check:
 	mkdir -p $(EVIDENCE_DIR)
