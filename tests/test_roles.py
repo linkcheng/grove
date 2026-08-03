@@ -1,0 +1,28 @@
+from __future__ import annotations
+
+import pytest
+from app.roles import run_role_self_check
+
+
+@pytest.mark.parametrize("role", ["api", "runtime_worker", "projection_reconciliation", "offline_governance"])
+def test_role_self_check_returns_configuration_summary(monkeypatch: pytest.MonkeyPatch, role: str) -> None:
+    monkeypatch.setenv("GROVE_ROLE", role)
+    monkeypatch.setattr("app.roles.database_available", lambda _settings: True)
+    result = run_role_self_check()
+    assert result["role"] == role
+    assert result["status"] == "configured"
+    assert result["database"] == "postgresql"
+    assert result["database_status"] == "connected"
+
+
+def test_role_self_check_fails_before_start_for_bad_role(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GROVE_ROLE", "unknown")
+    with pytest.raises(ValueError):
+        run_role_self_check()
+
+
+def test_role_self_check_fails_when_database_credential_is_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GROVE_ROLE", "runtime_worker")
+    monkeypatch.setattr("app.roles.database_available", lambda _settings: False)
+    with pytest.raises(ValueError, match="database credential"):
+        run_role_self_check()

@@ -92,5 +92,35 @@ provenance。Core 不理解资产、SQL、单次读取或 partial/selection 策�
 当前尚未选择 Product MVP 的目标 Business Profile；Asset Risk 只是参考实现，不能
 被代码、配置或测试框架当作隐式默认值。
 
-仓库当前只包含架构设计；任何 Profile 是否可发布，以 `docs/90` 的 G0～G8、适用
-blocker 和不可变 `ImplementationAcceptanceRecord` 为准，不能由文档完成度推断。
+仓库包含架构设计与 WS-0 工程基线实现；任何 Profile 是否可发布，以 `docs/90` 的
+G0～G8、适用 blocker 和不可变 `ImplementationAcceptanceRecord` 为准，不能由文档或
+WS-0 完成度推断。
+
+## WS-0 工程基线开发
+
+WS-0 是可重复构建、迁移和启动的工程基线，不是 Core/Product release，也不实现
+Contract Spine 或任何业务 Profile。它使用 Python 3.12.12、uv、FastAPI、Pydantic
+v2、SQLAlchemy async、Alembic 和 PostgreSQL；Vue 前端留到 WS-4 契约稳定后。
+
+本地先准备 `pgvector-postgis:pg16` 镜像，然后运行：
+
+```bash
+uv sync --frozen
+make verify
+make manifest-check
+make integration
+make ci
+# clean checkout only: strict WS-0 exit evidence
+make release-check
+```
+
+Compose 固定项目名 `grove-ws0-test`，四个角色共用一个应用镜像但使用独立数据库
+凭据；API 提供 `/api/v1/health/live` 和 `/api/v1/health/ready`，其余角色只执行
+配置自检并退出，不使用空循环伪装工作进程。`ci-evidence/` 生成运行时 CycloneDX SBOM、
+真实迁移往返报告和带内容寻址引用的 canonical `RuntimeBuildManifest`，该目录被 git
+忽略。`make ci` 只代表开发检查；`make release-check` 还要求 clean source、完整
+CAS evidence 和严格 release gate。签名状态
+明确为 `not_configured`，DBOS capability 明确为 disabled。
+
+本地卷若出现 PostgreSQL collation 警告，不影响现有 WS-0 检查；正式 clean-room
+验收应使用全新的 `grove-ws0-test` volume，验收脚本不会删除既有数据。

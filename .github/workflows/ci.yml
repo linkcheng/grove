@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.24"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.12"
+      - name: Prepare PostgreSQL test image
+        run: bash scripts/prepare_ci_postgres_image.sh
+      - name: Run strict release check
+        run: make release-check
+      - name: Upload CI evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grove-ws0-evidence
+          path: ci-evidence

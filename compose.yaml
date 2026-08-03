@@ -1,0 +1,74 @@
+name: grove-ws0-test
+
+services:
+  db:
+    image: pgvector-postgis:pg16
+    environment:
+      POSTGRES_DB: grove
+      POSTGRES_USER: grove
+      POSTGRES_PASSWORD: grove
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U grove -d grove"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 3s
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - grove_ws0_pgdata:/var/lib/postgresql/data
+      - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/001-grove-roles.sql:ro
+
+  api:
+    build:
+      context: .
+    image: grove-ws0:local
+    environment:
+      GROVE_ROLE: api
+      GROVE_APP_ENV: integration
+      GROVE_DATABASE_URL: postgresql+psycopg://grove_api:grove_api_ws0@db:5432/grove
+      GROVE_APP_IMAGE_ID: grove-ws0:local
+      GROVE_POSTGRES_IMAGE_ID: pgvector-postgis:pg16
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ci-evidence:/app/ci-evidence
+
+  runtime-worker:
+    image: grove-ws0:local
+    environment:
+      GROVE_ROLE: runtime_worker
+      GROVE_APP_ENV: integration
+      GROVE_DATABASE_URL: postgresql+psycopg://grove_runtime:grove_runtime_ws0@db:5432/grove
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "app.main", "--role", "runtime_worker", "--self-check"]
+
+  projection-reconciliation:
+    image: grove-ws0:local
+    environment:
+      GROVE_ROLE: projection_reconciliation
+      GROVE_APP_ENV: integration
+      GROVE_DATABASE_URL: postgresql+psycopg://grove_projection:grove_projection_ws0@db:5432/grove
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "app.main", "--role", "projection_reconciliation", "--self-check"]
+
+  offline-governance:
+    image: grove-ws0:local
+    environment:
+      GROVE_ROLE: offline_governance
+      GROVE_APP_ENV: integration
+      GROVE_DATABASE_URL: postgresql+psycopg://grove_governance:grove_governance_ws0@db:5432/grove
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "app.main", "--role", "offline_governance", "--self-check"]
+
+volumes:
+  grove_ws0_pgdata:
