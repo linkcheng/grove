@@ -27,5 +27,8 @@ async def readiness(request: Request, response: Response) -> ApiResponse[HealthD
     available = await check_database(engine, settings.readiness_timeout_seconds)
     if not available:
         response.status_code = 503
-        return cast(ApiResponse[HealthData], fail(50301, "database unavailable"))
+        return cast(
+            ApiResponse[HealthData],
+            fail(50301, "database unavailable", error_code="DependencyUnavailable", retry_after=1),
+        )
     return ok(HealthData(status="ready"))

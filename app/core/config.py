@@ -5,10 +5,10 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, ValidationError, field_validator
+from pydantic import Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -42,6 +42,18 @@ class Settings(BaseSettings):
     app_image_id: str = Field(default="not_built", min_length=1, max_length=128)
     postgres_image_id: str = Field(default="not_resolved", min_length=1, max_length=128)
     readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
+    auth_mode: Literal["disabled", "fixture"] = "disabled"
+
+    @model_validator(mode="after")
+    def validate_auth_mode(self) -> Settings:
+        if self.auth_mode == "fixture" and self.app_env not in {
+            "development",
+            "test",
+            "conformance",
+            "integration",
+        }:
+            raise ValueError("fixture authentication is only available in non-production environments")
+        return self
 
     @field_validator("database_url")
     @classmethod
@@ -70,6 +82,7 @@ class Settings(BaseSettings):
             "app_image_id": self.app_image_id,
             "postgres_image_id": self.postgres_image_id,
             "readiness_timeout_seconds": self.readiness_timeout_seconds,
+            "auth_mode": self.auth_mode,
         }
 
     def database_url_value(self) -> str:

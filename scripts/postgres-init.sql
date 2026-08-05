@@ -3,32 +3,33 @@
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'grove_api') THEN
-        CREATE ROLE grove_api LOGIN PASSWORD 'grove_api_ws0';
+        CREATE ROLE grove_api LOGIN PASSWORD 'grove_api_ws0' NOSUPERUSER NOBYPASSRLS;
     ELSE
-        ALTER ROLE grove_api LOGIN PASSWORD 'grove_api_ws0';
+        ALTER ROLE grove_api LOGIN PASSWORD 'grove_api_ws0' NOSUPERUSER NOBYPASSRLS;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'grove_runtime') THEN
-        CREATE ROLE grove_runtime LOGIN PASSWORD 'grove_runtime_ws0';
+        CREATE ROLE grove_runtime LOGIN PASSWORD 'grove_runtime_ws0' NOSUPERUSER NOBYPASSRLS;
     ELSE
-        ALTER ROLE grove_runtime LOGIN PASSWORD 'grove_runtime_ws0';
+        ALTER ROLE grove_runtime LOGIN PASSWORD 'grove_runtime_ws0' NOSUPERUSER NOBYPASSRLS;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'grove_projection') THEN
-        CREATE ROLE grove_projection LOGIN PASSWORD 'grove_projection_ws0';
+        CREATE ROLE grove_projection LOGIN PASSWORD 'grove_projection_ws0' NOSUPERUSER NOBYPASSRLS;
     ELSE
-        ALTER ROLE grove_projection LOGIN PASSWORD 'grove_projection_ws0';
+        ALTER ROLE grove_projection LOGIN PASSWORD 'grove_projection_ws0' NOSUPERUSER NOBYPASSRLS;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'grove_governance') THEN
-        CREATE ROLE grove_governance LOGIN PASSWORD 'grove_governance_ws0';
+        CREATE ROLE grove_governance LOGIN PASSWORD 'grove_governance_ws0' NOSUPERUSER NOBYPASSRLS;
     ELSE
-        ALTER ROLE grove_governance LOGIN PASSWORD 'grove_governance_ws0';
+        ALTER ROLE grove_governance LOGIN PASSWORD 'grove_governance_ws0' NOSUPERUSER NOBYPASSRLS;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'grove_migration') THEN
-        CREATE ROLE grove_migration LOGIN PASSWORD 'grove_migration_ws0';
+        CREATE ROLE grove_migration LOGIN PASSWORD 'grove_migration_ws0' SUPERUSER BYPASSRLS;
     ELSE
-        ALTER ROLE grove_migration LOGIN PASSWORD 'grove_migration_ws0';
+        ALTER ROLE grove_migration LOGIN PASSWORD 'grove_migration_ws0' SUPERUSER BYPASSRLS;
     END IF;
     IF to_regclass('public.alembic_version') IS NOT NULL THEN
         ALTER TABLE public.alembic_version OWNER TO grove_migration;
+        GRANT SELECT ON public.alembic_version TO grove_api;
     END IF;
 END
 $$;

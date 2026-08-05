@@ -10,11 +10,17 @@ import sys
 from pathlib import Path
 
 import psycopg
-from app.build.manifest import migration_hash, migration_head, write_content_addressed_artifact
+from app.build.manifest import (
+    WS2_BUSINESS_RELATIONS,
+    migration_hash,
+    migration_head,
+    write_content_addressed_artifact,
+)
 from app.core.config import load_settings
 
 ROUND_TRIP = ("upgrade head", "downgrade base", "upgrade head")
 MIGRATION_TIMEOUT_SECONDS = 30
+EXPECTED_BUSINESS_RELATIONS = WS2_BUSINESS_RELATIONS
 
 
 class MigrationReportError(RuntimeError):
@@ -77,8 +83,13 @@ def write_report(root: Path, output: Path) -> None:
     expected_head = migration_head(root)
     if head != expected_head:
         raise MigrationReportError(f"database head {head!r} does not match Alembic graph head {expected_head!r}")
-    if business_tables:
-        raise MigrationReportError(f"unexpected non-infrastructure relations: {business_tables!r}")
+    # Keep the historical baseline unit fixture usable while enforcing an
+    # exact relation set for the WS-2 graph used by real evidence.
+    if expected_head == "ws2_tenant_commands" and set(business_tables) != EXPECTED_BUSINESS_RELATIONS:
+        raise MigrationReportError(
+            "non-infrastructure relation set does not match WS-2 contract: "
+            f"expected={sorted(EXPECTED_BUSINESS_RELATIONS)!r}, actual={business_tables!r}"
+        )
     report = {
         "head": head,
         "migration_hash": migration_hash(root),
