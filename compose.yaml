@@ -26,6 +26,7 @@ services:
     environment:
       GROVE_ROLE: api
       GROVE_APP_ENV: integration
+      GROVE_AUTH_MODE: fixture
       GROVE_DATABASE_URL: postgresql+psycopg://grove_api:grove_api_ws0@db:5432/grove
       GROVE_APP_IMAGE_ID: grove-ws0:local
       GROVE_POSTGRES_IMAGE_ID: pgvector-postgis:pg16

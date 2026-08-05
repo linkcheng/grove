@@ -597,16 +597,28 @@ BudgetRejected
 ToolQueryTooBroad
 ResourceSelectionUnavailable
 RunNotFound
+CommandNotFound
 RunStateConflict
 CheckpointUnavailable
 ReplayDataUnavailable
 ReplayDataMismatch
 ArtifactUnavailable
+DependencyUnavailable
 ProjectionNotReady
 ```
 
 Error response 包含 `error_code`、`correlation_id`、可安全公开的 field
 violations 和可选 `retry_after`；不得回显内部 ID、Prompt 或敏感策略。
+
+WS-2 使用 `DependencyUnavailable` 表示数据库连接、连接池或有界数据库
+超时等预期基础设施故障，HTTP status 为 503，并返回 `retry_after`（秒）。
+约束冲突、数据损坏和程序缺陷不转换为该错误，继续按内部错误暴露并记录。
+
+WS-2 的业务失败保持 HTTP status `200`，由响应 `code` 与 `error_code` 区分：
+`PermissionDenied`、`RunNotFound`、`CommandNotFound`、`PlanChanged`、
+`SubmissionConflict`、`CommandConflict`、`RunStateConflict` 和
+`EvaluationGateFailed` 均不使用 HTTP 403/404/409。HTTP 404 只表示路由不存在；
+认证失败仍为 401，校验失败仍为 422，数据库依赖不可用仍为 503。
 
 `ToolQueryTooBroad` 表示按该 Tool contract 无法在可信预算内形成完整结果。response
 只用 field violation 表示安全 `limit_kind` 和缩小范围建议，不含实际总量、部分

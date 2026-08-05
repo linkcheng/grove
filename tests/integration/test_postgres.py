@@ -9,13 +9,13 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_real_postgres_has_only_migration_infrastructure() -> None:
+async def test_real_postgres_has_ws2_tenant_command_relations() -> None:
     database_url = os.environ["GROVE_DATABASE_URL"]
     engine = create_async_engine(database_url)
     try:
         async with engine.connect() as connection:
             version = (await connection.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-            assert version == "baseline"
+            assert version == "ws2_tenant_commands"
             tables = (
                 (
                     await connection.execute(
@@ -33,6 +33,15 @@ async def test_real_postgres_has_only_migration_infrastructure() -> None:
                 .scalars()
                 .all()
             )
-            assert tables == []
+            assert set(tables) == {
+                "agent_run",
+                "command_payload",
+                "execution_principal",
+                "execution_spec",
+                "membership",
+                "run_command",
+                "tenant",
+                "workload_principal",
+            }
     finally:
         await engine.dispose()

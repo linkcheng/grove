@@ -5,6 +5,7 @@ import inspect
 import json
 
 import pytest
+from app.core.errors import AppError, DependencyUnavailableError
 from app.core.observability import NonBlockingQueueHandler
 from app.main import create_app
 from fastapi import HTTPException
@@ -109,6 +110,30 @@ def test_http_and_validation_exception_handlers(monkeypatch: pytest.MonkeyPatch)
         invalid = client.get("/validate/not-an-int", headers={"X-Request-ID": "invalid"})
     assert invalid.status_code == 422
     assert invalid.json()["code"] == 42200
+
+
+def test_app_error_handler_preserves_retry_after_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GROVE_ROLE", "api")
+    app = create_app()
+
+    @app.get("/raise-dependency-error")
+    async def raise_dependency_error() -> None:
+        raise DependencyUnavailableError()
+
+    @app.get("/raise-app-error")
+    async def raise_app_error() -> None:
+        raise AppError(40999, "conflict", error_code="Conflict", status_code=409)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        dependency = client.get("/raise-dependency-error", headers={"X-Request-ID": "dep_error"})
+        plain = client.get("/raise-app-error", headers={"X-Request-ID": "plain_error"})
+
+    assert dependency.status_code == 503
+    assert dependency.json()["retry_after"] == 1
+    assert dependency.headers["retry-after"] == "1"
+    assert plain.status_code == 409
+    assert "retry_after" not in plain.json()
+    assert "retry-after" not in plain.headers
 
 
 def test_unexpected_exception_writes_structured_observability_fields(

@@ -29,6 +29,18 @@ MIGRATION_EXECUTION_FILES = (
     "alembic/env.py",
     "alembic/script.py.mako",
 )
+WS2_BUSINESS_RELATIONS = frozenset(
+    {
+        "tenant",
+        "membership",
+        "workload_principal",
+        "execution_principal",
+        "execution_spec",
+        "command_payload",
+        "agent_run",
+        "run_command",
+    }
+)
 DEPENDENCY_NAMES = (
     "fastapi",
     "pydantic",
@@ -445,8 +457,12 @@ def _verify_migration_report(path: Path, manifest: RuntimeBuildManifest) -> None
         raise ManifestError("migration report hash does not match manifest migration hash")
     if payload.get("round_trip") != ["upgrade head", "downgrade base", "upgrade head"]:
         raise ManifestError("migration report round trip is incomplete")
-    if payload.get("business_tables") != []:
-        raise ManifestError("migration report contains unexpected business tables")
+    relations = payload.get("business_tables")
+    if not isinstance(relations, list) or not all(isinstance(item, str) for item in relations):
+        raise ManifestError("migration report business_tables must be a list of relation names")
+    expected_relations = WS2_BUSINESS_RELATIONS if report_head == "ws2_tenant_commands" else frozenset()
+    if set(relations) != expected_relations:
+        raise ManifestError("migration report relation set does not match migration head")
 
 
 def _dependency_versions() -> dict[str, str]:
@@ -496,7 +512,7 @@ def build_manifest(
             "dbos": {"enabled": False, "status": "disabled", "reason": "not_installed"},
         },
         "application_version": __version__,
-        "schema_contract_version": "ws0-baseline",
+        "schema_contract_version": "ws2-tenant-commands",
         "signing": {"status": "not_configured", "reference": None},
     }
     # The root is intentionally used only for local hashing; it never enters the manifest.
@@ -516,6 +532,23 @@ def build_manifest_from_workspace(root: Path) -> dict[str, Any]:
     postgres_image_id = _image_id_or_default("GROVE_POSTGRES_IMAGE_ID", "not_resolved")
     sbom_ref, sbom_digest = _workspace_evidence(root, "runtime-sbom.cdx.json")
     migration_report_ref, migration_report_digest = _workspace_evidence(root, "migrations.json")
+    # A fixed-name evidence alias may be left over from an older migration
+    # graph. Do not emit it as if it described the current workspace; draft
+    # manifests fall back to explicit placeholders until a fresh report is
+    # produced. Explicit manifests still fail closed in ``verify_manifest``.
+    current_migration_head = migration_head(root)
+    current_migration_hash = migration_hash(root)
+    if migration_report_ref != EVIDENCE_PLACEHOLDER:
+        try:
+            report = json.loads((root / migration_report_ref).read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            report = None
+        if (
+            not isinstance(report, dict)
+            or report.get("head") != current_migration_head
+            or report.get("migration_hash") != current_migration_hash
+        ):
+            migration_report_ref, migration_report_digest = EVIDENCE_PLACEHOLDER, EVIDENCE_PLACEHOLDER
     resolved_images = re.fullmatch(r"sha256:[0-9a-f]{64}", app_image_id) and re.fullmatch(
         r"sha256:[0-9a-f]{64}", postgres_image_id
     )
@@ -533,8 +566,8 @@ def build_manifest_from_workspace(root: Path) -> dict[str, Any]:
         dirty=dirty,
         python_version="3.12.12",
         uv_lock_hash=uv_hash,
-        migration_head=migration_head(root),
-        migration_hash=migration_hash(root),
+        migration_head=current_migration_head,
+        migration_hash=current_migration_hash,
         app_image_id=app_image_id,
         postgres_image_id=postgres_image_id,
         sbom_ref=sbom_ref,

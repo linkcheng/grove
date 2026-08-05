@@ -5,6 +5,7 @@ project="${COMPOSE_PROJECT_NAME:-grove-ws0-test}"
 cleanroom_remove_volumes="${CLEANROOM_REMOVE_VOLUMES:-0}"
 compose=(docker compose -p "$project" -f compose.yaml)
 api_response=""
+lock_holder_pid=""
 
 if [[ "$cleanroom_remove_volumes" != "0" && "$cleanroom_remove_volumes" != "1" ]]; then
   printf 'CLEANROOM_REMOVE_VOLUMES must be 0 or 1\n' >&2
@@ -12,6 +13,11 @@ if [[ "$cleanroom_remove_volumes" != "0" && "$cleanroom_remove_volumes" != "1" ]
 fi
 
 cleanup() {
+  if [[ -n "$lock_holder_pid" ]]; then
+    kill "$lock_holder_pid" >/dev/null 2>&1 || true
+    wait "$lock_holder_pid" >/dev/null 2>&1 || true
+    lock_holder_pid=""
+  fi
   if [[ -n "$api_response" ]]; then
     rm -f "$api_response"
   fi
@@ -134,16 +140,147 @@ if [[ "$health" != "healthy" ]]; then
   printf 'PostgreSQL healthcheck did not become healthy: %s\n' "$health" >&2
   exit 1
 fi
-"${compose[@]}" exec -T db pg_isready -U grove -d grove
+
+# The official image can report a healthy probe while its entrypoint is still
+# handing off from temporary initialization.  Wait for PID 1 to be the real
+# PostgreSQL server before accepting SQL stability as readiness evidence.
+db_pid1_comm=""
+for _attempt in $(seq 1 60); do
+  db_pid1_comm="$("${compose[@]}" exec -T db sh -c 'cat /proc/1/comm' 2>/dev/null | tr -d '\r' || true)"
+  if [[ "$db_pid1_comm" == "postgres" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ "$db_pid1_comm" != "postgres" ]]; then
+  printf 'PostgreSQL PID 1 did not become postgres within the bounded retry window: %s\n' "$db_pid1_comm" >&2
+  exit 1
+fi
+
+# Healthcheck/pg_isready can succeed while an entrypoint restart still has the
+# database in a transient state. Require bounded SQL success for three
+# consecutive probes and reset the counter after any failure.
+stable_sql_probes=0
+for _attempt in $(seq 1 60); do
+  sql_probe="$("${compose[@]}" exec -T db env PGCONNECT_TIMEOUT=2 psql -U grove -d grove -Atqc 'SELECT 1' 2>/dev/null || true)"
+  if [[ "$sql_probe" == "1" ]]; then
+    stable_sql_probes=$((stable_sql_probes + 1))
+    if [[ "$stable_sql_probes" -ge 3 ]]; then
+      break
+    fi
+  else
+    stable_sql_probes=0
+  fi
+  sleep 1
+done
+if [[ "$stable_sql_probes" -lt 3 ]]; then
+  printf 'PostgreSQL SQL probe did not remain stable within the bounded retry window\n' >&2
+  exit 1
+fi
 
 # The named volume may predate the init hook, so apply the idempotent role
-# bootstrap explicitly as well. The application roles never use grove.
-"${compose[@]}" exec -T db psql -U grove -d grove < scripts/postgres-init.sql
+# bootstrap explicitly as well. The application roles never use grove. A
+# transient database shutdown resets the bounded retry, rather than turning a
+# readiness race into a false success.
+bootstrap_timeout_seconds=10
+bootstrap_pgoptions='-c statement_timeout=5000 -c lock_timeout=1000'
+run_bootstrap() {
+  "${compose[@]}" exec -T db timeout "${bootstrap_timeout_seconds}s" env \
+    PGCONNECT_TIMEOUT=5 PGOPTIONS="$bootstrap_pgoptions" \
+    psql -X -v ON_ERROR_STOP=1 -U grove -d grove
+}
+
+bootstrap_ok=0
+for _attempt in $(seq 1 60); do
+  if run_bootstrap < scripts/postgres-init.sql; then
+    bootstrap_ok=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$bootstrap_ok" != "1" ]]; then
+  printf 'PostgreSQL role bootstrap did not complete within the bounded retry window\n' >&2
+  exit 1
+fi
+# Exercise the same bootstrap path twice on the live volume; role grants and
+# ownership changes must remain idempotent across repeated invocations. Retry
+# the second real command independently as well.
+bootstrap_ok=0
+for _attempt in $(seq 1 60); do
+  if run_bootstrap < scripts/postgres-init.sql; then
+    bootstrap_ok=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$bootstrap_ok" != "1" ]]; then
+  printf 'PostgreSQL repeated role bootstrap did not complete within the bounded retry window\n' >&2
+  exit 1
+fi
 
 mkdir -p ci-evidence
-"${compose[@]}" run --rm \
-  -e GROVE_DATABASE_URL=postgresql+psycopg://grove_migration:grove_migration_ws0@db:5432/grove \
-  api python scripts/migration_report.py --output /app/ci-evidence/migrations.json
+migration_ok=0
+for _attempt in $(seq 1 60); do
+  if "${compose[@]}" run --rm \
+    -e GROVE_DATABASE_URL=postgresql+psycopg://grove_migration:grove_migration_ws0@db:5432/grove \
+    -e PGCONNECT_TIMEOUT=10 \
+    -e PGOPTIONS='-c statement_timeout=30000 -c lock_timeout=5000' \
+    api python scripts/migration_report.py --output /app/ci-evidence/migrations.json; then
+    migration_ok=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$migration_ok" != "1" ]]; then
+  printf 'migration report did not complete within the bounded retry window\n' >&2
+  exit 1
+fi
+
+# Fault probes prove that the bootstrap command itself fails closed.  First an
+# injected SQL error must stop the script with ON_ERROR_STOP; then an
+# ACCESS-EXCLUSIVE lock on the object touched by the bootstrap must hit
+# lock_timeout (and the outer coreutils timeout is a second fixed upper bound).
+if printf '%s\n' 'SELECT 1;' 'SELECT grove_bootstrap_injected_error;' | run_bootstrap; then
+  printf 'bootstrap error probe unexpectedly succeeded\n' >&2
+  exit 1
+fi
+
+lock_holder_status=0
+"${compose[@]}" exec -T db timeout 15s env PGCONNECT_TIMEOUT=5 \
+  psql -X -v ON_ERROR_STOP=1 -U grove -d grove \
+  -c 'BEGIN; LOCK TABLE public.alembic_version IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(5); COMMIT;' &
+lock_holder_pid=$!
+lock_acquired=0
+for _attempt in $(seq 1 20); do
+  lock_state="$("${compose[@]}" exec -T db env PGCONNECT_TIMEOUT=5 psql -X -U grove -d grove -Atqc \
+    "SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid = l.relation WHERE c.relname = 'alembic_version' AND l.mode = 'AccessExclusiveLock' AND l.granted" \
+    2>/dev/null || true)"
+  if [[ "$lock_state" == "1" ]]; then
+    lock_acquired=1
+    break
+  fi
+  sleep 0.1
+done
+if [[ "$lock_acquired" != "1" ]]; then
+  printf 'bootstrap lock holder did not acquire the required lock\n' >&2
+  kill "$lock_holder_pid" >/dev/null 2>&1 || true
+  wait "$lock_holder_pid" >/dev/null 2>&1 || true
+  lock_holder_pid=""
+  exit 1
+fi
+if run_bootstrap < scripts/postgres-init.sql; then
+  printf 'bootstrap lock probe unexpectedly succeeded\n' >&2
+  kill "$lock_holder_pid" >/dev/null 2>&1 || true
+  wait "$lock_holder_pid" >/dev/null 2>&1 || true
+  lock_holder_pid=""
+  exit 1
+fi
+wait "$lock_holder_pid" || lock_holder_status=$?
+lock_holder_pid=""
+if [[ "$lock_holder_status" != "0" ]]; then
+  printf 'bootstrap lock holder failed with exit=%s\n' "$lock_holder_status" >&2
+  exit 1
+fi
 
 for role_service in runtime-worker projection-reconciliation offline-governance; do
   role_output="$("${compose[@]}" run --rm "$role_service")"
@@ -170,8 +307,11 @@ printf '\n'
 curl --fail --silent --show-error -H 'X-Request-ID: integration_ready' http://127.0.0.1:8000/api/v1/health/ready
 printf '\n'
 
-"${compose[@]}" exec -T db psql -U grove_migration -d grove -Atc "SELECT version_num FROM alembic_version" | grep -Fx baseline
-GROVE_DATABASE_URL=postgresql+psycopg://grove_migration:grove_migration_ws0@localhost:54329/grove uv run pytest tests/integration -m integration -ra
+"${compose[@]}" exec -T db psql -U grove_migration -d grove -Atc "SELECT version_num FROM alembic_version" | grep -Fx ws2_tenant_commands
+GROVE_DATABASE_URL=postgresql+psycopg://grove_api:grove_api_ws0@localhost:54329/grove \
+GROVE_MIGRATION_DATABASE_URL=postgresql+psycopg://grove_migration:grove_migration_ws0@localhost:54329/grove \
+GROVE_API_BASE_URL=http://127.0.0.1:8000 \
+uv run pytest tests/integration -m integration -ra
 
 app_image_id="$(docker image inspect grove-ws0:local --format '{{.Id}}')"
 postgres_image_id="$(docker image inspect pgvector-postgis:pg16 --format '{{.Id}}')"

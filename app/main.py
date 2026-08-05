@@ -13,10 +13,15 @@ from typing import Any, cast
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.api.v1.execution import router as execution_router
 from app.api.v1.health import router as health_router
+from app.auth.context import active_tenant_context
 from app.core.config import ConfigurationError, Role, Settings, load_settings
+from app.core.errors import AppError
 from app.core.observability import active_logging_runtime, configure_logging, log_event
 from app.core.trace import resolve_trace_id, trace_id_context
 from app.db.session import create_engine, session_factory
@@ -95,10 +100,39 @@ async def request_trace_middleware(request: Request, call_next: Callable[[Reques
     return response
 
 
+async def active_tenant_context_middleware(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Ensure an authenticated context cannot leak between reused requests."""
+
+    token = active_tenant_context.set(None)
+    try:
+        return await call_next(request)
+    finally:
+        active_tenant_context.reset(token)
+
+
 async def http_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     http_exc = cast(StarletteHTTPException, exc)
-    code = 40400 if http_exc.status_code == 404 else 40000 if http_exc.status_code < 500 else 50000
-    body = fail(code, str(http_exc.detail), trace_id=request.state.trace_id)
+    code = {
+        400: 40000,
+        401: 40100,
+        403: 40300,
+        404: 40400,
+        409: 40900,
+        422: 42200,
+        503: 50301,
+    }.get(http_exc.status_code, 50000 if http_exc.status_code >= 500 else 40000)
+    error_code = {
+        400: "BadRequest",
+        401: "AuthenticationRequired",
+        403: "Forbidden",
+        404: "NotFound",
+        409: "Conflict",
+        422: "InputContractInvalid",
+        503: "DependencyUnavailable",
+    }.get(http_exc.status_code, "InternalServerError" if http_exc.status_code >= 500 else "BadRequest")
+    body = fail(code, str(http_exc.detail), trace_id=request.state.trace_id, error_code=error_code)
     return JSONResponse(
         status_code=http_exc.status_code,
         content=_response_content(body),
@@ -106,12 +140,67 @@ async def http_exception_handler(request: Request, exc: Exception) -> JSONRespon
     )
 
 
-async def validation_exception_handler(request: Request, _exc: Exception) -> JSONResponse:
-    body = fail(42200, "request validation failed", trace_id=request.state.trace_id)
+async def validation_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    validation = cast(RequestValidationError, exc)
+    violations = [
+        {"field": ".".join(str(part) for part in error.get("loc", ())), "reason": str(error.get("msg", "invalid"))}
+        for error in validation.errors()
+    ]
+    body = fail(
+        42200,
+        "request validation failed",
+        trace_id=request.state.trace_id,
+        error_code="InputContractInvalid",
+        field_violations=violations,
+    )
     return JSONResponse(
         status_code=422,
         content=_response_content(body),
         headers={"x-request-id": request.state.trace_id},
+    )
+
+
+async def app_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    app_error = cast(AppError, exc)
+    body = fail(
+        app_error.code,
+        app_error.message,
+        trace_id=request.state.trace_id,
+        error_code=app_error.error_code,
+        retry_after=app_error.retry_after,
+    )
+    headers = {"x-request-id": request.state.trace_id}
+    if app_error.retry_after is not None:
+        headers["retry-after"] = str(app_error.retry_after)
+    return JSONResponse(
+        status_code=app_error.status_code,
+        content=_response_content(body),
+        headers=headers,
+    )
+
+
+async def database_dependency_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Map bounded connection/pool failures to the documented 503 contract."""
+
+    log_event(
+        "database_dependency_unavailable",
+        trace_id=request.state.trace_id,
+        duration_ms=round((perf_counter() - getattr(request.state, "started_at", perf_counter())) * 1000, 3),
+        status=503,
+        route=_route_template(request),
+        error=type(exc).__name__,
+    )
+    body = fail(
+        50302,
+        "dependency unavailable",
+        trace_id=request.state.trace_id,
+        error_code="DependencyUnavailable",
+        retry_after=1,
+    )
+    return JSONResponse(
+        status_code=503,
+        content=_response_content(body),
+        headers={"x-request-id": request.state.trace_id, "retry-after": "1"},
     )
 
 
@@ -125,7 +214,7 @@ async def unexpected_exception_handler(request: Request, exc: Exception) -> JSON
         route=_route_template(request),
         error=type(exc).__name__,
     )
-    body = fail(50000, "internal server error", trace_id=request.state.trace_id)
+    body = fail(50000, "internal server error", trace_id=request.state.trace_id, error_code="InternalServerError")
     return JSONResponse(
         status_code=500,
         content=_response_content(body),
@@ -142,9 +231,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="GROVE WS-0", version="0.1.0", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.settings = active
     app.include_router(health_router, prefix="/api/v1")
+    app.include_router(execution_router, prefix="/api/v1")
+    app.middleware("http")(active_tenant_context_middleware)
     app.middleware("http")(request_trace_middleware)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(AppError, app_error_handler)
+    for database_error in (OperationalError, InterfaceError, SQLAlchemyTimeoutError):
+        app.add_exception_handler(database_error, database_dependency_exception_handler)
     app.add_exception_handler(Exception, unexpected_exception_handler)
     return app
 
