@@ -43,9 +43,14 @@ class Settings(BaseSettings):
     postgres_image_id: str = Field(default="not_resolved", min_length=1, max_length=128)
     readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
     auth_mode: Literal["disabled", "fixture"] = "disabled"
+    worker_tenant_id: str = Field(default="default", min_length=1, max_length=128)
+    worker_id: str = Field(default="grove-worker-1", min_length=1, max_length=256)
+    runtime_build_hash: str = Field(default="", min_length=0, max_length=64)
 
     @model_validator(mode="after")
     def validate_auth_mode(self) -> Settings:
+        if self.role is Role.RUNTIME_WORKER and not self.runtime_build_hash:
+            raise ValueError("runtime_worker role requires GROVE_RUNTIME_BUILD_HASH")
         if self.auth_mode == "fixture" and self.app_env not in {
             "development",
             "test",

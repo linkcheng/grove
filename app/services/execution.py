@@ -300,6 +300,8 @@ async def submit(session: AsyncSession, context: ActiveTenantContext, request: S
         submission_digest=digest,
         skill_spec_hash=spec.skill_spec_hash,
         skill_spec_ref=spec_ref,
+        runtime_build_ref=spec.runtime_build.ref,
+        runtime_build_hash=spec.runtime_build.content_hash,
     )
     if run is None:
         # The advisory lock makes this path unreachable for a healthy

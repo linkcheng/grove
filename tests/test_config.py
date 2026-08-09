@@ -1,8 +1,90 @@
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 from app.core.config import ConfigurationError, Role, Settings, load_settings
 from app.main import _load_cli_settings
+
+ENV_EXAMPLE = Path(__file__).resolve().parents[1] / ".env.example"
+METADATA_RE = re.compile(
+    r"^用途：(?P<use>[^；]+)；要求：(?P<required>[^；]+)；适用：(?P<scope>[^；]+)；敏感：(?P<sensitive>是|否)。?$"
+)
+
+
+def _parse_env_example() -> tuple[dict[str, str], dict[str, str], dict[str, dict[str, str]], str]:
+    """Parse active and commented shell-compatible assignments without evaluating the file."""
+
+    content = ENV_EXAMPLE.read_text(encoding="utf-8")
+    assignments: dict[str, str] = {}
+    commented_assignments: dict[str, str] = {}
+    metadata: dict[str, dict[str, str]] = {}
+    pending_metadata: dict[str, str] | None = None
+    for line_number, raw_line in enumerate(content.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            pending_metadata = None
+            continue
+        commented = line.startswith("#")
+        candidate = line[1:].lstrip() if commented else line
+        metadata_match = METADATA_RE.fullmatch(candidate) if commented else None
+        if metadata_match:
+            pending_metadata = metadata_match.groupdict()
+            continue
+        key, separator, value = candidate.partition("=")
+        if not separator:
+            assert commented, f"line {line_number} is not an assignment"
+            pending_metadata = None
+            continue
+        assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key), f"invalid key on line {line_number}"
+        target = commented_assignments if commented else assignments
+        assert key not in assignments and key not in commented_assignments, f"duplicate key: {key}"
+        assert pending_metadata is not None, f"assignment {key} has no adjacent metadata"
+        target[key] = value.strip()
+        metadata[key] = pending_metadata
+        pending_metadata = None
+    return assignments, commented_assignments, metadata, content
+
+
+def test_env_example_covers_runtime_ai_and_tooling_configuration() -> None:
+    assignments, commented_assignments, metadata, content = _parse_env_example()
+    settings_keys = {f"GROVE_{name.upper()}" for name in Settings.model_fields}
+    ai_gateway_keys = {
+        "AI_GATEWAY_URL",
+        "AI_GATEWAY_API_KEY",
+        "AI_GATEWAY_MODEL",
+    }
+    tooling_keys = {
+        "GROVE_MIGRATION_DATABASE_URL",
+        "GROVE_API_BASE_URL",
+        "GROVE_REVERSE_MANIFEST",
+        "GROVE_INTEGRATION_LIBRARY",
+        "COMPOSE_PROJECT_NAME",
+        "CLEANROOM_REMOVE_VOLUMES",
+    }
+    assert set(assignments) == settings_keys | ai_gateway_keys
+    assert {key for key in assignments if key.startswith("GROVE_")} == settings_keys
+    assert tooling_keys <= commented_assignments.keys()
+    assert not tooling_keys & assignments.keys()
+    documented_keys = set(assignments) | set(commented_assignments)
+    assert set(metadata) == documented_keys
+    for fields in metadata.values():
+        assert fields["use"].strip()
+        assert fields["required"].strip()
+        assert fields["scope"].strip()
+        assert fields["sensitive"] in {"是", "否"}
+        assert any(marker in fields["required"] for marker in ("必填", "可选"))
+        assert any("\u4e00" <= character <= "\u9fff" for character in "".join(fields.values()))
+
+    api_key = assignments["AI_GATEWAY_API_KEY"]
+    assert re.fullmatch(r"__[A-Z0-9_]+__", api_key)
+    assert "__REPLACE_WITH_API_DB_PASSWORD__" in assignments["GROVE_DATABASE_URL"]
+    assert "__REPLACE_WITH_MIGRATION_DB_PASSWORD__" in commented_assignments["GROVE_MIGRATION_DATABASE_URL"]
+    for key, value in {**assignments, **commented_assignments}.items():
+        if metadata[key]["sensitive"] == "是":
+            assert "change_me" not in value.lower()
+    assert not re.search(r"(?:sk-|Bearer\s+)[A-Za-z0-9_-]{8,}", content, flags=re.IGNORECASE)
 
 
 def test_role_is_closed_and_allows_only_four_roles() -> None:
@@ -17,6 +99,8 @@ def test_role_is_closed_and_allows_only_four_roles() -> None:
 @pytest.mark.parametrize("role", ["api", "runtime_worker", "projection_reconciliation", "offline_governance"])
 def test_settings_accepts_declared_roles(monkeypatch: pytest.MonkeyPatch, role: str) -> None:
     monkeypatch.setenv("GROVE_ROLE", role)
+    if role == "runtime_worker":
+        monkeypatch.setenv("GROVE_RUNTIME_BUILD_HASH", "a" * 64)
     settings = load_settings()
     assert settings.role.value == role
 
@@ -68,6 +152,7 @@ def test_cli_role_conflict_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None
 def test_unknown_grove_environment_key_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GROVE_ROLE", "api")
     monkeypatch.setenv("GROVE_ROEL", "runtime_worker")
+    monkeypatch.setenv("GROVE_RUNTIME_BUILD_HASH", "a" * 64)
     with pytest.raises(ConfigurationError, match="unknown"):
         load_settings()
 

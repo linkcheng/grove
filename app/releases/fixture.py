@@ -17,6 +17,12 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.build.catalog_authority import (
+    CATALOG_AUTHORITY_COMPILER_VERSION,
+    expected_catalog_artifact_hash,
+    expected_catalog_authority_root,
+    expected_catalog_authority_sections,
+)
 from app.build.manifest import RuntimeBuildManifest, verify_manifest
 from app.contracts.canonical import ArtifactRef, EvaluationEvidenceRef, VersionedRef, canonical_hash
 from app.core.config import Role
@@ -276,6 +282,10 @@ def _draft_runtime_build() -> RuntimeBuildManifest:
         "adapter_capabilities": {},
         "application_version": "0.1.0",
         "schema_contract_version": "ws2.fixture@1",
+        "catalog_authority_compiler_version": CATALOG_AUTHORITY_COMPILER_VERSION,
+        "catalog_authority_artifact_hash": expected_catalog_artifact_hash(),
+        "catalog_authority_expected_root": expected_catalog_authority_root(),
+        "catalog_authority_sections": expected_catalog_authority_sections(),
         "signing": {"status": "not_configured", "reference": None},
     }
     without_hash = _canonical_bytes(document)

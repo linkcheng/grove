@@ -4,7 +4,7 @@ EVIDENCE_DIR := ci-evidence
 COMPOSE_PROJECT := grove-ws0-test
 COMPOSE := docker compose -p $(COMPOSE_PROJECT) -f compose.yaml
 
-.PHONY: install verify manifest-check integration cleanroom-check ci release-check
+.PHONY: install verify manifest-check ws-3-check integration cleanroom-check ci release-check
 
 install:
 	uv sync --frozen
@@ -25,6 +25,38 @@ manifest-check:
 	uv run python scripts/build_manifest.py --verify $(EVIDENCE_DIR)/runtime-build-manifest.json
 	rm -f $(EVIDENCE_DIR)/runtime-build-manifest.second.json
 	bash scripts/reverse_validation.sh
+
+ws-3-check:
+	@printf 'WS-3 current gate (checkpoint, cancel, execution-authority closure candidates; not full WS-3)\n'
+	uv run pytest -q \
+		tests/test_ws3_checkpoint.py \
+		tests/test_ws3_execution_driver.py \
+		tests/test_ws3_execution_state_machine.py \
+		tests/test_ws3_postgres_execution_driver.py \
+		tests/integration/test_catalog_authority_root.py \
+		tests/test_manifest.py \
+		tests/test_migration_contract.py \
+		tests/test_migration_report.py \
+		-m 'not integration'
+	@if [[ -z "$${GROVE_DATABASE_URL:-}" ]]; then \
+		printf 'WS-3 current gate requires GROVE_DATABASE_URL for real PostgreSQL integration\n' >&2; \
+		exit 2; \
+	fi
+	@if [[ -n "$${GROVE_MIGRATION_DATABASE_URL:-}" ]]; then \
+		GROVE_ROLE=api uv run python scripts/ws3_preflight.py \
+			--database-url "$${GROVE_MIGRATION_DATABASE_URL}"; \
+	else \
+		GROVE_ROLE=api uv run python scripts/ws3_preflight.py \
+			--database-url "$${GROVE_DATABASE_URL}"; \
+	fi
+	@if [[ -n "$${GROVE_MIGRATION_DATABASE_URL:-}" ]]; then \
+		GROVE_MIGRATION_DATABASE_URL="$$GROVE_MIGRATION_DATABASE_URL" \
+			uv run pytest -q tests/integration/test_ws3_postgres_execution_driver.py \
+				tests/integration/test_catalog_authority_root.py -m integration -ra; \
+	else \
+		uv run pytest -q tests/integration/test_ws3_postgres_execution_driver.py \
+			tests/integration/test_catalog_authority_root.py -m integration -ra; \
+	fi
 
 integration:
 	$(MAKE) manifest-check

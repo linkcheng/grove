@@ -49,7 +49,7 @@ def test_unknown_route_is_unified_and_contains_trace_id(monkeypatch: pytest.Monk
 
 
 def test_non_api_role_cannot_create_http_app(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GROVE_ROLE", "runtime_worker")
+    monkeypatch.setenv("GROVE_ROLE", "projection_reconciliation")
     try:
         create_app()
     except ValueError as exc:

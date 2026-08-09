@@ -6,6 +6,11 @@ from pathlib import Path
 
 import pytest
 from app.build.manifest import (
+    WS2_BUSINESS_RELATIONS,
+    WS3_BUSINESS_RELATIONS,
+    WS3_INFRASTRUCTURE_RELATIONS,
+    WS3_SCHEMA_CONTRACT,
+    WS3_SCHEMA_CONTRACT_VERSION,
     ManifestError,
     RuntimeBuildManifest,
     build_manifest,
@@ -53,6 +58,208 @@ def _valid_migration_report(head: str, migration_digest: str) -> bytes:
         "status": "completed",
     }
     return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def test_ws3_function_contract_uses_complete_schema_identity_keys() -> None:
+    function_keys = set(WS3_SCHEMA_CONTRACT["functions"])
+    acl_keys = set(WS3_SCHEMA_CONTRACT["function_acl"])
+    assert all(key.startswith("public.") and "(" in key and key.endswith(")") for key in function_keys)
+    assert all(key.startswith("public.") and "(" in key and key.endswith(")") for key in acl_keys)
+    assert "public.grove_reconcile_expired_run_command(p_tenant_id text, p_run_id uuid)" in function_keys
+    assert "public.grove_reconcile_expired_run_command(p_tenant_id text, p_run_id uuid)" in acl_keys
+    assert "public.grove_execution_claim_lifecycle_valid(p_run_status text, p_command_type text)" in function_keys
+    assert "public.grove_execution_claim_lifecycle_valid(p_run_status text, p_command_type text)" in acl_keys
+    assert all(
+        any(name in key for name in ("heartbeat", "consume", "dead_letter", "reconcile"))
+        for key in acl_keys
+        if "_internal(" in key
+    )
+    assert all(
+        value == "{grove_migration=X/grove_migration}"
+        for key, value in WS3_SCHEMA_CONTRACT["function_acl"].items()
+        if "_internal(" in key
+    )
+    assert WS3_SCHEMA_CONTRACT_VERSION == "ws3-execution-authority-v7"
+    assert set(WS3_SCHEMA_CONTRACT["authority_relations"]) == {
+        "public.tenant",
+        "public.membership",
+        "public.workload_principal",
+        "public.execution_principal",
+        "public.execution_spec",
+        "public.command_payload",
+        "public.agent_run",
+        "public.run_command",
+        "public.checkpoints",
+        "public.checkpoint_blobs",
+        "public.checkpoint_writes",
+        "public.checkpoint_migrations",
+    }
+    assert WS3_SCHEMA_CONTRACT["authority_roles"]["grove_api"]["attributes"]["rolbypassrls"] is False
+    assert WS3_SCHEMA_CONTRACT["authority_roles"]["grove_migration"]["attributes"]["rolsuper"] is True
+    assert all(
+        "target_function" in trigger and "target_function_family" in trigger
+        for trigger in (
+            *WS3_SCHEMA_CONTRACT["agent_run_triggers"].values(),
+            *WS3_SCHEMA_CONTRACT["checkpoint_triggers"].values(),
+        )
+    )
+    assert all(
+        set(trigger["target_function_family"]) == {trigger["target_function"]["identity"]}
+        for trigger in (
+            WS3_SCHEMA_CONTRACT["trigger"],
+            *WS3_SCHEMA_CONTRACT["agent_run_triggers"].values(),
+            *WS3_SCHEMA_CONTRACT["checkpoint_triggers"].values(),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "section",
+    (
+        "schema_contract_version",
+        "columns",
+        "constraints",
+        "functions",
+        "function_acl",
+        "trigger",
+        "trigger_target_function",
+        "trigger_target_function_family",
+        "agent_run_triggers",
+        "checkpoint_triggers",
+        "policies",
+        "migration_rows",
+        "rls",
+        "privileges",
+        "database_temp_privileges",
+        "table_acl",
+        "authority_roles",
+        "authority_relations",
+        "authority_relation_exclusions",
+        "authority_relation_grants",
+        "authority_relation_policies",
+        "authority_relation_rules",
+        "authority_public_functions",
+        "authority_dml_targets",
+        "authority_object_inventory",
+        "authority_constraints",
+        "authority_function_acl",
+        "authority_acl",
+    ),
+)
+def test_manifest_rejects_tampered_ws3_schema_evidence_after_all_hashes_are_recomputed(
+    tmp_path: Path, section: str
+) -> None:
+    report: dict[str, object] = {
+        "head": "ws3_execution_driver",
+        "migration_hash": "b" * 64,
+        "business_tables": sorted(WS2_BUSINESS_RELATIONS),
+        "round_trip": ["upgrade head", "downgrade base", "upgrade head"],
+        "schema_contract_version": WS3_SCHEMA_CONTRACT_VERSION,
+        "status": "completed",
+        "ws3_schema": json.loads(json.dumps(WS3_SCHEMA_CONTRACT)),
+    }
+    valid_payload = (json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    valid_ref, valid_hash = _write_cas_evidence(tmp_path, "migrations.json", valid_payload)
+    valid_manifest = build_manifest(
+        root=tmp_path,
+        source_commit="abc1234",
+        dirty=False,
+        python_version="3.12.12",
+        uv_lock_hash="a" * 64,
+        migration_head="ws3_execution_driver",
+        migration_hash="b" * 64,
+        app_image_id="not_built",
+        postgres_image_id="not_resolved",
+        migration_report_ref=valid_ref,
+        migration_report_hash=valid_hash,
+    )
+    assert verify_manifest(valid_manifest, root=tmp_path)
+
+    changed = json.loads(json.dumps(report))
+    if section == "schema_contract_version":
+        changed[section] = "ws2-tenant-commands"
+    elif section == "columns":
+        changed["ws3_schema"][section]["checkpoints.content_hash"][2] = "1"
+    elif section == "constraints":
+        changed["ws3_schema"][section]["checkpoints_content_hash_ck"] = "CHECK (content_hash ~ '^[0-9a-f]{63}$')"
+    elif section == "functions":
+        changed["ws3_schema"][section][
+            "public.grove_checkpoint_claim_provenance(p_tenant_id text, p_run_id uuid, p_command_id uuid, "
+            "p_command_seq bigint, p_command_digest text, p_runtime_build_hash text, p_worker_id text, "
+            "p_execution_fence bigint, p_lease_until timestamp with time zone)"
+        ]["definition_sha256"] = "c" * 64
+    elif section == "function_acl":
+        changed["ws3_schema"][section]["public.grove_reject_agent_run_runtime_build_rebinding()"] = "{public=X/public}"
+    elif section == "trigger":
+        changed["ws3_schema"][section]["enabled"] = "D"
+    elif section == "trigger_target_function":
+        changed["ws3_schema"]["trigger"]["target_function"]["definition_sha256"] = "c" * 64
+    elif section == "trigger_target_function_family":
+        changed["ws3_schema"]["trigger"]["target_function_family"]["public.grove_reject_execution_fence_regression()"][
+            "definition_sha256"
+        ] = "c" * 64
+    elif section == "agent_run_triggers":
+        changed["ws3_schema"][section]["public.agent_run.agent_run_runtime_build_guard"]["enabled"] = "D"
+    elif section == "checkpoint_triggers":
+        changed["ws3_schema"][section]["public.checkpoints.checkpoints_authority_guard"]["enabled"] = "D"
+    elif section == "policies":
+        changed["ws3_schema"][section]["checkpoints_tenant_policy"]["with_check"] = "false"
+    elif section == "migration_rows":
+        changed["ws3_schema"][section].append(10)
+    elif section == "rls":
+        changed["ws3_schema"][section]["agent_run"][1] = False
+    elif section == "table_acl":
+        changed["ws3_schema"][section]["checkpoints.grove_runtime.INSERT"] = False
+    elif section == "database_temp_privileges":
+        changed["ws3_schema"][section]["grove_runtime"] = True
+    elif section == "authority_roles":
+        changed["ws3_schema"][section]["grove_api"]["attributes"]["rolbypassrls"] = True
+    elif section == "authority_relations":
+        changed["ws3_schema"][section]["public.tenant"]["owner"] = "grove_api"
+    elif section == "authority_relation_exclusions":
+        changed["ws3_schema"][section]["public.execution_principal"]["authority_dml_targets"] = False
+    elif section == "authority_relation_grants":
+        changed["ws3_schema"][section]["public.checkpoint_migrations"]["table"]["grove_api"]["UPDATE"] = True
+    elif section == "authority_relation_policies":
+        changed["ws3_schema"][section]["public.run_command"]["public.run_command.run_command_tenant_isolation"][
+            "permissive"
+        ] = False
+    elif section == "authority_relation_rules":
+        changed["ws3_schema"][section]["public.run_command"]["public.run_command.run_command_rule"] = {
+            "name": "run_command_rule",
+            "enabled": "O",
+            "definition": "CREATE RULE run_command_rule AS ON UPDATE TO run_command DO INSTEAD NOTHING",
+        }
+    elif section == "authority_public_functions":
+        changed["ws3_schema"][section]["public.grove_active_tenant()"]["definition_sha256"] = "c" * 64
+    elif section == "authority_dml_targets":
+        changed["ws3_schema"][section]["public.grove_sync_execution_principal()"] = ["public.tenant"]
+    elif section == "authority_object_inventory":
+        changed["ws3_schema"][section]["public.tenant"]["relpersistence"] = "u"
+    elif section == "authority_constraints":
+        changed["ws3_schema"][section]["public.tenant.tenant_pkey"]["definition"] = "PRIMARY KEY (status)"
+    elif section == "authority_function_acl":
+        changed["ws3_schema"][section]["public.grove_active_tenant()"][0]["grantee"] = "public"
+    elif section == "authority_acl":
+        changed["ws3_schema"][section]["table"]["public.tenant"][0]["privilege"] = "TRUNCATE"
+    else:
+        changed["ws3_schema"][section]["runtime_claim_execute"] = False
+    tampered_payload = (json.dumps(changed, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    tampered_ref, tampered_hash = _write_cas_evidence(tmp_path, "migrations.json", tampered_payload)
+    tampered_manifest = build_manifest(
+        root=tmp_path,
+        source_commit="abc1234",
+        dirty=False,
+        python_version="3.12.12",
+        uv_lock_hash="a" * 64,
+        migration_head="ws3_execution_driver",
+        migration_hash="b" * 64,
+        app_image_id="not_built",
+        postgres_image_id="not_resolved",
+        migration_report_ref=tampered_ref,
+        migration_report_hash=tampered_hash,
+    )
+    assert not verify_manifest(tampered_manifest, root=tmp_path)
 
 
 def _release_manifest_with_evidence(
@@ -134,7 +341,7 @@ def test_workspace_manifest_has_no_absolute_path_and_missing_lock_fails(tmp_path
     root = Path.cwd()
     generated = build_manifest_from_workspace(root)
     assert verify_manifest(generated, root=root)
-    assert generated["migration"]["head"] == "ws2_tenant_commands"
+    assert generated["migration"]["head"] == "ws3_runtime_worker_delivery"
     assert str(root) not in canonical_bytes(generated).decode()
     assert verify_manifest(RuntimeBuildManifest.model_validate(generated), root=root)
     with pytest.raises(ManifestError, match="uv.lock"):
@@ -364,6 +571,137 @@ def test_manifest_rejects_semantically_invalid_migration_report_after_manifest_r
     # The manifest hash and CAS hash are both valid; only the report semantics
     # are forged.  Verification must still reject the evidence.
     assert not verify_manifest(manifest, root=tmp_path)
+
+
+def test_ws3_catalog_authority_report_binds_actual_root_sections_and_counts(tmp_path: Path) -> None:
+    seed = build_manifest(
+        root=tmp_path,
+        source_commit="abc1234",
+        dirty=False,
+        python_version="3.12.12",
+        uv_lock_hash="a" * 64,
+        migration_head="ws3_runtime_worker_delivery",
+        migration_hash="b" * 64,
+        app_image_id="not_built",
+        postgres_image_id="not_resolved",
+    )
+    catalog = {
+        "compiler_version": seed["catalog_authority_compiler_version"],
+        "expected_artifact_hash": seed["catalog_authority_artifact_hash"],
+        "expected_root": seed["catalog_authority_expected_root"],
+        "actual_root": seed["catalog_authority_expected_root"],
+        "sections": seed["catalog_authority_sections"],
+        "section_counts": {name: section["count"] for name, section in seed["catalog_authority_sections"].items()},
+    }
+    report = {
+        "status": "completed",
+        "head": "ws3_runtime_worker_delivery",
+        "migration_hash": "b" * 64,
+        "round_trip": ["upgrade head", "downgrade base", "upgrade head"],
+       "business_tables": sorted(WS3_BUSINESS_RELATIONS),
+       "infrastructure_tables": sorted(WS3_INFRASTRUCTURE_RELATIONS),
+       "schema_contract_version": WS3_SCHEMA_CONTRACT_VERSION,
+       "ws3_schema": WS3_SCHEMA_CONTRACT,
+       "catalog_authority": catalog,
+    }
+    valid_payload = (json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    valid_ref, valid_hash = _write_cas_evidence(tmp_path, "migrations.json", valid_payload)
+    manifest = build_manifest(
+        root=tmp_path,
+        source_commit="abc1234",
+        dirty=False,
+        python_version="3.12.12",
+        uv_lock_hash="a" * 64,
+        migration_head="ws3_runtime_worker_delivery",
+        migration_hash="b" * 64,
+        app_image_id="not_built",
+        postgres_image_id="not_resolved",
+        migration_report_ref=valid_ref,
+        migration_report_hash=valid_hash,
+    )
+    assert verify_manifest(manifest, root=tmp_path)
+
+    for field, replacement in (
+        ("actual_root", "0" * 64),
+        ("sections", {}),
+        ("section_counts", {}),
+    ):
+        changed = json.loads(json.dumps(report))
+        changed["catalog_authority"][field] = replacement
+        payload = (json.dumps(changed, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        ref, digest = _write_cas_evidence(tmp_path / field, "migrations.json", payload)
+        tampered = build_manifest(
+            root=tmp_path,
+            source_commit="abc1234",
+            dirty=False,
+            python_version="3.12.12",
+            uv_lock_hash="a" * 64,
+            migration_head="ws3_runtime_worker_delivery",
+            migration_hash="b" * 64,
+            app_image_id="not_built",
+            postgres_image_id="not_resolved",
+            migration_report_ref=ref,
+            migration_report_hash=digest,
+        )
+        assert not verify_manifest(tampered, root=tmp_path)
+
+
+def test_manifest_rejects_forged_catalog_anchor_after_report_cas_and_manifest_rehash(tmp_path: Path) -> None:
+    seed = build_manifest(
+        root=tmp_path,
+        source_commit="abc1234",
+        dirty=False,
+        python_version="3.12.12",
+        uv_lock_hash="a" * 64,
+        migration_head="ws3_runtime_worker_delivery",
+        migration_hash="b" * 64,
+        app_image_id="not_built",
+        postgres_image_id="not_resolved",
+    )
+    catalog = {
+        "compiler_version": seed["catalog_authority_compiler_version"],
+        "expected_artifact_hash": seed["catalog_authority_artifact_hash"],
+        "expected_root": seed["catalog_authority_expected_root"],
+        "actual_root": seed["catalog_authority_expected_root"],
+        "sections": seed["catalog_authority_sections"],
+        "section_counts": {name: section["count"] for name, section in seed["catalog_authority_sections"].items()},
+    }
+    report = {
+        "status": "completed",
+        "head": "ws3_runtime_worker_delivery",
+        "migration_hash": "b" * 64,
+        "round_trip": ["upgrade head", "downgrade base", "upgrade head"],
+        "business_tables": sorted(WS3_BUSINESS_RELATIONS),
+        "infrastructure_tables": sorted(WS3_INFRASTRUCTURE_RELATIONS),
+        "schema_contract_version": WS3_SCHEMA_CONTRACT_VERSION,
+        "ws3_schema": WS3_SCHEMA_CONTRACT,
+        "catalog_authority": catalog,
+    }
+    root = tmp_path / "forged"
+    forged = json.loads(json.dumps(seed))
+    forged_catalog = forged["catalog_authority_sections"]
+    forged["catalog_authority_compiler_version"] = "catalog-authority-root-forged"
+    forged["catalog_authority_artifact_hash"] = "f" * 64
+    forged["catalog_authority_expected_root"] = "e" * 64
+    forged_report = json.loads(json.dumps(report))
+    forged_report["catalog_authority"] = {
+        "compiler_version": forged["catalog_authority_compiler_version"],
+        "expected_artifact_hash": forged["catalog_authority_artifact_hash"],
+        "expected_root": forged["catalog_authority_expected_root"],
+        "actual_root": forged["catalog_authority_expected_root"],
+        "sections": forged_catalog,
+        "section_counts": {name: section["count"] for name, section in forged_catalog.items()},
+    }
+    report_payload = (json.dumps(forged_report, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    ref, digest = _write_cas_evidence(root, "migrations.json", report_payload)
+    forged["migration_report_ref"] = ref
+    forged["migration_report_hash"] = digest
+    forged["manifest_hash"] = hashlib.sha256(canonical_bytes(forged)).hexdigest()
+
+    # The report/CAS and manifest hashes are internally consistent, but their
+    # entire catalog anchor is fabricated.  Verification must re-read the
+    # source-controlled trusted anchor instead of trusting this self-consistent set.
+    assert not verify_manifest(forged, root=root)
 
 
 def test_release_rejects_semantically_invalid_sbom_after_all_hashes_are_recomputed(tmp_path: Path) -> None:

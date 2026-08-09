@@ -323,7 +323,11 @@ async def test_submit_service_persists_spec_payload_run_and_command(monkeypatch:
     monkeypatch.setattr(
         execution,
         "_build_fixture_spec",
-        lambda *_args: SimpleNamespace(skill_spec_hash="a" * 64, model_dump=lambda **_: {"skill_spec_hash": "a" * 64}),
+        lambda *_args: SimpleNamespace(
+            skill_spec_hash="a" * 64,
+            runtime_build=SimpleNamespace(ref="runtime-build:a", content_hash="b" * 64),
+            model_dump=lambda **_: {"skill_spec_hash": "a" * 64},
+        ),
     )
     monkeypatch.setattr(execution, "insert_spec_if_absent", lambda *_args, **_kwargs: _async_value(None))
     monkeypatch.setattr(execution, "insert_payload_if_absent", lambda *_args, **_kwargs: _async_value(None))
@@ -700,6 +704,8 @@ async def test_repository_run_and_command_writes() -> None:
             submission_digest="a" * 64,
             skill_spec_hash="b" * 64,
             skill_spec_ref="spec:b",
+            runtime_build_ref="runtime-build:b",
+            runtime_build_hash="c" * 64,
         )
         is run
     )
@@ -713,11 +719,13 @@ async def test_repository_run_and_command_writes() -> None:
             submission_digest="a" * 64,
             skill_spec_hash="b" * 64,
             skill_spec_ref="spec:b",
+            runtime_build_ref="runtime-build:b",
+            runtime_build_hash="c" * 64,
         )
         is None
     )
 
-    command_session = _RepositorySession()
+    command_session = _RepositorySession(execute_results=[_Result()])
     command = await repository.insert_command(
         _repository_session(command_session),
         context=context,
@@ -729,4 +737,5 @@ async def test_repository_run_and_command_writes() -> None:
     )
     assert command.status == "pending"
     assert command.command_schema_version == "start.v1"
-    assert command_session.flush_count == 1
+    assert len(command_session.executed) == 1
+    assert command_session.flush_count == 0

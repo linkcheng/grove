@@ -307,7 +307,7 @@ printf '\n'
 curl --fail --silent --show-error -H 'X-Request-ID: integration_ready' http://127.0.0.1:8000/api/v1/health/ready
 printf '\n'
 
-"${compose[@]}" exec -T db psql -U grove_migration -d grove -Atc "SELECT version_num FROM alembic_version" | grep -Fx ws2_tenant_commands
+"${compose[@]}" exec -T db psql -U grove_migration -d grove -Atc "SELECT version_num FROM alembic_version" | grep -Fx ws3_execution_authority_closure
 GROVE_DATABASE_URL=postgresql+psycopg://grove_api:grove_api_ws0@localhost:54329/grove \
 GROVE_MIGRATION_DATABASE_URL=postgresql+psycopg://grove_migration:grove_migration_ws0@localhost:54329/grove \
 GROVE_API_BASE_URL=http://127.0.0.1:8000 \

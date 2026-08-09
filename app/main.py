@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -243,6 +244,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
+def _run_runtime_worker(settings: Settings) -> None:
+    """Start the bounded runtime worker poll loop."""
+    from app.execution import PostgresExecutionDriver
+    from app.worker.loop import run_worker
+
+    engine = create_engine(settings)
+    session_maker = session_factory(engine)
+    driver = PostgresExecutionDriver(
+        session_factory=session_maker,
+        lease_seconds=30.0,
+    )
+    asyncio.run(
+        run_worker(
+            driver=driver,
+            tenant_id=settings.worker_tenant_id,
+            worker_id=settings.worker_id,
+            runtime_build_hash=settings.runtime_build_hash,
+            database_url=settings.database_url_value(),
+        )
+    )
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GROVE role entrypoint")
     parser.add_argument("--role", choices=[role.value for role in Role])
@@ -264,7 +287,12 @@ def main() -> int:
         print(json.dumps(run_role_self_check(settings), ensure_ascii=False, sort_keys=True))
         return 0
     if settings.role is not Role.API:
-        raise SystemExit("non-api roles must use --self-check; no idle worker loop is provided")
+        if args.self_check:
+           print(json.dumps(run_role_self_check(settings), ensure_ascii=False, sort_keys=True))
+           return 0
+        if settings.role is Role.RUNTIME_WORKER:
+           return asyncio.run(_run_runtime_worker(settings))
+        raise SystemExit("non-api/non-runtime_worker roles must use --self-check")
     import uvicorn
 
     logging_runtime = configure_logging(settings.log_level, role=settings.role.value)

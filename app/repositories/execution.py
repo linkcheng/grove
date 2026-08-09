@@ -248,6 +248,8 @@ async def insert_run_if_absent(
     submission_digest: str,
     skill_spec_hash: str,
     skill_spec_ref: str,
+    runtime_build_ref: str,
+    runtime_build_hash: str,
 ) -> AgentRun | None:
     result = await session.execute(
         pg_insert(AgentRun)
@@ -260,6 +262,8 @@ async def insert_run_if_absent(
             principal_kind=context.principal.kind.value,
             skill_spec_hash=skill_spec_hash,
             skill_spec_ref=skill_spec_ref,
+            runtime_build_ref=runtime_build_ref,
+            runtime_build_hash=runtime_build_hash,
             status="accepted",
             revision=0,
         )
@@ -302,20 +306,22 @@ async def insert_command(
     payload_ref: str,
     payload_hash: str,
 ) -> RunCommand:
-    command = RunCommand(
-        command_id=command_id,
-        tenant_id=context.tenant_id,
-        run_id=run_id,
-        principal_id=context.principal.principal_id,
-        principal_kind=context.principal.kind.value,
-        command_seq=0,
-        command_type="start",
-        command_schema_version="start.v1",
-        command_digest=command_digest,
-        payload_ref=payload_ref,
-        payload_hash=payload_hash,
-        status="pending",
-    )
-    session.add(command)
-    await session.flush()
+    values = {
+        "command_id": command_id,
+        "tenant_id": context.tenant_id,
+        "run_id": run_id,
+        "principal_id": context.principal.principal_id,
+        "principal_kind": context.principal.kind.value,
+        "command_seq": 0,
+        "command_type": "start",
+        "command_schema_version": "start.v1",
+        "command_digest": command_digest,
+        "payload_ref": payload_ref,
+        "payload_hash": payload_hash,
+        "status": "pending",
+    }
+    # Use an explicit column insert so the API role cannot set lease/fence
+    # fields, even to NULL, and therefore needs no delivery-state privilege.
+    await session.execute(pg_insert(RunCommand).values(**values))
+    command = RunCommand(**values)
     return command
