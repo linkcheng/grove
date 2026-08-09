@@ -30,6 +30,7 @@ from app.execution.conformance_graph import (
     node_a,
     node_b,
 )
+from app.observation.facts import build_lifecycle_emit_request, build_node_executed_emit_request
 
 logger = logging.getLogger(__name__)
 
@@ -146,12 +147,32 @@ class RuntimeWorker:
         }
         payload_hash = canonical_hash(payload)
         payload_ref = f"continue-payload:{payload_hash}"
+        occurred = datetime.now(UTC)
+        events = [
+            build_node_executed_emit_request(
+                run_id=claim.run_id,
+                command_seq=claim.command_seq,
+                node_id="node_a",
+                stage="start",
+                input_hash=input_hash,
+                value=yielded["value"],
+                occurred_at=occurred,
+            ),
+            build_lifecycle_emit_request(
+                run_id=claim.run_id,
+                command_seq=claim.command_seq,
+                status="running",
+                run_revision=claim.command_seq + 1,
+                occurred_at=occurred,
+            ),
+        ]
         receipt = await self._driver.finish_delivery(
             claim,
             outcome_kind="yield",
             continue_payload_ref=payload_ref,
             continue_payload_hash=payload_hash,
             continue_payload=payload,
+            events=events,
         )
         logger.info(
             "worker.yield run=%s seq=%d continue=%s revision=%d",
@@ -167,7 +188,26 @@ class RuntimeWorker:
 
         await self._write_checkpoint(claim, terminal)
 
-        receipt = await self._driver.finish_delivery(claim, outcome_kind="terminal")
+        occurred = datetime.now(UTC)
+        events = [
+            build_node_executed_emit_request(
+                run_id=claim.run_id,
+                command_seq=claim.command_seq,
+                node_id="node_b",
+                stage="terminal",
+                input_hash=input_hash,
+                value=terminal["value"],
+                occurred_at=occurred,
+            ),
+            build_lifecycle_emit_request(
+                run_id=claim.run_id,
+                command_seq=claim.command_seq,
+                status="succeeded",
+                run_revision=claim.command_seq,
+                occurred_at=occurred,
+            ),
+        ]
+        receipt = await self._driver.finish_delivery(claim, outcome_kind="terminal", events=events)
         logger.info(
             "worker.terminal run=%s seq=%d status=%s",
             claim.run_id, claim.command_seq, receipt.status,

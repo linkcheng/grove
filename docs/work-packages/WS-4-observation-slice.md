@@ -120,8 +120,14 @@ trace、内存事件或 raw RuntimeEvent 渲染，会产生第二状态真相、
 
 - Agent Run、command、checkpoint 和 authorization 继续由现有 owner 持有。
 - RuntimeEvent/Audit Fact 是不可采样的已提交观测事实，但不能恢复执行。
+- RuntimeEvent 行的原子写入属于权威事务的观测侧扩展：在 run→command 锁序内
+  分配 `run_seq` 并插入 outbox 行，不修改 WS-3 状态机转移逻辑；fault matrix 中
+  "kill outbox publisher" 针对 relay/notify 环节，而非权威事务内的原子 INSERT。
+  `run_seq` 由锁定 `agent_run` 行的 commit-order 分配（doc 10 §11、doc 16 §15）。
 - Interaction/UI/Inspect 是可删除并重建的 read model，只报告 source watermark 和完整性。
 - Diagnostic telemetry 允许有界采样或丢弃，只负责诊断，不证明业务事实。
+- OTel Collector 属于可替换诊断基础设施，不是第 5 个 grove 部署角色
+  （ADR-0023）；进程内 OTel SDK 使用有界 export，Collector 故障不反压在线执行。
 - API/SSE 使用公共 ID，并在内部做 tenant-scoped ownership lookup；projection ID、trace
   context 和 Baggage 都不是授权凭据。
 

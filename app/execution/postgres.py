@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Sequence
 from datetime import UTC
 from uuid import UUID
 
@@ -17,6 +18,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.contracts.canonical import canonical_bytes, canonical_hash
+from app.core.trace import current_trace_id
 from app.execution.contracts import (
     BIGINT_MAX,
     CancelRun,
@@ -36,6 +38,7 @@ from app.execution.contracts import (
     _strict_claim,
     _strict_command,
 )
+from app.observation.facts import EmitEventRequest
 
 MAX_LEASE_SECONDS = 90.0
 
@@ -472,6 +475,51 @@ class PostgresExecutionDriver:
             {"tenant_id": tenant_id},
         )
 
+    async def _emit_observation_events(
+        self,
+        session: AsyncSession,
+        claim: ExecutionClaim,
+        events: Sequence[EmitEventRequest],
+    ) -> None:
+        """Emit observation events atomically inside the delivery transaction.
+
+        Called after ``grove_finish_delivery`` reports ``consumed`` while the
+        run→command locks are still held by the same transaction.  The emit
+        allocates commit-ordered ``run_seq`` and inserts the runtime fact and
+        outbox rows; it never mutates WS-3 authority state.
+        """
+
+        descriptors = []
+        for request in events:
+            payload_obj = json.loads(request.canonical_payload_bytes())
+            descriptors.append(
+                {
+                    "event_type": request.event_type,
+                    "source": request.source,
+                    "source_event_id": request.source_event_id,
+                    "payload_schema_ref": request.payload_schema_ref,
+                    "payload": payload_obj,
+                    "occurred_at": request.occurred_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+                }
+            )
+        events_json = json.dumps(descriptors, separators=(",", ":"), ensure_ascii=False)
+        await session.execute(
+            text(
+                "SELECT * FROM grove_emit_runtime_events("
+                ":tenant_id, :run_id, :orchestration_id, :correlation_id, "
+                ":causation_id, :trace_id, CAST(:events AS jsonb))"
+            ),
+            {
+                "tenant_id": claim.tenant_id,
+                "run_id": claim.run_id,
+                "orchestration_id": claim.run_id,
+                "correlation_id": str(claim.run_id),
+                "causation_id": claim.command_id,
+                "trace_id": current_trace_id(),
+                "events": events_json,
+            },
+        )
+
     async def finish_delivery(
         self,
         claim: ExecutionClaim,
@@ -479,6 +527,7 @@ class PostgresExecutionDriver:
         continue_payload_ref: str | None = None,
         continue_payload_hash: str | None = None,
         continue_payload: dict[str, object] | None = None,
+        events: Sequence[EmitEventRequest] | None = None,
     ) -> DeliveryReceipt:
         """Atomically consume the current command and finalize delivery.
 
@@ -534,4 +583,6 @@ class PostgresExecutionDriver:
                     raise RunStateConflict("authoritative checkpoint proof is missing")
                 if code != "consumed":
                     raise RuntimeError("database returned an unknown delivery result")
+                if events:
+                    await self._emit_observation_events(session, trusted, events)
                 return DeliveryReceipt.model_validate(dict(row))

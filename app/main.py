@@ -20,6 +20,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.v1.execution import router as execution_router
 from app.api.v1.health import router as health_router
+from app.api.v1.observation import router as observation_router
 from app.auth.context import active_tenant_context
 from app.core.config import ConfigurationError, Role, Settings, load_settings
 from app.core.errors import AppError
@@ -233,6 +234,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = active
     app.include_router(health_router, prefix="/api/v1")
     app.include_router(execution_router, prefix="/api/v1")
+    app.include_router(observation_router, prefix="/api/v1")
     app.middleware("http")(active_tenant_context_middleware)
     app.middleware("http")(request_trace_middleware)
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
@@ -244,7 +246,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
-def _run_runtime_worker(settings: Settings) -> None:
+def _run_runtime_worker(settings: Settings) -> int:
     """Start the bounded runtime worker poll loop."""
     from app.execution import PostgresExecutionDriver
     from app.worker.loop import run_worker
@@ -264,6 +266,31 @@ def _run_runtime_worker(settings: Settings) -> None:
             database_url=settings.database_url_value(),
         )
     )
+    return 0
+
+
+def _run_projection_reconciliation(settings: Settings) -> int:
+    """Start the bounded projection/reconciliation poll loop."""
+
+    engine = create_engine(settings)
+    session_maker = session_factory(engine)
+    asyncio.run(_run_projection_loop(session_maker))
+    return 0
+
+
+async def _run_projection_loop(session_maker: Any) -> None:
+    import signal as _signal
+
+    from app.observation.projection import ProjectionReconciler
+
+    reconciler = ProjectionReconciler(session_maker)
+    loop = asyncio.get_event_loop()
+    for sig in (_signal.SIGTERM, _signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, reconciler.request_shutdown)
+        except NotImplementedError:
+            pass
+    await reconciler.run()
 
 
 def _parse_args() -> argparse.Namespace:
@@ -291,8 +318,10 @@ def main() -> int:
            print(json.dumps(run_role_self_check(settings), ensure_ascii=False, sort_keys=True))
            return 0
         if settings.role is Role.RUNTIME_WORKER:
-           return asyncio.run(_run_runtime_worker(settings))
-        raise SystemExit("non-api/non-runtime_worker roles must use --self-check")
+           return _run_runtime_worker(settings)
+        if settings.role is Role.PROJECTION_RECONCILIATION:
+           return _run_projection_reconciliation(settings)
+        raise SystemExit("non-api/non-runtime_worker/non-projection roles must use --self-check")
     import uvicorn
 
     logging_runtime = configure_logging(settings.log_level, role=settings.role.value)

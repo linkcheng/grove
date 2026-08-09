@@ -1,0 +1,378 @@
+"""Projection/Reconciliation role: durable outbox consumer -> UI read model.
+
+The projection is the single owner of the rebuildable UI projection read model.
+It consumes the runtime event outbox with a bounded poll loop (the durable
+cursor compensation for ``LISTEN/NOTIFY``), validates each event's versioned
+schema, and produces typed ``UIProjectionEvent`` rows.  Unknown schemas are
+dead-lettered rather than guessed; the read model is always rebuildable from
+the authoritative ``runtime_event`` facts.  The projection never touches WS-3
+authority state and never blocks a Run.
+
+Tenant discovery uses a SECURITY DEFINER helper (``grove_fetch_observation_batch``)
+because the reconciler cannot enumerate tenants through RLS without an active
+tenant context.  All read-model writes remain RLS-scoped to the per-row tenant
+context.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from datetime import datetime
+from typing import Any, Literal
+from uuid import UUID
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.contracts.canonical import ProjectionSourceRef, UIProjectionEvent
+from app.observation.facts import (
+    NODE_EXECUTED_SCHEMA_REF,
+    RUN_LIFECYCLE_SCHEMA_REF,
+    RunLifecyclePayload,
+    build_ui_projection_meta,
+    lifecycle_to_run_status_changed,
+    parse_runtime_payload,
+)
+
+logger = logging.getLogger(__name__)
+
+POLL_INTERVAL_SECONDS = 0.5
+BATCH_SIZE = 100
+UI_TARGET_KIND: Literal["run", "orchestration"] = "run"
+UI_SCHEMA_REF = "grove.ui.run-status-changed.v1"
+_AUDIT_ONLY_SCHEMAS = frozenset({NODE_EXECUTED_SCHEMA_REF})
+
+
+class ProjectionShutdown(Exception):
+    """Raised to break the projection poll loop."""
+
+
+async def _scope_tenant(session: AsyncSession, tenant_id: str) -> None:
+    await session.execute(text("SET LOCAL statement_timeout = '5000ms'"))
+    await session.execute(text("SET LOCAL lock_timeout = '2000ms'"))
+    await session.execute(text("SELECT set_config('grove.tenant_id', :t, true)"), {"t": tenant_id})
+
+
+def _source_refs_json(run_id: UUID, run_seq: int) -> str:
+    ref = ProjectionSourceRef(
+        source_kind="runtime_event",
+        source_ref=f"runtime-event:{run_id}:{run_seq}",
+        source_hash="0" * 64,
+        source_seq=run_seq,
+        source_schema_ref=RUN_LIFECYCLE_SCHEMA_REF,
+    )
+    return json.dumps([ref.model_dump(mode="json")])
+
+
+class ProjectionReconciler:
+    """Consume the runtime event outbox into a rebuildable UI read model."""
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        batch_size: int = BATCH_SIZE,
+    ) -> None:
+        self._session_factory = session_factory
+        self._batch_size = batch_size
+        self._shutdown = asyncio.Event()
+
+    def request_shutdown(self) -> None:
+        self._shutdown.set()
+
+    async def run(self) -> None:
+        logger.info("projection.start")
+        while not self._shutdown.is_set():
+            try:
+                processed = await self.run_once()
+                if processed == 0:
+                    await self._sleep_or_shutdown()
+            except ProjectionShutdown:
+                break
+            except Exception:
+                logger.exception("projection.iteration_error")
+                await self._sleep_or_shutdown()
+        logger.info("projection.stop")
+
+    async def _sleep_or_shutdown(self) -> None:
+        try:
+            await asyncio.wait_for(self._shutdown.wait(), timeout=POLL_INTERVAL_SECONDS)
+            raise ProjectionShutdown()
+        except TimeoutError:
+            pass
+
+    async def run_once(self) -> int:
+        """Process one bounded cross-tenant pass. Returns applied count."""
+        applied = 0
+        while not self._shutdown.is_set():
+            count = await self._process_batch()
+            if count == 0:
+                break
+            applied += count
+        return applied
+
+    async def _process_batch(self) -> int:
+        rows = await self._fetch_pending()
+        if not rows:
+            return 0
+        for row in rows:
+            await self._process_row(row)
+        return len(rows)
+
+    async def _fetch_pending(self) -> list[Any]:
+        async with self._session_factory() as session:
+            result = await session.execute(
+                text("SELECT * FROM grove_fetch_observation_batch(:limit)"), {"limit": self._batch_size}
+            )
+            return list(result.fetchall())
+
+    async def _process_row(self, row: tuple[Any, ...]) -> None:
+        outbox_id, tenant_id, run_id, event_id, run_seq, source = row
+        async with self._session_factory() as session, session.begin():
+            await _scope_tenant(session, tenant_id)
+            await self._apply_outbox_row(
+                session,
+                tenant_id=tenant_id,
+                outbox_id=outbox_id,
+                run_id=run_id,
+                event_id=event_id,
+                run_seq=run_seq,
+                source=source,
+            )
+
+    async def _apply_outbox_row(
+        self,
+        session: AsyncSession,
+        *,
+        tenant_id: str,
+        outbox_id: int,
+        run_id: UUID,
+        event_id: UUID,
+        run_seq: int,
+        source: str,
+    ) -> None:
+        event_row = (
+            await session.execute(
+                text(
+                    "SELECT event_type, payload_schema_ref, payload, occurred_at, "
+                    "correlation_id, causation_id, trace_id, source_event_id "
+                    "FROM runtime_event WHERE event_id = :eid"
+                ),
+                {"eid": event_id},
+            )
+        ).one_or_none()
+        if event_row is None:
+            await self._relay(session, outbox_id)
+            return
+
+        event_type, schema_ref, payload, occurred_at = event_row[0], event_row[1], event_row[2], event_row[3]
+        correlation_id, causation_id, trace_id, source_event_id = (
+            event_row[4], event_row[5], event_row[6], event_row[7]
+        )
+
+        if schema_ref == RUN_LIFECYCLE_SCHEMA_REF:
+            await self._project_lifecycle(
+                session,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                event_id=event_id,
+                run_seq=run_seq,
+                payload=payload,
+                occurred_at=occurred_at,
+                correlation_id=correlation_id,
+                causation_id=causation_id,
+                trace_id=trace_id,
+            )
+        elif schema_ref in _AUDIT_ONLY_SCHEMAS:
+            pass
+        else:
+            await self._dead_letter(
+                session,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                event_id=event_id,
+                run_seq=run_seq,
+                source=source,
+                source_event_id=source_event_id,
+                event_type=event_type,
+                schema_ref=schema_ref,
+                payload=payload,
+                reason=f"unknown payload schema ref: {schema_ref}",
+            )
+        await self._advance_watermark(session, tenant_id, source, outbox_id, run_seq)
+        await self._relay(session, outbox_id)
+
+    async def _project_lifecycle(
+        self,
+        session: AsyncSession,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        event_id: UUID,
+        run_seq: int,
+        payload: Any,
+        occurred_at: datetime,
+        correlation_id: str,
+        causation_id: UUID,
+        trace_id: str,
+    ) -> None:
+        parsed = parse_runtime_payload(RUN_LIFECYCLE_SCHEMA_REF, payload)
+        assert isinstance(parsed, RunLifecyclePayload)
+        ui_payload = lifecycle_to_run_status_changed(parsed)
+        meta = build_ui_projection_meta(
+            tenant_id=tenant_id,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            trace_id=trace_id,
+        )
+        UIProjectionEvent(
+            meta=meta,
+            event_id=event_id,
+            target_kind=UI_TARGET_KIND,
+            target_ref=run_id,
+            projection_seq=1,
+            payload_schema_ref=UI_SCHEMA_REF,
+            payload=ui_payload,
+            source_refs=(
+                ProjectionSourceRef(
+                    source_kind="runtime_event",
+                    source_ref=f"runtime-event:{run_id}:{run_seq}",
+                    source_hash="0" * 64,
+                    source_seq=run_seq,
+                    source_schema_ref=RUN_LIFECYCLE_SCHEMA_REF,
+                ),
+            ),
+            projected_at=occurred_at,
+        )
+        next_seq = (
+            await session.execute(
+                text(
+                    "SELECT COALESCE(MAX(projection_seq), 0) + 1 FROM ui_projection_event "
+                    "WHERE tenant_id = :t AND target_kind = :k AND target_ref = :r"
+                ),
+                {"t": tenant_id, "k": UI_TARGET_KIND, "r": run_id},
+            )
+        ).scalar_one()
+        await session.execute(
+            text(
+                "INSERT INTO ui_projection_event ("
+                "tenant_id, target_kind, target_ref, event_id, projection_seq, "
+                "contract_version, correlation_id, causation_id, trace_id, "
+                "payload_schema_ref, payload, source_refs, projected_at"
+                ") VALUES ("
+                ":t, :k, :r, :eid, :seq, :cv, :corr, :caus, :trace, "
+                ":schema, CAST(:payload AS jsonb), CAST(:src AS jsonb), :at"
+                ") ON CONFLICT (tenant_id, event_id) DO NOTHING"
+            ),
+            {
+                "t": tenant_id, "k": UI_TARGET_KIND, "r": run_id, "eid": event_id, "seq": next_seq,
+                "cv": meta.contract_version, "corr": correlation_id, "caus": causation_id,
+                "trace": trace_id, "schema": UI_SCHEMA_REF,
+                "payload": json.dumps(ui_payload.model_dump(mode="json"), sort_keys=True),
+                "src": _source_refs_json(run_id, run_seq), "at": occurred_at,
+            },
+        )
+
+    async def _dead_letter(
+        self,
+        session: AsyncSession,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        event_id: UUID,
+        run_seq: int,
+        source: str,
+        source_event_id: str,
+        event_type: str,
+        schema_ref: str,
+        payload: Any,
+        reason: str,
+    ) -> None:
+        await session.execute(
+            text(
+                "INSERT INTO runtime_event_dead_letter ("
+                "tenant_id, run_id, event_id, run_seq, source, source_event_id, "
+                "event_type, payload_schema_ref, payload, reason"
+                ") VALUES ("
+                ":t, :r, :eid, :rs, :src, :seid, :et, :schema, CAST(:payload AS jsonb), :reason"
+                ") ON CONFLICT (tenant_id, event_id) DO NOTHING"
+            ),
+            {
+                "t": tenant_id, "r": run_id, "eid": event_id, "rs": run_seq, "src": source,
+                "seid": source_event_id, "et": event_type, "schema": schema_ref,
+                "payload": json.dumps(payload), "reason": reason,
+            },
+        )
+
+    async def _advance_watermark(
+        self, session: AsyncSession, tenant_id: str, source: str, outbox_id: int, run_seq: int
+    ) -> None:
+        await session.execute(
+            text(
+                "INSERT INTO projection_watermark ("
+                "tenant_id, source, last_outbox_id, last_run_seq, event_count"
+                ") VALUES (:t, :s, :oid, :rs, 1) "
+                "ON CONFLICT (tenant_id, source) DO UPDATE SET "
+                "last_outbox_id = GREATEST(projection_watermark.last_outbox_id, EXCLUDED.last_outbox_id), "
+                "last_run_seq = GREATEST(projection_watermark.last_run_seq, EXCLUDED.last_run_seq), "
+                "event_count = projection_watermark.event_count + 1, updated_at = now()"
+            ),
+            {"t": tenant_id, "s": source, "oid": outbox_id, "rs": run_seq},
+        )
+
+    async def _relay(self, session: AsyncSession, outbox_id: int) -> None:
+        await session.execute(
+            text("UPDATE runtime_event_outbox SET relayed_at = now() WHERE outbox_id = :oid"),
+            {"oid": outbox_id},
+        )
+
+    async def rebuild(self, tenant_id: str) -> int:
+        """Rebuild the UI read model from authoritative runtime_event facts."""
+        async with self._session_factory() as session, session.begin():
+            await _scope_tenant(session, tenant_id)
+            await session.execute(
+                text("DELETE FROM ui_projection_event WHERE tenant_id = :t"), {"t": tenant_id}
+            )
+            await session.execute(
+                text("DELETE FROM projection_watermark WHERE tenant_id = :t"), {"t": tenant_id}
+            )
+            rows = (
+                await session.execute(
+                    text(
+                        "SELECT re.event_id, re.run_id, re.run_seq, re.payload, re.occurred_at, "
+                        "re.correlation_id, re.causation_id, re.trace_id "
+                        "FROM runtime_event re WHERE re.tenant_id = :t "
+                        "AND re.payload_schema_ref = :schema ORDER BY re.run_seq"
+                    ),
+                    {"t": tenant_id, "schema": RUN_LIFECYCLE_SCHEMA_REF},
+                )
+            ).fetchall()
+            for row in rows:
+                await self._project_lifecycle(
+                    session,
+                    tenant_id=tenant_id,
+                    run_id=row[1],
+                    event_id=row[0],
+                    run_seq=row[2],
+                    payload=row[3],
+                    occurred_at=row[4],
+                    correlation_id=row[5],
+                    causation_id=row[6],
+                    trace_id=row[7],
+                )
+            return len(rows)
+
+    async def health(self) -> dict[str, Any]:
+        """Return low-cardinality projection health for the readiness endpoint."""
+        async with self._session_factory() as session:
+            result = (
+                await session.execute(text("SELECT * FROM grove_observation_health()"))
+            ).one_or_none()
+        if result is None:
+            return {"status": "ready", "backlog": 0, "unknown_schema": 0}
+        return {"status": "ready", "backlog": result[0], "unknown_schema": result[1]}
+
+
+__all__ = ["ProjectionReconciler", "ProjectionShutdown"]
