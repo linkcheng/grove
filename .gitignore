@@ -22,4 +22,5 @@ coverage.xml
 ci-evidence/
 .DS_Store
 .workbuddy/
-.codex/
+.codex/*
+!.codex/work-packages.toml

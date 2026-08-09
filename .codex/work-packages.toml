@@ -1,0 +1,54 @@
+schema_version = 1
+project_name = "GROVE"
+
+[work_item]
+id_regex = '(?i)^WS-(?P<number>0|[1-9][0-9]*)$'
+canonical_id_template = "WS-{number}"
+roadmap_document = "ROADMAP.md"
+roadmap_section = "Work Packages"
+task_directory = "docs/work-packages"
+task_file_template = "{item_id}-{name_slug}.md"
+require_name_on_id_line = true
+
+[status]
+spec = ["draft", "accepted", "superseded"]
+delivery = ["not_started", "in_progress", "blocked", "implemented", "verified"]
+goal_ready_spec = "accepted"
+
+[git]
+branch_template = "codex/{id_lower}-{name_slug}"
+commit_template = "feat: establish GROVE {item_id} {name_lower}"
+allow_pr = false
+allow_push = false
+allow_merge = false
+
+[agents]
+worker = "luna_worker"
+reviewer = "sol_reviewer"
+serial_only = true
+
+[documents]
+always_read = [
+  "AGENTS.md",
+  "CONTEXT.md",
+  "ROADMAP.md",
+  "docs/00_GROVE_Architecture.md",
+  "docs/90_P0_Blockers_and_Acceptance.md",
+]
+
+[commands]
+baseline = ["make verify", "make release-check"]
+work_package = ["make {id_lower}-check"]
+final = [
+  "make verify",
+  "make {id_lower}-check",
+  "make cleanroom-check",
+  "make release-check",
+  "git diff --check origin/main...HEAD",
+  "git status --short --branch",
+]
+
+[scope]
+dependency_sections = ["14.3 依赖与并行边界"]
+discipline_sections = ["14.4 实施纪律"]
+release_boundary = "WS-0～WS-4 是工程增量；只有 WS-5/WS-7 的精确验收记录可以形成对应发布结论。"

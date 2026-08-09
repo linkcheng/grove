@@ -1088,16 +1088,20 @@ Skill channel、提供领域质量分数或关闭 G3。测试数据、fixture Sk
 
 ### 14.2 Work Package 与退出条件
 
-| Work Package | 实现范围 | 可观察退出条件 | Gate/证据 |
-|---|---|---|---|
-| WS-0 Build Baseline | 建立单代码库发布闭包、锁定依赖、role entrypoint、migration pipeline、CI evidence store 和 `RuntimeBuildManifest` 生成 | 可重复 build/migrate，API/Worker/Projector/Offline role 只能按声明启动；无业务默认配置 | G0 的 build/migration/SBOM/signature/rollback 基础证据；首次 `framework-baseline` |
-| WS-1 Contract Spine | 实现 Canonical Contracts、Skill/Manifest/Spec hash、version converter、Capability/Permission/Disabled adapter 和 dependency rule | 相同输入产生稳定 hash；未知版本、closure 外调用和缺 capability 均在 provider 前失败 | POC-F/G；G1；N-15/N-16/N-18/N-19 的 contract 子集 |
-| WS-2 Tenant-aware Command | 实现认证入口、Active Tenant Context、Workload Principal、数据库最小角色/RLS、submit/query command 与 idempotency/revision | API 只持久化命令且不执行 Graph；跨 Tenant、重复和冲突命令满足同一 contract | POC-D 对应部分；G4；N-08/N-20/N-22 的入口子集 |
-| WS-3 Durable Execution | 实现 PostgreSQL Execution Driver、claim/lease/fence、LangGraph invocation、PostgresSaver、checkpoint 与 crash reconciliation | kill 任一 Worker 后只有一个有效写者，已提交 command/checkpoint 不丢失，API 无 Graph 执行能力 | POC-I、POC-C Core 子集；G2/G5；N-03/N-05/N-25 |
-| WS-4 Observation Slice | 实现 event/audit outbox、Runtime/Interaction/UI projector、SSE cursor/backfill、generic Run Inspect、OTel 与 role health | Projector/Collector/SSE 故障不阻断 Run；重启后按 watermark 收敛且未知 schema 不猜测 | POC-D UI/event 子集；G7；N-07/N-11/N-29 |
-| WS-5 Core Release Proof | 对同一 build 运行 role fault matrix、cross-Tenant/security、load/30 天等效容量、PITR、dashboard/runbook drill 和 Skill Governance conformance evaluation | G0～G2、G4～G8 全部通过，所有适用 Core P0 verified；生成 `business_profile_ref=null` 的记录 | POC-H、适用 POC-C/D/F/G/I；Core `ImplementationAcceptanceRecord` |
-| WS-6 Selected Profile E2E | 冻结一个 Business Profile，接入其真实 corpus/Snapshot、model/provider、声明的 Tool/Action 和 typed renderer，建立 golden dataset 与 human review | 从认证提交到业务结果/UI/Inspect 的全部声明 seam 在 Reference Target 上通过；无 Profile 外能力 | POC-E Knowledge Baseline、Profile-specific POC、G3；若选择 Asset Risk 才执行 POC-M |
-| WS-7 Product MVP Release | 对精确 Product build/profile/config 重跑受影响通用 gate，完成业务 Evaluation、security/load/soak、rollout/rollback 审批 | G0～G8 和适用 P0/P1 满足 12.1，生成非空 `business_profile_ref/hash` 的批准记录 | Product MVP `ImplementationAcceptanceRecord` |
+Work Package 的编号、名称、依赖、状态和结果摘要只在
+[`ROADMAP.md`](../ROADMAP.md) 注册。本节只保留 Gate/证据映射，不复制任务状态或详细
+任务书。
+
+| Work Package | Gate/证据 |
+|---|---|
+| WS-0 | G0 的 build/migration/SBOM/signature/rollback 基础证据；首次 `framework-baseline` |
+| WS-1 | POC-F/G；G1；N-15/N-16/N-18/N-19 的 contract 子集 |
+| WS-2 | POC-D 对应部分；G4；N-08/N-20/N-22 的入口子集 |
+| WS-3 | POC-I、POC-C Core 子集；G2/G5；N-03/N-05/N-25 |
+| WS-4 | POC-D UI/event 子集；G7；N-07/N-11/N-29 |
+| WS-5 | POC-H、适用 POC-C/D/F/G/I；Core `ImplementationAcceptanceRecord` |
+| WS-6 | POC-E Knowledge Baseline、Profile-specific POC、G3；若选择 Asset Risk 才执行 POC-M |
+| WS-7 | Product MVP `ImplementationAcceptanceRecord` |
 
 WS-0～WS-4 只是可演示的工程增量，不能称为 release。WS-5 的出口是通用 Core
 Release，不是产品完成；WS-6 开始前必须冻结目标 Business Profile。若所选 Profile
@@ -1107,15 +1111,7 @@ Profile closure 删除、用 mock 成功或包装成普通 Tool。
 
 ### 14.3 依赖与并行边界
 
-```text
-WS-0 → WS-1 → WS-2 → WS-3 → WS-4 → WS-5 Core Release
-                  │
-                  └─ product discovery may select Business Profile
-                                      ↓
-                           applicable Release Tracks
-                                      ↓
-                                  WS-6 → WS-7 Product MVP
-```
+精确依赖图只维护在 [`ROADMAP.md`](../ROADMAP.md)。以下内容约束允许的并行工作与阶段边界。
 
 - Business Profile discovery 可以与 WS-2～WS-5 并行，但不能修改 Core contract 来
   迎合单一领域；共性只有在至少两个真实 Profile 证明后才考虑上提。
