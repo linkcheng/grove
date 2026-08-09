@@ -13,7 +13,7 @@ from app.contracts.canonical import (
     RunStatusChanged,
     UIProjectionEvent,
 )
-from app.observation.facts import UI_PROJECTION_SCHEMA_REF
+from app.observation.facts import UI_PROJECTION_SCHEMA_REF, PublicRunStatus
 from app.observation.reducer import RunViewState, reduce_run_view
 
 RUN_ID = UUID("22222222-2222-2222-2222-222222222222")
@@ -43,7 +43,7 @@ def _meta(tenant_id: str = "tenant-a", correlation_id: str = "corr-1") -> Contra
 
 def run_status_event(
     seq: int,
-    status: str,
+    status: PublicRunStatus,
     revision: int,
     *,
     tenant_id: str = "tenant-a",

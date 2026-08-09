@@ -1,7 +1,7 @@
 """Execution Driver contracts."""
 
 from app.execution.checkpoint import FencedPostgresSaver
-from app.execution.contracts import BIGINT_MAX, ExecutionFenceExhausted
+from app.execution.contracts import BIGINT_MAX, DeliveryReceipt, ExecutionFenceExhausted
 from app.execution.driver import (
     MAX_LEASE_SECONDS,
     MAX_TIME_ADVANCE_SECONDS,
@@ -40,7 +40,6 @@ from app.execution.driver import (
     derive_signal_command_id,
     derive_signal_id,
 )
-from app.execution.contracts import DeliveryReceipt
 from app.execution.postgres import PostgresExecutionDriver
 
 __all__ = [

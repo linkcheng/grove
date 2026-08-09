@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 from app.execution.conformance_graph import (
+    ConformanceState,
     build_conformance_graph,
     compute_input_hash,
     initial_state,
@@ -25,7 +28,7 @@ def test_different_inputs_produce_different_hashes() -> None:
 
 def test_node_a_produces_yielded_state() -> None:
     state = initial_state("test")
-    result = node_a(dict(state))
+    result = node_a(cast(ConformanceState, dict(state)))
     assert result["stage"] == "yielded"
     assert result["yield_marker"] == "stage_a_done"
     assert isinstance(result["value"], int)
@@ -34,7 +37,7 @@ def test_node_a_produces_yielded_state() -> None:
 
 def test_node_b_produces_terminal_state() -> None:
     yielded = node_a(initial_state("test"))
-    result = node_b(dict(yielded))
+    result = node_b(cast(ConformanceState, dict(yielded)))
     assert result["stage"] == "terminal"
     assert result["output_payload"] is not None
     assert result["output_hash"] is not None

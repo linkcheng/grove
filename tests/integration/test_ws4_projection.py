@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from app.observation.projection import ProjectionReconciler
@@ -77,7 +78,7 @@ def _lifecycle_payload(run_id: uuid.UUID, status: str, revision: int) -> dict[st
     return {"kind": "run_lifecycle", "run_id": str(run_id), "status": status, "run_revision": revision}
 
 
-async def _ui_events(tenant: str, run_id: uuid.UUID) -> list[dict[str, object]]:
+async def _ui_events(tenant: str, run_id: uuid.UUID) -> list[dict[str, Any]]:
     engine = create_async_engine(MIGRATION_URL)
     try:
         async with engine.connect() as conn:
@@ -97,10 +98,10 @@ async def _outbox_relayed(tenant: str) -> int:
     engine = create_async_engine(MIGRATION_URL)
     try:
         async with engine.connect() as conn:
-            return (await conn.execute(
+            return int((await conn.execute(
                 text("SELECT count(*) FROM runtime_event_outbox WHERE tenant_id = :t AND relayed_at IS NOT NULL"),
                 {"t": tenant},
-            )).scalar_one()
+            )).scalar_one())
     finally:
         await engine.dispose()
 

@@ -35,7 +35,7 @@ class TestPayloads:
 
     def test_run_lifecycle_rejects_unknown_status(self) -> None:
         with pytest.raises(ValidationError):
-            RunLifecyclePayload(kind="run_lifecycle", run_id=RUN_ID, status="zombie", run_revision=1)
+            RunLifecyclePayload(kind="run_lifecycle", run_id=RUN_ID, status="zombie", run_revision=1)  # type: ignore[arg-type]
 
     def test_node_executed_payload_validates(self) -> None:
         payload = NodeExecutedPayload(

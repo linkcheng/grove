@@ -23,10 +23,11 @@ import pytest
 from app.contracts.canonical import canonical_hash
 from app.execution import PostgresExecutionDriver
 from app.execution.checkpoint import FencedPostgresSaver
-from app.execution.conformance_graph import compute_input_hash, node_a, node_b
+from app.execution.conformance_graph import ConformanceState, compute_input_hash, node_a, node_b
 from app.observation.facts import build_lifecycle_emit_request, build_node_executed_emit_request
 from app.observation.projection import ProjectionReconciler
-from langgraph.checkpoint.base import CheckpointMetadata, empty_checkpoint
+from langchain_core.runnables.config import RunnableConfig
+from langgraph.checkpoint.base import ChannelVersions, CheckpointMetadata, empty_checkpoint
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -106,16 +107,16 @@ def _driver() -> PostgresExecutionDriver:
     return PostgresExecutionDriver(session_factory=session_maker, lease_seconds=30.0)
 
 
-async def _checkpoint(claim: Any, state: dict[str, Any]) -> None:
+async def _checkpoint(claim: Any, state: ConformanceState) -> None:
     conninfo = RUNTIME_URL.replace("postgresql+psycopg://", "postgresql://")
     async with await psycopg.AsyncConnection.connect(conninfo=conninfo) as conn:
         ck = empty_checkpoint()
-        versions = {k: str(v) for k, v in state.items()}
+        versions: ChannelVersions = {k: str(v) for k, v in state.items()}
         ck["channel_versions"] = versions
         ck["channel_values"] = dict(state)
         config: dict[str, Any] = {"configurable": {"thread_id": str(claim.run_id), "checkpoint_ns": ""}}
         saver = FencedPostgresSaver(conn, claim)
-        await saver.aput(config, ck, cast(CheckpointMetadata, {}), versions)
+        await saver.aput(cast("RunnableConfig", config), ck, cast(CheckpointMetadata, {}), versions)
         await conn.commit()
 
 
@@ -123,9 +124,9 @@ async def _count(table: str, tenant: str) -> int:
     engine = create_async_engine(MIGRATION_URL)
     try:
         async with engine.connect() as conn:
-            return (await conn.execute(
+            return int((await conn.execute(
                 text(f"SELECT count(*) FROM {table} WHERE tenant_id = :t"), {"t": tenant}  # noqa: S608
-            )).scalar_one()
+            )).scalar_one())
     finally:
         await engine.dispose()
 

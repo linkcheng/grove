@@ -17,12 +17,13 @@ import pytest
 from app.contracts.canonical import canonical_hash
 from app.execution import PostgresExecutionDriver
 from app.execution.checkpoint import FencedPostgresSaver
-from app.execution.conformance_graph import compute_input_hash, node_a, node_b
+from app.execution.conformance_graph import ConformanceState, compute_input_hash, node_a, node_b
 from app.observation.facts import (
     build_lifecycle_emit_request,
     build_node_executed_emit_request,
 )
-from langgraph.checkpoint.base import CheckpointMetadata, empty_checkpoint
+from langchain_core.runnables.config import RunnableConfig
+from langgraph.checkpoint.base import ChannelVersions, CheckpointMetadata, empty_checkpoint
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -108,16 +109,16 @@ def _make_driver() -> PostgresExecutionDriver:
     )
 
 
-async def _write_checkpoint(claim: Any, state: dict[str, Any]) -> None:
+async def _write_checkpoint(claim: Any, state: ConformanceState) -> None:
     conninfo = RUNTIME_URL.replace("postgresql+psycopg://", "postgresql://")
     async with await psycopg.AsyncConnection.connect(conninfo=conninfo) as conn:
         checkpoint = empty_checkpoint()
-        versions = {k: str(v) for k, v in state.items()}
+        versions: ChannelVersions = {k: str(v) for k, v in state.items()}
         checkpoint["channel_versions"] = versions
         checkpoint["channel_values"] = dict(state)
         config: dict[str, Any] = {"configurable": {"thread_id": str(claim.run_id), "checkpoint_ns": ""}}
         saver = FencedPostgresSaver(conn, claim)
-        await saver.aput(config, checkpoint, cast(CheckpointMetadata, {}), versions)
+        await saver.aput(cast("RunnableConfig", config), checkpoint, cast(CheckpointMetadata, {}), versions)
         await conn.commit()
 
 

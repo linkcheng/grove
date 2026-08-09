@@ -30,8 +30,9 @@ async def _seed(tenant: str, run_id: uuid.UUID, status: str, revision: int) -> N
         await conn.execute(text("INSERT INTO tenant (tenant_id) VALUES (:t) ON CONFLICT DO NOTHING"), {"t": tenant})
         await conn.execute(
             text(
-                "INSERT INTO workload_principal (tenant_id, principal_id, principal_kind, workload_ref, scopes, active) "
-                "VALUES (:t, 'obs-worker', 'workload', 'obs', '[\"execution.run\"]'::jsonb, true) ON CONFLICT DO NOTHING"
+                "INSERT INTO workload_principal (tenant_id, principal_id, principal_kind, "
+                "workload_ref, scopes, active) VALUES (:t, 'obs-worker', 'workload', "
+                "'obs', '[\"execution.run\"]'::jsonb, true) ON CONFLICT DO NOTHING"
             ),
             {"t": tenant},
         )

@@ -10,19 +10,15 @@ These tests use real PostgreSQL with the grove_runtime role.
 from __future__ import annotations
 
 import asyncio
-import os
 import uuid
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import psycopg
 import pytest
+from app.execution import PostgresExecutionDriver, StaleExecutionFence
+from app.execution.conformance_graph import compute_input_hash, node_a, node_b
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
-from app.execution import PostgresExecutionDriver, StaleExecutionFence, VersionUnavailable
-from app.execution.conformance_graph import compute_input_hash, node_a, node_b
-from app.execution.contracts import DeliveryReceipt
 
 API_URL = "postgresql+psycopg://grove_api:grove_api_ws0@127.0.0.1:54329/grove"
 RUNTIME_URL = "postgresql+psycopg://grove_runtime:grove_runtime_ws0@127.0.0.1:54329/grove"
@@ -31,7 +27,10 @@ BUILD_HASH = "a" * 64
 TENANT_BASE = "crash-test-tenant"
 
 
-async def _submit_run(run_id: uuid.UUID, submission_id: uuid.UUID, tenant: str = TENANT_BASE, runtime_build_hash: str = BUILD_HASH) -> None:
+async def _submit_run(
+    run_id: uuid.UUID, submission_id: uuid.UUID, tenant: str = TENANT_BASE,
+    runtime_build_hash: str = BUILD_HASH,
+) -> None:
     """Insert a tenant, spec, run, and pending start command directly."""
     payload_hash = run_id.hex.ljust(64, "0")[:64]
     payload_ref = f"start-payload-{run_id}"
@@ -104,7 +103,8 @@ async def _submit_run(run_id: uuid.UUID, submission_id: uuid.UUID, tenant: str =
                 "VALUES (:t, :cid, :rid, 'crash-worker', 'workload', "
                 "0, 'start', 'start.v1', :dig, :pref, :ph, 'pending')"
             ),
-            {"t": tenant, "cid": uuid.uuid4(), "rid": run_id, "dig": payload_hash, "ph": payload_hash, "pref": payload_ref},
+            {"t": tenant, "cid": uuid.uuid4(), "rid": run_id,
+             "dig": payload_hash, "ph": payload_hash, "pref": payload_ref},
         )
     await engine.dispose()
 
@@ -214,9 +214,11 @@ class TestWorkerCrashRecovery:
         assert claim_a is not None
 
         # Write checkpoint as worker A.
-        from app.execution.checkpoint import FencedPostgresSaver
-        from langgraph.checkpoint.base import CheckpointMetadata, empty_checkpoint
         from typing import cast
+
+        from app.execution.checkpoint import FencedPostgresSaver
+        from langchain_core.runnables.config import RunnableConfig
+        from langgraph.checkpoint.base import ChannelVersions, CheckpointMetadata, empty_checkpoint
 
         input_hash = compute_input_hash("grove-conformance")
         yielded = node_a({"stage": "start", "input_hash": input_hash, "value": 0})
@@ -224,14 +226,14 @@ class TestWorkerCrashRecovery:
         conninfo = RUNTIME_URL.replace("postgresql+psycopg://", "postgresql://")
         async with await psycopg.AsyncConnection.connect(conninfo=conninfo) as conn:
             checkpoint = empty_checkpoint()
-            versions = {k: str(v) for k, v in yielded.items()}
+            versions: ChannelVersions = {k: str(v) for k, v in yielded.items()}
             checkpoint["channel_versions"] = versions
             checkpoint["channel_values"] = dict(yielded)
             config: dict[str, Any] = {
                 "configurable": {"thread_id": str(run_id), "checkpoint_ns": ""}
             }
             saver = FencedPostgresSaver(conn, claim_a)
-            await saver.aput(config, checkpoint, cast(CheckpointMetadata, {}), versions)
+            await saver.aput(cast("RunnableConfig", config), checkpoint, cast(CheckpointMetadata, {}), versions)
             await conn.commit()
 
         # Worker A "crashes" after checkpoint, before finish_delivery.
@@ -295,9 +297,11 @@ class TestWorkerCrashRecovery:
         assert claim is not None
 
         # Write checkpoint.
-        from app.execution.checkpoint import FencedPostgresSaver
-        from langgraph.checkpoint.base import CheckpointMetadata, empty_checkpoint
         from typing import cast
+
+        from app.execution.checkpoint import FencedPostgresSaver
+        from langchain_core.runnables.config import RunnableConfig
+        from langgraph.checkpoint.base import ChannelVersions, CheckpointMetadata, empty_checkpoint
 
         input_hash = compute_input_hash("grove-conformance")
         yielded = node_a({"stage": "start", "input_hash": input_hash, "value": 0})
@@ -305,14 +309,14 @@ class TestWorkerCrashRecovery:
         conninfo = RUNTIME_URL.replace("postgresql+psycopg://", "postgresql://")
         async with await psycopg.AsyncConnection.connect(conninfo=conninfo) as conn:
             checkpoint = empty_checkpoint()
-            versions = {k: str(v) for k, v in yielded.items()}
+            versions: ChannelVersions = {k: str(v) for k, v in yielded.items()}
             checkpoint["channel_versions"] = versions
             checkpoint["channel_values"] = dict(yielded)
             config: dict[str, Any] = {
                 "configurable": {"thread_id": str(run_id), "checkpoint_ns": ""}
             }
             saver = FencedPostgresSaver(conn, claim)
-            await saver.aput(config, checkpoint, cast(CheckpointMetadata, {}), versions)
+            await saver.aput(cast("RunnableConfig", config), checkpoint, cast(CheckpointMetadata, {}), versions)
             await conn.commit()
 
         # First finish_delivery.
@@ -381,10 +385,12 @@ class TestWorkerCrashRecovery:
         await _submit_run(run_id, submission_id, tenant)
 
         driver = _make_runtime_driver()
-        from app.execution.checkpoint import FencedPostgresSaver
-        from langgraph.checkpoint.base import CheckpointMetadata, empty_checkpoint
         from typing import cast
+
         from app.contracts.canonical import canonical_hash
+        from app.execution.checkpoint import FencedPostgresSaver
+        from langchain_core.runnables.config import RunnableConfig
+        from langgraph.checkpoint.base import ChannelVersions, CheckpointMetadata, empty_checkpoint
 
         # Stage 1: start → yield
         claim1 = await driver.claim(
@@ -400,12 +406,12 @@ class TestWorkerCrashRecovery:
         conninfo = RUNTIME_URL.replace("postgresql+psycopg://", "postgresql://")
         async with await psycopg.AsyncConnection.connect(conninfo=conninfo) as conn:
             checkpoint = empty_checkpoint()
-            versions = {k: str(v) for k, v in yielded.items()}
+            versions: ChannelVersions = {k: str(v) for k, v in yielded.items()}
             checkpoint["channel_versions"] = versions
             checkpoint["channel_values"] = dict(yielded)
             config = {"configurable": {"thread_id": str(run_id), "checkpoint_ns": ""}}
             saver = FencedPostgresSaver(conn, claim1)
-            await saver.aput(config, checkpoint, cast(CheckpointMetadata, {}), versions)
+            await saver.aput(cast("RunnableConfig", config), checkpoint, cast(CheckpointMetadata, {}), versions)
             await conn.commit()
 
         payload = {"outcome_kind": "yield", "input_hash": input_hash, "value": yielded["value"]}
@@ -436,7 +442,7 @@ class TestWorkerCrashRecovery:
             checkpoint["channel_values"] = dict(terminal)
             config = {"configurable": {"thread_id": str(run_id), "checkpoint_ns": ""}}
             saver = FencedPostgresSaver(conn, claim2)
-            await saver.aput(config, checkpoint, cast(CheckpointMetadata, {}), versions)
+            await saver.aput(cast("RunnableConfig", config), checkpoint, cast(CheckpointMetadata, {}), versions)
             await conn.commit()
 
         receipt2 = await driver.finish_delivery(claim2, outcome_kind="terminal")

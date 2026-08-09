@@ -1836,7 +1836,7 @@ WS3_SCHEMA_CONTRACT["functions"].update(
             "definition_sha256": "fcccb177c86edebaff2031a335d9f96e2d62f46db577cc8b2061fb292dcecbe0",
         },
         "public.grove_finish_delivery(p_tenant_id text, p_run_id uuid, p_command_id uuid, p_command_seq bigint, p_command_digest text, p_runtime_build_hash text, p_worker_id text, p_execution_fence bigint, p_expected_lease_until timestamp with time zone, p_outcome_kind text, p_continue_payload_ref text, p_continue_payload_hash text, p_continue_payload jsonb)": {  # noqa: E501
-            "identity_arguments": "p_tenant_id text, p_run_id uuid, p_command_id uuid, p_command_seq bigint, p_command_digest text, p_runtime_build_hash text, p_worker_id text, p_execution_fence bigint, p_expected_lease_until timestamp with time zone, p_outcome_kind text, p_continue_payload_ref text, p_continue_payload_hash text, p_continue_payload jsonb",
+            "identity_arguments": "p_tenant_id text, p_run_id uuid, p_command_id uuid, p_command_seq bigint, p_command_digest text, p_runtime_build_hash text, p_worker_id text, p_execution_fence bigint, p_expected_lease_until timestamp with time zone, p_outcome_kind text, p_continue_payload_ref text, p_continue_payload_hash text, p_continue_payload jsonb",  # noqa: E501
             "owner": "grove_migration",
             "security_definer": True,
             "settings": ["search_path=pg_catalog, public"],

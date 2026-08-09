@@ -12,10 +12,11 @@ import asyncio
 import logging
 import signal
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import cast
 
 import psycopg
-from langgraph.checkpoint.base import CheckpointMetadata, empty_checkpoint
+from langchain_core.runnables.config import RunnableConfig
+from langgraph.checkpoint.base import ChannelVersions, CheckpointMetadata, empty_checkpoint
 
 from app.contracts.canonical import canonical_hash
 from app.execution import (
@@ -218,15 +219,15 @@ class RuntimeWorker:
         conninfo = self._database_url.replace("postgresql+asyncpg://", "postgresql://")
         async with await psycopg.AsyncConnection.connect(conninfo=conninfo) as connection:
             checkpoint = empty_checkpoint()
-            versions = {k: str(v) for k, v in state.items()}
+            versions: ChannelVersions = {k: str(v) for k, v in state.items()}
             checkpoint["channel_versions"] = versions
             checkpoint["channel_values"] = dict(state)
-            config: dict[str, Any] = {
-                "configurable": {
+            config = RunnableConfig(
+                configurable={
                     "thread_id": str(claim.run_id),
                     "checkpoint_ns": "",
                 }
-            }
+            )
             saver = FencedPostgresSaver(connection, claim)
             await saver.aput(
                 config,
