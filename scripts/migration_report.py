@@ -1190,17 +1190,16 @@ def catalog_authority_state(database_url: str | None = None) -> dict[str, object
 
 
 def _ws3_database_state_impl(database_url: str | None = None) -> dict[str, object]:
-    """Read the complete v7 authority surface from independent pg_catalog facts."""
+    """Read the finite WS-3 v7 authority surface from independent catalog facts."""
 
     configured_url = load_settings().database_url_value() if database_url is None else database_url
     with psycopg.connect(_psycopg_url(configured_url), connect_timeout=10) as connection:
         with connection.cursor() as cursor:
             relation_names = _authority_relation_names()
 
-            # All non-extension public pg_class objects are enumerated first.
-            # The expected set is checked before any relation-specific query so
-            # an extra table/index/sequence/view/composite cannot hide behind
-            # an exclusion or grant filter.
+            # Enumerate non-extension public pg_class objects, then project the
+            # result onto the finite WS-3 authority inventory. Later work
+            # packages may add unrelated objects to the open public catalog.
             cursor.execute(
                 """
                 SELECT n.nspname, c.relname, c.relkind, owner.rolname,
@@ -1284,13 +1283,17 @@ def _ws3_database_state_impl(database_url: str | None = None) -> dict[str, objec
                     "index": index_facts,
                 }
             expected_object_identities = set(WS3_AUTHORITY_OBJECT_INVENTORY)
-            if set(object_inventory) != expected_object_identities:
+            # WS-3 authority objects must exist (subset check).  Newer migrations
+            # (WS-4 observation slice) legitimately add objects outside WS-3
+            # authority scope; the open-world catalog is not a security proof.
+            missing_objects = expected_object_identities - set(object_inventory)
+            if missing_objects:
                 raise MigrationReportError(
-                    "public authority object catalog set drift: "
-                    f"expected={sorted(expected_object_identities)!r}, actual={sorted(object_inventory)!r}"
+                    f"public authority object catalog missing WS-3 objects: missing={sorted(missing_objects)!r}"
                 )
-            if object_inventory != WS3_AUTHORITY_OBJECT_INVENTORY:
-                raise MigrationReportError("public authority object semantic inventory drift")
+            for identity in expected_object_identities:
+                if object_inventory[identity] != WS3_AUTHORITY_OBJECT_INVENTORY[identity]:
+                    raise MigrationReportError(f"public authority object semantic drift: {identity}")
             relation_catalog = {
                 relation_identity: object_inventory[relation_identity]
                 for relation_identity in (f"public.{name}" for name in relation_names)
@@ -1343,13 +1346,27 @@ def _ws3_database_state_impl(database_url: str | None = None) -> dict[str, objec
                 }
                 for row in cursor.fetchall()
             }
-            constraints = {facts["name"]: facts["definition"] for facts in authority_constraints.values()}
-            if authority_constraints != WS3_AUTHORITY_CONSTRAINTS:
-                raise MigrationReportError("authority relation constraint catalog drift")
+            # Constraint identities are exact within WS-3 authority relations;
+            # constraints on later work-package relations stay out of scope.
+            expected_constraints = WS3_AUTHORITY_CONSTRAINTS
+            expected_constraint_relations = {str(facts["relation"]) for facts in expected_constraints.values()}
+            ws3_constraints = {
+                identity: facts
+                for identity, facts in authority_constraints.items()
+                if facts["relation"] in expected_constraint_relations
+            }
+            if set(ws3_constraints) != set(expected_constraints):
+                raise MigrationReportError(
+                    "WS-3 authority relation constraint set drift: "
+                    f"expected={sorted(expected_constraints)!r}, actual={sorted(ws3_constraints)!r}"
+                )
+            for identity, facts in expected_constraints.items():
+                if ws3_constraints[identity] != facts:
+                    raise MigrationReportError(f"authority relation constraint semantic drift: {identity}")
 
-            # Enumerate every non-extension public function.  The resulting
-            # identity set is itself evidence; the expected contract cannot
-            # whitelist only the currently interesting function names.
+            # Enumerate every non-extension public function, then require the
+            # finite WS-3 identities and their same-name overload families to
+            # match exactly. Unrelated functions remain outside this preflight.
             cursor.execute(
                 """
                 SELECT p.oid, n.nspname, p.proname, pg_get_function_identity_arguments(p.oid),
@@ -1411,14 +1428,34 @@ def _ws3_database_state_impl(database_url: str | None = None) -> dict[str, objec
                 function_definitions[identity] = str(row[16])
                 function_sources[identity] = str(row[15])
                 function_acl[identity] = _normalized_acl_text(row[14])
-            if set(function_facts) != set(WS3_SCHEMA_CONTRACT["functions"]):
+            # WS-3 authority functions must exist (subset check).  Newer
+            # migrations add functions outside WS-3 authority scope.
+            expected_functions = set(WS3_SCHEMA_CONTRACT["functions"])
+            missing_functions = expected_functions - set(function_facts)
+            if missing_functions:
                 raise MigrationReportError(
-                    "public function identity set drift: "
-                    f"expected={sorted(WS3_SCHEMA_CONTRACT['functions'])!r}, actual={sorted(function_facts)!r}"
+                    f"public function identity set missing WS-3 functions: missing={sorted(missing_functions)!r}"
                 )
+            protected_function_names = {
+                (str(facts["schema"]), str(facts["name"]))
+                for identity, facts in function_facts.items()
+                if identity in expected_functions
+            }
+            unexpected_protected_overloads = {
+                identity
+                for identity, facts in function_facts.items()
+                if (str(facts["schema"]), str(facts["name"])) in protected_function_names
+                and identity not in expected_functions
+            }
+            if unexpected_protected_overloads:
+                raise MigrationReportError(
+                    f"protected WS-3 function overload set drift: unexpected={sorted(unexpected_protected_overloads)!r}"
+                )
+            authority_function_facts = {identity: function_facts[identity] for identity in expected_functions}
+            authority_function_sources = {identity: function_sources[identity] for identity in expected_functions}
             public_function_facts = {
                 identity: {key: value for key, value in facts.items() if key not in {"schema", "name", "acl"}}
-                for identity, facts in function_facts.items()
+                for identity, facts in authority_function_facts.items()
             }
 
             # Trigger and target-family maps are complete over the same public
@@ -1588,7 +1625,12 @@ def _ws3_database_state_impl(database_url: str | None = None) -> dict[str, objec
                 """,
                 (list(WS3_AUTHORITY_OBJECT_RELKINDS),),
             )
-            table_acl_entries = {f"{row[0]}.{row[1]}": _canonical_acl_entries(row[2]) for row in cursor.fetchall()}
+            expected_table_acl_keys = set(WS3_AUTHORITY_ACL_EXPECTED["table"])
+            table_acl_entries = {
+                identity: _canonical_acl_entries(row[2])
+                for row in cursor.fetchall()
+                if (identity := f"{row[0]}.{row[1]}") in expected_table_acl_keys
+            }
             cursor.execute(
                 """
                 SELECT n.nspname, c.relname, a.attname,
@@ -1622,10 +1664,12 @@ def _ws3_database_state_impl(database_url: str | None = None) -> dict[str, objec
                 """,
                 (list(WS3_AUTHORITY_OBJECT_RELKINDS),),
             )
+            expected_column_acl_keys = set(WS3_AUTHORITY_ACL_EXPECTED["column"])
             column_acl_entries = {
-                f"{row[0]}.{row[1]}.{row[2]}": _canonical_acl_entries(row[3])
+                identity: entries
                 for row in cursor.fetchall()
-                if _canonical_acl_entries(row[3])
+                if (identity := f"{row[0]}.{row[1]}.{row[2]}") in expected_column_acl_keys
+                if (entries := _canonical_acl_entries(row[3]))
             }
             cursor.execute(
                 """
@@ -1675,10 +1719,13 @@ def _ws3_database_state_impl(database_url: str | None = None) -> dict[str, objec
                 raise MigrationReportError("authority ACL closure drift")
             actual_mutation_relations = _online_mutation_relation_set(cursor)
             expected_mutation_relations = {f"public.{name}" for name in WS3_AUTHORITY_MUTATION_RELATION_NAMES}
-            if actual_mutation_relations != expected_mutation_relations:
+            ws3_relation_scope = set(WS3_AUTHORITY_RELATION_REGISTRY) | set(WS3_AUTHORITY_RELATION_EXCLUSIONS)
+            actual_ws3_mutation_relations = actual_mutation_relations & ws3_relation_scope
+            if actual_ws3_mutation_relations != expected_mutation_relations:
                 raise MigrationReportError(
                     "online mutation grant closure drift: "
-                    f"expected={sorted(expected_mutation_relations)!r}, actual={sorted(actual_mutation_relations)!r}"
+                    f"expected={sorted(expected_mutation_relations)!r}, "
+                    f"actual={sorted(actual_ws3_mutation_relations)!r}"
                 )
 
             authority_relations = deepcopy(WS3_AUTHORITY_RELATION_REGISTRY)
@@ -1706,7 +1753,10 @@ def _ws3_database_state_impl(database_url: str | None = None) -> dict[str, objec
                         "direct_mutation_grants": mutation_grants_all[relation_key],
                     }
                 )
-            authority_dml_targets = _authority_dml_targets_diagnostic(function_facts, function_sources)
+            authority_dml_targets = _authority_dml_targets_diagnostic(
+                authority_function_facts,
+                authority_function_sources,
+            )
             authority_exclusions = deepcopy(WS3_AUTHORITY_RELATION_EXCLUSIONS)
             for relation_key, exclusion in authority_exclusions.items():
                 grants = mutation_grants_all[relation_key]
@@ -1808,7 +1858,7 @@ def _ws3_database_state_impl(database_url: str | None = None) -> dict[str, objec
                 if owner not in owned_objects:
                     raise MigrationReportError(f"authority relation {relation_key} has unexpected owner {owner}")
                 owned_objects[owner].append(relation_key)
-            for identity, facts in function_facts.items():
+            for identity, facts in authority_function_facts.items():
                 owner = str(facts["owner"])
                 if owner not in owned_objects:
                     raise MigrationReportError(f"authority function {identity} has unexpected owner {owner}")
@@ -1920,17 +1970,24 @@ def _ws3_database_state_impl(database_url: str | None = None) -> dict[str, objec
             }
     return {
         "columns": columns,
-        "constraints": constraints,
+        "constraints": {
+            str(facts["name"]): facts["definition"]
+            for identity, facts in ws3_constraints.items()
+            if identity in WS3_AUTHORITY_CONSTRAINTS
+        },
         "functions": public_function_facts,
         "authority_public_functions": public_function_facts,
         "authority_function_acl": {
             identity: list(cast(list[dict[str, object]], facts.get("acl_entries", [])))
             for identity, facts in function_facts.items()
+            if identity in expected_functions
         },
-        "authority_object_inventory": object_inventory,
-        "authority_constraints": authority_constraints,
+        "authority_object_inventory": {identity: object_inventory[identity] for identity in expected_object_identities},
+        "authority_constraints": {
+            identity: ws3_constraints[identity] for identity in WS3_AUTHORITY_CONSTRAINTS if identity in ws3_constraints
+        },
         "authority_acl": authority_acl,
-        "function_acl": function_acl,
+        "function_acl": {identity: function_acl[identity] for identity in expected_functions},
         "authority_roles": authority_roles,
         "authority_relations": authority_relations,
         "authority_relation_exclusions": authority_exclusions,
@@ -2008,6 +2065,7 @@ def write_report(root: Path, output: Path) -> None:
             "ws3_cancel_acceptance",
             "ws3_dead_letter_reconciliation",
             "ws3_execution_authority_closure",
+            "ws3_runtime_worker_delivery",
         }
         or expected_head in WS4_MIGRATION_HEADS
     ):
@@ -2029,7 +2087,9 @@ def write_report(root: Path, output: Path) -> None:
             "ws3_cancel_acceptance",
             "ws3_dead_letter_reconciliation",
             "ws3_execution_authority_closure",
+            "ws3_runtime_worker_delivery",
         }
+        or expected_head in WS4_MIGRATION_HEADS
         else [],
         "round_trip": list(ROUND_TRIP),
         "schema_contract_version": schema_contract_version,

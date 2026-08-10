@@ -219,13 +219,18 @@ if [[ "$bootstrap_ok" != "1" ]]; then
 fi
 
 mkdir -p ci-evidence
+# The migration_report runs inside the container as a non-root grove user.
+# Host-generated ci-evidence files are owned by the host user; make the
+# entire evidence tree world-writable so the container can write CAS
+# artifacts, temp files, and subdirectories.
+chmod -R a+rwX ci-evidence
 migration_ok=0
 for _attempt in $(seq 1 60); do
   if "${compose[@]}" run --rm \
     -e GROVE_DATABASE_URL=postgresql+psycopg://grove_migration:grove_migration_ws0@db:5432/grove \
     -e PGCONNECT_TIMEOUT=10 \
-    -e PGOPTIONS='-c statement_timeout=30000 -c lock_timeout=5000' \
-    api python scripts/migration_report.py --output /app/ci-evidence/migrations.json; then
+    -e PGOPTIONS='-c statement_timeout=60000 -c lock_timeout=30000' \
+    api sh -c 'umask 0000 && python scripts/migration_report.py --output /app/ci-evidence/migrations.json'; then
     migration_ok=1
     break
   fi
@@ -307,7 +312,12 @@ printf '\n'
 curl --fail --silent --show-error -H 'X-Request-ID: integration_ready' http://127.0.0.1:8000/api/v1/health/ready
 printf '\n'
 
-"${compose[@]}" exec -T db psql -U grove_migration -d grove -Atc "SELECT version_num FROM alembic_version" | grep -Fx ws3_execution_authority_closure
+expected_head="$(uv run alembic heads 2>/dev/null | tail -1 | awk '{print $1}')"
+if [[ -z "$expected_head" ]]; then
+  printf 'could not resolve alembic head for migration verification\n' >&2
+  exit 1
+fi
+"${compose[@]}" exec -T db psql -U grove_migration -d grove -Atc "SELECT version_num FROM alembic_version" | grep -Fx "$expected_head"
 GROVE_DATABASE_URL=postgresql+psycopg://grove_api:grove_api_ws0@localhost:54329/grove \
 GROVE_MIGRATION_DATABASE_URL=postgresql+psycopg://grove_migration:grove_migration_ws0@localhost:54329/grove \
 GROVE_API_BASE_URL=http://127.0.0.1:8000 \

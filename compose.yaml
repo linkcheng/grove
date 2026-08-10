@@ -43,6 +43,7 @@ services:
     environment:
       GROVE_ROLE: runtime_worker
       GROVE_APP_ENV: integration
+      GROVE_RUNTIME_BUILD_HASH: "0000000000000000000000000000000000000000000000000000000000000000"
       GROVE_DATABASE_URL: postgresql+psycopg://grove_runtime:grove_runtime_ws0@db:5432/grove
     depends_on:
       db:

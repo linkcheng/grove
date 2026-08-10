@@ -773,6 +773,8 @@ def test_content_addressed_artifact_is_immutable_and_symlink_safe(tmp_path: Path
     digest = write_content_addressed_artifact(output, payload)
     cas = output.parent / "sha256" / digest / output.name
     assert cas.read_bytes() == payload
+    assert output.stat().st_mode & 0o777 == 0o644
+    assert cas.stat().st_mode & 0o777 == 0o644
     assert write_content_addressed_artifact(output, payload) == digest
 
     cas.write_bytes(b"conflict")

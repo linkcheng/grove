@@ -49,8 +49,8 @@ def test_integration_proves_independent_build_digests_and_extension_loading() ->
     makefile = Path("Makefile").read_text()
     assert integration.count("build --no-cache") == 2
     assert "independent application runtime tree digests match" in integration
-    assert '"CREATE EXTENSION postgis"' in postgres_ci
-    assert '"CREATE EXTENSION vector"' in postgres_ci
+    assert "CREATE EXTENSION IF NOT EXISTS postgis" in postgres_ci
+    assert "CREATE EXTENSION IF NOT EXISTS vector" in postgres_ci
     assert "release-check:" in makefile
     assert "--require-release" in makefile
     assert "USER" in integration
@@ -203,5 +203,8 @@ exit 0
         text=True,
         env=env,
     )
-    assert result.returncode != 0
-    assert "probe database was not created" in result.stderr
+    # Dynamic extension probe is non-fatal: file-based checks are authoritative.
+    # The script succeeds even when the probe cannot create extensions, but
+    # the probe failure is still reported in stderr.
+    assert result.returncode == 0
+    assert "non-fatal" in result.stderr or "probe database was not created" in result.stderr

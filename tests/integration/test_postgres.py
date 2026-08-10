@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
+from app.build.manifest import WS2_BUSINESS_RELATIONS
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.integration
@@ -15,7 +19,9 @@ async def test_real_postgres_has_ws2_tenant_command_relations() -> None:
     try:
         async with engine.connect() as connection:
             version = (await connection.execute(text("SELECT version_num FROM alembic_version"))).scalar_one()
-            assert version == "ws3_execution_authority_closure"
+            from app.build.manifest import migration_head
+
+            assert version == migration_head(_PROJECT_ROOT)
             tables = (
                 (
                     await connection.execute(
@@ -33,19 +39,6 @@ async def test_real_postgres_has_ws2_tenant_command_relations() -> None:
                 .scalars()
                 .all()
             )
-            assert set(tables) == {
-                "agent_run",
-                "checkpoint_blobs",
-                "checkpoint_migrations",
-                "checkpoint_writes",
-                "checkpoints",
-                "command_payload",
-                "execution_principal",
-                "execution_spec",
-                "membership",
-                "run_command",
-                "tenant",
-                "workload_principal",
-            }
+            assert WS2_BUSINESS_RELATIONS <= set(tables)
     finally:
         await engine.dispose()

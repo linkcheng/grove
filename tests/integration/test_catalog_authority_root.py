@@ -6,8 +6,15 @@ from pathlib import Path
 import psycopg
 import pytest
 from app.build.catalog_authority import compare_expected_catalog_root, discover_catalog_authority
+from app.build.manifest import migration_head
 from psycopg import sql
 from scripts import ws3_preflight
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_requires_exact_ws3_catalog = pytest.mark.skipif(
+    migration_head(_PROJECT_ROOT) != "ws3_runtime_worker_delivery",
+    reason="external catalog root is pinned to the exact WS-3 head",
+)
 
 
 def _migration_url() -> str:
@@ -78,6 +85,7 @@ def _expect_extension_section_delta(
 
 
 @pytest.mark.integration
+@_requires_exact_ws3_catalog
 def test_catalog_authority_root_is_repeatable_and_matches_external_artifact() -> None:
     url = _migration_url()
     with psycopg.connect(url) as connection:
@@ -89,6 +97,7 @@ def test_catalog_authority_root_is_repeatable_and_matches_external_artifact() ->
 
 
 @pytest.mark.integration
+@_requires_exact_ws3_catalog
 def test_catalog_authority_v1_tamper_matrix_is_red_then_green() -> None:
     url = _migration_url()
     with psycopg.connect(url, autocommit=True) as connection:

@@ -2663,6 +2663,7 @@ def _write_immutable_cas_file(path: Path, payload: bytes) -> None:
         _write_immutable_cas_file(path, payload)
         return
     with os.fdopen(descriptor, "wb") as stream:
+        os.fchmod(stream.fileno(), 0o644)
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
@@ -2673,6 +2674,10 @@ def _atomic_replace_alias(output: Path, payload: bytes) -> None:
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
+            # mkstemp intentionally starts at 0600. Evidence contains no
+            # secrets and must remain readable by the host artifact uploader
+            # after a non-root container atomically replaces the alias.
+            os.fchmod(stream.fileno(), 0o644)
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())

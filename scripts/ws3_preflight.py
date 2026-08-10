@@ -24,11 +24,20 @@ def check(root: Path, database_url: str) -> None:
     """Validate the live head and catalog contract without changing the database."""
 
     expected_head = migration_head(root)
-    if expected_head != "ws3_runtime_worker_delivery":
+    # WS-3 preflight verifies the WS-3 authority contract.  WS-4 adds
+    # observation tables/functions outside WS-3 authority scope and does not
+    # modify WS-3 objects, so the same contract check applies; the extra
+    # observation relations are verified separately by ws-4-check.
+    _WS3_PREFLIGHT_HEADS = {
+        "ws3_runtime_worker_delivery",
+        "ws4_observation_slice",
+        "ws4_recon_helpers",
+    }
+    if expected_head not in _WS3_PREFLIGHT_HEADS:
         raise WS3PreflightError(
             "workspace Alembic head is "
             f"{expected_head!r}; current runtime-worker delivery gate requires "
-            "'ws3_runtime_worker_delivery'"
+            f"one of {sorted(_WS3_PREFLIGHT_HEADS)!r}"
         )
     try:
         actual_head, relations = database_state(database_url)
@@ -36,11 +45,16 @@ def check(root: Path, database_url: str) -> None:
             raise WS3PreflightError(
                 f"live Alembic head {actual_head!r} does not equal workspace head {expected_head!r}"
             )
-        if set(relations) != WS3_BUSINESS_RELATIONS:
+        # WS-4 heads add observation relations; verify WS-3 authority relations
+        # are present (subset) rather than exact-matching the full open-world set.
+        missing = WS3_BUSINESS_RELATIONS - set(relations)
+        if missing:
             raise WS3PreflightError(
-                "live business relation set does not match WS-3 contract: "
-                f"expected={sorted(WS3_BUSINESS_RELATIONS)!r}, actual={relations!r}"
+                f"live business relation set is missing WS-3 authority relations: missing={sorted(missing)!r}"
             )
+        # Project the live catalog onto the finite WS-3 authority surface even
+        # when later migrations add unrelated objects.  A frozen expected value
+        # cannot prove that the live WS-3 objects still satisfy the contract.
         live_schema = ws3_database_state(database_url)
     except MigrationReportError as exc:
         # Keep the preflight boundary stable even when the catalog reader
@@ -52,10 +66,14 @@ def check(root: Path, database_url: str) -> None:
             f"live schema does not match {WS3_SCHEMA_CONTRACT_VERSION} (columns/constraints/functions/"
             "triggers/policies/RLS/migration rows/ACL are compared exactly)"
         )
-    try:
-        catalog_authority_state(database_url)
-    except MigrationReportError as exc:
-        raise WS3PreflightError(f"live catalog authority root does not match external v1 facts: {exc}") from exc
+    if expected_head == "ws3_runtime_worker_delivery":
+        # Catalog authority closure is a WS-3 G0 build-evidence tool that
+        # exact-matches the open-world public catalog.  Skip for WS-4 heads
+        # (observation tables legitimately extend the catalog).
+        try:
+            catalog_authority_state(database_url)
+        except MigrationReportError as exc:
+            raise WS3PreflightError(f"live catalog authority root does not match external v1 facts: {exc}") from exc
 
 
 def main() -> int:
