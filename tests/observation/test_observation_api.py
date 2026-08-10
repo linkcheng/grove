@@ -29,4 +29,3 @@ class TestCompleteness:
 
     def test_non_terminal_is_partial(self) -> None:
         assert observation._completeness("running", 0, 0, 0) == "partial"
-

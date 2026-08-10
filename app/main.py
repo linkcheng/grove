@@ -315,12 +315,12 @@ def main() -> int:
         return 0
     if settings.role is not Role.API:
         if args.self_check:
-           print(json.dumps(run_role_self_check(settings), ensure_ascii=False, sort_keys=True))
-           return 0
+            print(json.dumps(run_role_self_check(settings), ensure_ascii=False, sort_keys=True))
+            return 0
         if settings.role is Role.RUNTIME_WORKER:
-           return _run_runtime_worker(settings)
+            return _run_runtime_worker(settings)
         if settings.role is Role.PROJECTION_RECONCILIATION:
-           return _run_projection_reconciliation(settings)
+            return _run_projection_reconciliation(settings)
         raise SystemExit("non-api/non-runtime_worker/non-projection roles must use --self-check")
     import uvicorn
 

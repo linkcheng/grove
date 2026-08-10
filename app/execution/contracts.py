@@ -317,11 +317,11 @@ _STRICT_MODEL_TYPES: frozenset[type[BaseModel]] = frozenset(
         ChildCompletionPayload,
         RunSignal,
         InterruptBinding,
-       RunCommandReceipt,
-       ExecutionClaim,
-       AppliedCommandMetadata,
-       DeliveryReceipt,
-   }
+        RunCommandReceipt,
+        ExecutionClaim,
+        AppliedCommandMetadata,
+        DeliveryReceipt,
+    }
 )
 _COMMAND_TYPES: frozenset[type[BaseModel]] = frozenset({StartRun, ResumeRun, CancelRun, ContinueRun, RunSignal})
 
@@ -497,11 +497,11 @@ __all__ = [
     "ChildCompletionPayload",
     "CommandConflict",
     "CommandNotFound",
-   "CommandStatus",
-   "CommandType",
-   "ContinueRun",
-   "DeliveryReceipt",
-   "ExecutionClaim",
+    "CommandStatus",
+    "CommandType",
+    "ContinueRun",
+    "DeliveryReceipt",
+    "ExecutionClaim",
     "ExecutionCommand",
     "ExecutionDriverError",
     "ExecutionFenceExhausted",

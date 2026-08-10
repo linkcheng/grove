@@ -10,11 +10,19 @@ def test_role_self_check_returns_configuration_summary(monkeypatch: pytest.Monke
     if role == "runtime_worker":
         monkeypatch.setenv("GROVE_RUNTIME_BUILD_HASH", "a" * 64)
     monkeypatch.setattr("app.roles.database_available", lambda _settings: True)
+    monkeypatch.setattr(
+        "app.roles.projection_available", lambda _settings: {"backlog": 0, "dead_letter": 0, "status": "ready"}
+    )
     result = run_role_self_check()
     assert result["role"] == role
     assert result["status"] == "configured"
     assert result["database"] == "postgresql"
     assert result["database_status"] == "connected"
+    if role == "projection_reconciliation":
+        assert result["projection"] == {"backlog": 0, "dead_letter": 0, "status": "ready"}
+    if role == "runtime_worker":
+        assert result["worker"]["worker_id"]
+        assert result["worker"]["claim_protocol"] == "advisory_fence_lease"
 
 
 def test_role_self_check_fails_before_start_for_bad_role(monkeypatch: pytest.MonkeyPatch) -> None:

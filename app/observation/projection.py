@@ -26,7 +26,7 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.contracts.canonical import ProjectionSourceRef, UIProjectionEvent
+from app.contracts.canonical import ProjectionSourceRef, canonical_hash
 from app.observation.facts import (
     NODE_EXECUTED_SCHEMA_REF,
     RUN_LIFECYCLE_SCHEMA_REF,
@@ -55,11 +55,11 @@ async def _scope_tenant(session: AsyncSession, tenant_id: str) -> None:
     await session.execute(text("SELECT set_config('grove.tenant_id', :t, true)"), {"t": tenant_id})
 
 
-def _source_refs_json(run_id: UUID, run_seq: int) -> str:
+def _source_refs_json(run_id: UUID, run_seq: int, source_hash: str) -> str:
     ref = ProjectionSourceRef(
         source_kind="runtime_event",
         source_ref=f"runtime-event:{run_id}:{run_seq}",
-        source_hash="0" * 64,
+        source_hash=source_hash,
         source_seq=run_seq,
         source_schema_ref=RUN_LIFECYCLE_SCHEMA_REF,
     )
@@ -169,7 +169,10 @@ class ProjectionReconciler:
 
         event_type, schema_ref, payload, occurred_at = event_row[0], event_row[1], event_row[2], event_row[3]
         correlation_id, causation_id, trace_id, source_event_id = (
-            event_row[4], event_row[5], event_row[6], event_row[7]
+            event_row[4],
+            event_row[5],
+            event_row[6],
+            event_row[7],
         )
 
         if schema_ref == RUN_LIFECYCLE_SCHEMA_REF:
@@ -227,24 +230,15 @@ class ProjectionReconciler:
             causation_id=causation_id,
             trace_id=trace_id,
         )
-        UIProjectionEvent(
-            meta=meta,
-            event_id=event_id,
-            target_kind=UI_TARGET_KIND,
-            target_ref=run_id,
-            projection_seq=1,
-            payload_schema_ref=UI_SCHEMA_REF,
-            payload=ui_payload,
-            source_refs=(
-                ProjectionSourceRef(
-                    source_kind="runtime_event",
-                    source_ref=f"runtime-event:{run_id}:{run_seq}",
-                    source_hash="0" * 64,
-                    source_seq=run_seq,
-                    source_schema_ref=RUN_LIFECYCLE_SCHEMA_REF,
-                ),
-            ),
-            projected_at=occurred_at,
+        # Bind the projection to its source fact by the canonical hash of the
+        # observed runtime payload (content-addressed, not a placeholder).
+        source_hash = canonical_hash(parsed)
+        # Serialize same-target projections so projection_seq stays single-writer
+        # per run: two concurrent reconcilers cannot both read the same MAX and
+        # produce a colliding projection_seq.  The lock is transaction-scoped.
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:lk)::bigint)"),
+            {"lk": f"{tenant_id}:{run_id}"},
         )
         next_seq = (
             await session.execute(
@@ -267,11 +261,19 @@ class ProjectionReconciler:
                 ") ON CONFLICT (tenant_id, event_id) DO NOTHING"
             ),
             {
-                "t": tenant_id, "k": UI_TARGET_KIND, "r": run_id, "eid": event_id, "seq": next_seq,
-                "cv": meta.contract_version, "corr": correlation_id, "caus": causation_id,
-                "trace": trace_id, "schema": UI_SCHEMA_REF,
+                "t": tenant_id,
+                "k": UI_TARGET_KIND,
+                "r": run_id,
+                "eid": event_id,
+                "seq": next_seq,
+                "cv": meta.contract_version,
+                "corr": correlation_id,
+                "caus": causation_id,
+                "trace": trace_id,
+                "schema": UI_SCHEMA_REF,
                 "payload": json.dumps(ui_payload.model_dump(mode="json"), sort_keys=True),
-                "src": _source_refs_json(run_id, run_seq), "at": occurred_at,
+                "src": _source_refs_json(run_id, run_seq, source_hash),
+                "at": occurred_at,
             },
         )
 
@@ -300,9 +302,16 @@ class ProjectionReconciler:
                 ") ON CONFLICT (tenant_id, event_id) DO NOTHING"
             ),
             {
-                "t": tenant_id, "r": run_id, "eid": event_id, "rs": run_seq, "src": source,
-                "seid": source_event_id, "et": event_type, "schema": schema_ref,
-                "payload": json.dumps(payload), "reason": reason,
+                "t": tenant_id,
+                "r": run_id,
+                "eid": event_id,
+                "rs": run_seq,
+                "src": source,
+                "seid": source_event_id,
+                "et": event_type,
+                "schema": schema_ref,
+                "payload": json.dumps(payload),
+                "reason": reason,
             },
         )
 
@@ -332,12 +341,8 @@ class ProjectionReconciler:
         """Rebuild the UI read model from authoritative runtime_event facts."""
         async with self._session_factory() as session, session.begin():
             await _scope_tenant(session, tenant_id)
-            await session.execute(
-                text("DELETE FROM ui_projection_event WHERE tenant_id = :t"), {"t": tenant_id}
-            )
-            await session.execute(
-                text("DELETE FROM projection_watermark WHERE tenant_id = :t"), {"t": tenant_id}
-            )
+            await session.execute(text("DELETE FROM ui_projection_event WHERE tenant_id = :t"), {"t": tenant_id})
+            await session.execute(text("DELETE FROM projection_watermark WHERE tenant_id = :t"), {"t": tenant_id})
             rows = (
                 await session.execute(
                     text(
@@ -367,9 +372,7 @@ class ProjectionReconciler:
     async def health(self) -> dict[str, Any]:
         """Return low-cardinality projection health for the readiness endpoint."""
         async with self._session_factory() as session:
-            result = (
-                await session.execute(text("SELECT * FROM grove_observation_health()"))
-            ).one_or_none()
+            result = (await session.execute(text("SELECT * FROM grove_observation_health()"))).one_or_none()
         if result is None:
             return {"status": "ready", "backlog": 0, "unknown_schema": 0}
         return {"status": "ready", "backlog": result[0], "unknown_schema": result[1]}

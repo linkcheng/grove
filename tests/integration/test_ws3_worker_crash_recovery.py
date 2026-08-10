@@ -28,7 +28,9 @@ TENANT_BASE = "crash-test-tenant"
 
 
 async def _submit_run(
-    run_id: uuid.UUID, submission_id: uuid.UUID, tenant: str = TENANT_BASE,
+    run_id: uuid.UUID,
+    submission_id: uuid.UUID,
+    tenant: str = TENANT_BASE,
     runtime_build_hash: str = BUILD_HASH,
 ) -> None:
     """Insert a tenant, spec, run, and pending start command directly."""
@@ -91,7 +93,7 @@ async def _submit_run(
                 "INSERT INTO command_payload (tenant_id, payload_ref, payload_hash, "
                 "command_schema_version, sensitivity, retention, payload) "
                 "VALUES (:t, :pref, :ph, 'start.v1', 'sensitive', 'run_completion', "
-                "CAST('{\"input\":\"test\"}' AS JSONB))"
+                'CAST(\'{"input":"test"}\' AS JSONB))'
             ),
             {"t": tenant, "pref": payload_ref, "ph": payload_hash},
         )
@@ -103,8 +105,14 @@ async def _submit_run(
                 "VALUES (:t, :cid, :rid, 'crash-worker', 'workload', "
                 "0, 'start', 'start.v1', :dig, :pref, :ph, 'pending')"
             ),
-            {"t": tenant, "cid": uuid.uuid4(), "rid": run_id,
-             "dig": payload_hash, "ph": payload_hash, "pref": payload_ref},
+            {
+                "t": tenant,
+                "cid": uuid.uuid4(),
+                "rid": run_id,
+                "dig": payload_hash,
+                "ph": payload_hash,
+                "pref": payload_ref,
+            },
         )
     await engine.dispose()
 
@@ -140,9 +148,7 @@ async def _get_run_state(run_id: uuid.UUID, tenant: str = TENANT_BASE) -> dict[s
         "lease_owner": row[3],
         "checkpoint": row[4],
         "applied_seq": row[5],
-        "commands": [
-            {"seq": c[0], "type": c[1], "status": c[2], "lease_owner": c[3]} for c in commands
-        ],
+        "commands": [{"seq": c[0], "type": c[1], "status": c[2], "lease_owner": c[3]} for c in commands],
     }
 
 
@@ -229,9 +235,7 @@ class TestWorkerCrashRecovery:
             versions: ChannelVersions = {k: str(v) for k, v in yielded.items()}
             checkpoint["channel_versions"] = versions
             checkpoint["channel_values"] = dict(yielded)
-            config: dict[str, Any] = {
-                "configurable": {"thread_id": str(run_id), "checkpoint_ns": ""}
-            }
+            config: dict[str, Any] = {"configurable": {"thread_id": str(run_id), "checkpoint_ns": ""}}
             saver = FencedPostgresSaver(conn, claim_a)
             await saver.aput(cast("RunnableConfig", config), checkpoint, cast(CheckpointMetadata, {}), versions)
             await conn.commit()
@@ -312,9 +316,7 @@ class TestWorkerCrashRecovery:
             versions: ChannelVersions = {k: str(v) for k, v in yielded.items()}
             checkpoint["channel_versions"] = versions
             checkpoint["channel_values"] = dict(yielded)
-            config: dict[str, Any] = {
-                "configurable": {"thread_id": str(run_id), "checkpoint_ns": ""}
-            }
+            config: dict[str, Any] = {"configurable": {"thread_id": str(run_id), "checkpoint_ns": ""}}
             saver = FencedPostgresSaver(conn, claim)
             await saver.aput(cast("RunnableConfig", config), checkpoint, cast(CheckpointMetadata, {}), versions)
             await conn.commit()

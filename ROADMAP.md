@@ -12,7 +12,7 @@
 | WS-1 | Contract Spine | accepted | implemented | WS-0 | 建立稳定 canonical hash、封闭契约、权限边界和依赖规则，并在 provider 前拒绝非法执行 | — |
 | WS-2 | Tenant-aware Command | accepted | implemented | WS-1 | 建立认证租户上下文、数据库租户隔离以及只持久化 submit/query 的幂等命令入口 | — |
 | WS-3 | Durable Execution | accepted | in_progress | WS-2 | 建立 PostgreSQL claim/lease/fence、checkpoint 和崩溃恢复，使执行保持单写者且不丢已提交事实 | — |
-| WS-4 | Observation Slice | accepted | not_started | WS-3 | 建立不反压运行时的 event/audit、可重建投影、SSE/Inspect 与最小可运维观测闭环 | [任务书](docs/work-packages/WS-4-observation-slice.md) |
+| WS-4 | Observation Slice | accepted | in_progress | WS-3 | 建立不反压运行时的 event/audit、可重建投影、SSE/Inspect 与最小可运维观测闭环 | [任务书](docs/work-packages/WS-4-observation-slice.md) |
 | WS-5 | Core Release Proof | draft | not_started | WS-4 | 对同一 Core build 完成适用 Gate、故障、安全、容量、恢复和治理证明 | — |
 | WS-6 | Selected Profile E2E | draft | not_started | WS-5 | 冻结一个 Business Profile，先实现通用 Vue/RunInteractionModel，再完成真实语料、provider、工具和 typed renderer 的端到端验证 | — |
 | WS-7 | Product MVP Release | draft | not_started | WS-6 | 对精确产品 build/profile/config 完成业务评估、发布和回滚批准 | — |

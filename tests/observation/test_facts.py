@@ -73,8 +73,13 @@ class TestEmitEventRequest:
 
     def test_node_request_builds(self) -> None:
         request = build_node_executed_emit_request(
-            run_id=RUN_ID, command_seq=0, node_id="node_a", stage="start",
-            input_hash=ZERO_HASH, value=1, occurred_at=NOW,
+            run_id=RUN_ID,
+            command_seq=0,
+            node_id="node_a",
+            stage="start",
+            input_hash=ZERO_HASH,
+            value=1,
+            occurred_at=NOW,
         )
         assert request.payload_schema_ref == NODE_EXECUTED_SCHEMA_REF
 
@@ -105,7 +110,10 @@ class TestEmitEventRequest:
     def test_naive_datetime_rejected(self) -> None:
         with pytest.raises(ValueError):
             build_lifecycle_emit_request(
-                run_id=RUN_ID, command_seq=0, status="running", run_revision=1,
+                run_id=RUN_ID,
+                command_seq=0,
+                status="running",
+                run_revision=1,
                 occurred_at=datetime(2026, 1, 1),
             )
 
@@ -143,9 +151,7 @@ class TestProjectionMapping:
         assert mapped.run_id == RUN_ID
 
     def test_ui_projection_meta_contract_family(self) -> None:
-        meta = build_ui_projection_meta(
-            tenant_id="tenant-a", correlation_id="corr-1", causation_id=uuid4()
-        )
+        meta = build_ui_projection_meta(tenant_id="tenant-a", correlation_id="corr-1", causation_id=uuid4())
         assert meta.contract_name == "ui.projection"
         assert meta.contract_version == "v1"
         assert meta.tenant_id == "tenant-a"

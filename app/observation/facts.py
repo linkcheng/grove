@@ -49,9 +49,7 @@ TERMINAL_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 RUN_LIFECYCLE_SCHEMA_REF = "grove.runtime.run-lifecycle.v1"
 NODE_EXECUTED_SCHEMA_REF = "grove.runtime.node-executed.v1"
 
-KNOWN_RUNTIME_PAYLOAD_SCHEMAS: frozenset[str] = frozenset(
-    {RUN_LIFECYCLE_SCHEMA_REF, NODE_EXECUTED_SCHEMA_REF}
-)
+KNOWN_RUNTIME_PAYLOAD_SCHEMAS: frozenset[str] = frozenset({RUN_LIFECYCLE_SCHEMA_REF, NODE_EXECUTED_SCHEMA_REF})
 
 
 class RunLifecyclePayload(CanonicalModel):
@@ -220,6 +218,29 @@ def build_node_executed_emit_request(
 UI_PROJECTION_CONTRACT_VERSION = "v1"
 UI_PROJECTION_SCHEMA_REF = "grove.ui.run-status-changed.v1"
 
+# The canonical UI projection schema refs recognised by the headless reducer.
+# Each maps to one discriminated variant of the frozen ``UIProjectionPayload``
+# union; an unknown ref is never applied optimistically.
+UI_MESSAGE_STARTED_SCHEMA_REF = "grove.ui.message-started.v1"
+UI_MESSAGE_DELTA_SCHEMA_REF = "grove.ui.message-delta.v1"
+UI_MESSAGE_COMPLETED_SCHEMA_REF = "grove.ui.message-completed.v1"
+UI_INTERACTION_UPSERTED_SCHEMA_REF = "grove.ui.interaction-upserted.v1"
+UI_INTERACTION_RESOLVED_SCHEMA_REF = "grove.ui.interaction-resolved.v1"
+UI_DOMAIN_VIEW_SCHEMA_REF = "grove.ui.domain-view-accepted.v1"
+UI_CHILD_STATUS_SCHEMA_REF = "grove.ui.child-status-changed.v1"
+KNOWN_UI_PROJECTION_SCHEMA_REFS: frozenset[str] = frozenset(
+    {
+        UI_PROJECTION_SCHEMA_REF,
+        UI_MESSAGE_STARTED_SCHEMA_REF,
+        UI_MESSAGE_DELTA_SCHEMA_REF,
+        UI_MESSAGE_COMPLETED_SCHEMA_REF,
+        UI_INTERACTION_UPSERTED_SCHEMA_REF,
+        UI_INTERACTION_RESOLVED_SCHEMA_REF,
+        UI_DOMAIN_VIEW_SCHEMA_REF,
+        UI_CHILD_STATUS_SCHEMA_REF,
+    }
+)
+
 
 def lifecycle_to_run_status_changed(payload: RunLifecyclePayload) -> RunStatusChanged:
     """Map a runtime lifecycle fact to the typed UI projection payload."""
@@ -353,6 +374,13 @@ __all__ = [
     "UI_PROJECTION_CONTRACT_VERSION",
     "UI_PROJECTION_SCHEMA_REF",
     "UIProjectionEventView",
+    "UI_CHILD_STATUS_SCHEMA_REF",
+    "UI_DOMAIN_VIEW_SCHEMA_REF",
+    "UI_INTERACTION_RESOLVED_SCHEMA_REF",
+    "UI_INTERACTION_UPSERTED_SCHEMA_REF",
+    "UI_MESSAGE_COMPLETED_SCHEMA_REF",
+    "UI_MESSAGE_DELTA_SCHEMA_REF",
+    "UI_MESSAGE_STARTED_SCHEMA_REF",
     "UnknownRuntimeSchemaError",
     "PublicRunStatus",
     "build_lifecycle_emit_request",
@@ -362,4 +390,5 @@ __all__ = [
     "lifecycle_to_run_status_changed",
     "parse_runtime_payload",
     "ui_payload_adapter",
+    "KNOWN_UI_PROJECTION_SCHEMA_REFS",
 ]

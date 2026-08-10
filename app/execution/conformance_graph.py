@@ -53,13 +53,17 @@ def node_b(state: ConformanceState) -> ConformanceState:
     yield_marker = state.get("yield_marker", "stage_a_done")
     digest_body = json.dumps(
         {"input_hash": input_hash, "value": value, "yield_marker": yield_marker},
-        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
     )
     digest = _sha256(b"grove.conformance.node_b.v1\x00" + digest_body.encode("utf-8"))
     terminal_value = _int_from_hash(digest)
     output_payload = json.dumps(
         {"input_hash": input_hash, "value": terminal_value},
-        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
     )
     output_hash = _sha256(b"grove.conformance.output.v1\x00" + output_payload.encode("utf-8"))
     return {

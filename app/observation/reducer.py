@@ -10,7 +10,9 @@ Semantics (WS-4 acceptance):
   * duplicate ``event_id`` rows collapse to the lowest ``projection_seq``;
   * out-of-order input is sorted by ``projection_seq`` before application, so a
     replay never applies events out of commit order;
-  * a ``projection_seq`` gap marks the view ``partial`` rather than guessing;
+  * a ``projection_seq`` gap freezes the view at the last contiguously-applied
+    seq and marks it ``partial``; events past the gap are never applied, so a
+    missing transition can never produce an unjustified terminal status;
   * an unrecognised payload schema is counted and never crashes the reducer;
   * a tenant switch clears previously accumulated message/interaction state so a
     stale cross-tenant view cannot leak into the new tenant.
@@ -26,15 +28,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.contracts.canonical import UIProjectionEvent
 from app.observation.facts import (
+    KNOWN_UI_PROJECTION_SCHEMA_REFS,
     TERMINAL_RUN_STATUSES,
-    UI_PROJECTION_SCHEMA_REF,
     ObservationCompleteness,
     PublicRunStatus,
 )
-
-# The reducer recognises the WS-4 frozen UI projection schema refs.  Any other
-# ref is treated as unknown and never applied optimistically.
-KNOWN_UI_PROJECTION_SCHEMA_REFS: frozenset[str] = frozenset({UI_PROJECTION_SCHEMA_REF})
 
 
 class MessageView(BaseModel):
@@ -121,7 +119,7 @@ def reduce_run_view(events: Sequence[UIProjectionEvent[Any]]) -> RunViewState:
     unknown_schema_count = 0
     applied = 0
     gap_detected = False
-    expected_seq = 1
+    expected_seq = 0
     last_projection_seq = 0
 
     for event in ordered:
@@ -130,10 +128,14 @@ def reduce_run_view(events: Sequence[UIProjectionEvent[Any]]) -> RunViewState:
         if tenant_id is None:
             tenant_id = event_tenant
             run_id = event_target
+            expected_seq = event.projection_seq
         elif event_tenant != tenant_id or event_target != run_id:
             # A tenant or target switch is a stream integrity boundary: clear
             # any previously accumulated view so a stale cross-tenant state can
             # never surface for the new tenant.
+            # any previously accumulated view so a stale cross-tenant state can
+            # never surface for the new tenant, then restart the contiguous
+            # expectation at the new stream's first projection_seq.
             messages = {}
             interactions = {}
             status = None
@@ -141,11 +143,18 @@ def reduce_run_view(events: Sequence[UIProjectionEvent[Any]]) -> RunViewState:
             tenant_id = event_tenant
             run_id = event_target
             gap_detected = True
+            expected_seq = event.projection_seq
 
+        # Do not apply events past a projection_seq gap.  The missing event may
+        # mutate run state, so applying later events would be out of order and
+        # could surface a terminal status that the absent transition has not
+        # yet justified.  The view freezes at the contiguous watermark and
+        # remains ``partial`` until the gap is repaired.
         if event.projection_seq != expected_seq:
             gap_detected = True
+            break
         expected_seq = event.projection_seq + 1
-        last_projection_seq = max(last_projection_seq, event.projection_seq)
+        last_projection_seq = event.projection_seq
 
         if event.payload_schema_ref not in KNOWN_UI_PROJECTION_SCHEMA_REFS:
             unknown_schema_count += 1
@@ -185,9 +194,7 @@ def reduce_run_view(events: Sequence[UIProjectionEvent[Any]]) -> RunViewState:
     message_views = tuple(
         MessageView(**data) for data in sorted(messages.values(), key=lambda item: str(item["message_id"]))
     )
-    interaction_views = tuple(
-        sorted(interactions.values(), key=lambda item: str(item.interaction_id))
-    )
+    interaction_views = tuple(sorted(interactions.values(), key=lambda item: str(item.interaction_id)))
 
     return RunViewState(
         tenant_id=tenant_id,

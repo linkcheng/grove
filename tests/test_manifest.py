@@ -598,11 +598,11 @@ def test_ws3_catalog_authority_report_binds_actual_root_sections_and_counts(tmp_
         "head": "ws3_runtime_worker_delivery",
         "migration_hash": "b" * 64,
         "round_trip": ["upgrade head", "downgrade base", "upgrade head"],
-       "business_tables": sorted(WS3_BUSINESS_RELATIONS),
-       "infrastructure_tables": sorted(WS3_INFRASTRUCTURE_RELATIONS),
-       "schema_contract_version": WS3_SCHEMA_CONTRACT_VERSION,
-       "ws3_schema": WS3_SCHEMA_CONTRACT,
-       "catalog_authority": catalog,
+        "business_tables": sorted(WS3_BUSINESS_RELATIONS),
+        "infrastructure_tables": sorted(WS3_INFRASTRUCTURE_RELATIONS),
+        "schema_contract_version": WS3_SCHEMA_CONTRACT_VERSION,
+        "ws3_schema": WS3_SCHEMA_CONTRACT,
+        "catalog_authority": catalog,
     }
     valid_payload = (json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n").encode()
     valid_ref, valid_hash = _write_cas_evidence(tmp_path, "migrations.json", valid_payload)

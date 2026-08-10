@@ -48,11 +48,13 @@ async def test_worker_processes_start_command_and_finishes_yield() -> None:
     driver = MagicMock()
     driver.claim = AsyncMock(return_value=claim)
     driver.heartbeat = AsyncMock(return_value=claim)
-    driver.finish_delivery = AsyncMock(return_value=MagicMock(
-        continue_command_id=uuid4(),
-        run_revision=1,
-        status="consumed",
-    ))
+    driver.finish_delivery = AsyncMock(
+        return_value=MagicMock(
+            continue_command_id=uuid4(),
+            run_revision=1,
+            status="consumed",
+        )
+    )
     driver.dead_letter = AsyncMock()
 
     worker = RuntimeWorker(
@@ -78,11 +80,13 @@ async def test_worker_processes_continue_command_and_finishes_terminal() -> None
     driver = MagicMock()
     driver.claim = AsyncMock(return_value=claim)
     driver.heartbeat = AsyncMock(return_value=claim)
-    driver.finish_delivery = AsyncMock(return_value=MagicMock(
-        continue_command_id=None,
-        run_revision=1,
-        status="consumed",
-    ))
+    driver.finish_delivery = AsyncMock(
+        return_value=MagicMock(
+            continue_command_id=None,
+            run_revision=1,
+            status="consumed",
+        )
+    )
     driver.dead_letter = AsyncMock()
 
     worker = RuntimeWorker(

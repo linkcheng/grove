@@ -73,8 +73,13 @@ async def _submit_run(run_id: uuid.UUID, submission_id: uuid.UUID, tenant: str) 
                 ":ssh, :ssr, 'test-build', :rbh, 'accepted', 0)"
             ),
             {
-                "t": tenant, "rid": run_id, "sid": submission_id, "dig": payload_hash,
-                "ssh": "b" * 64, "ssr": "execution-spec:" + "b" * 64, "rbh": BUILD_HASH,
+                "t": tenant,
+                "rid": run_id,
+                "sid": submission_id,
+                "dig": payload_hash,
+                "ssh": "b" * 64,
+                "ssr": "execution-spec:" + "b" * 64,
+                "rbh": BUILD_HASH,
             },
         )
         await conn.execute(
@@ -82,7 +87,7 @@ async def _submit_run(run_id: uuid.UUID, submission_id: uuid.UUID, tenant: str) 
                 "INSERT INTO command_payload (tenant_id, payload_ref, payload_hash, "
                 "command_schema_version, sensitivity, retention, payload) "
                 "VALUES (:t, :pref, :ph, 'start.v1', 'sensitive', 'run_completion', "
-                "CAST('{\"input\":\"test\"}' AS JSONB))"
+                'CAST(\'{"input":"test"}\' AS JSONB))'
             ),
             {"t": tenant, "pref": payload_ref, "ph": payload_hash},
         )
@@ -95,8 +100,12 @@ async def _submit_run(run_id: uuid.UUID, submission_id: uuid.UUID, tenant: str) 
                 "0, 'start', 'start.v1', :dig, :pref, :ph, 'pending')"
             ),
             {
-                "t": tenant, "cid": uuid.uuid4(), "rid": run_id, "dig": payload_hash,
-                "ph": payload_hash, "pref": payload_ref,
+                "t": tenant,
+                "cid": uuid.uuid4(),
+                "rid": run_id,
+                "dig": payload_hash,
+                "ph": payload_hash,
+                "pref": payload_ref,
             },
         )
     await engine.dispose()
@@ -155,19 +164,31 @@ class TestObservationEmit:
         occurred = datetime.now(UTC)
         events = [
             build_node_executed_emit_request(
-                run_id=run_id, command_seq=0, node_id="node_a", stage="start",
-                input_hash=input_hash, value=yielded["value"], occurred_at=occurred,
+                run_id=run_id,
+                command_seq=0,
+                node_id="node_a",
+                stage="start",
+                input_hash=input_hash,
+                value=yielded["value"],
+                occurred_at=occurred,
             ),
             build_lifecycle_emit_request(
-                run_id=run_id, command_seq=0, status="running", run_revision=1, occurred_at=occurred,
+                run_id=run_id,
+                command_seq=0,
+                status="running",
+                run_revision=1,
+                occurred_at=occurred,
             ),
         ]
         payload = {"outcome_kind": "yield", "input_hash": input_hash, "value": yielded["value"]}
         payload_hash = canonical_hash(payload)
         receipt = await driver.finish_delivery(
-            claim, outcome_kind="yield",
+            claim,
+            outcome_kind="yield",
             continue_payload_ref=f"continue-payload:{payload_hash}",
-            continue_payload_hash=payload_hash, continue_payload=payload, events=events,
+            continue_payload_hash=payload_hash,
+            continue_payload=payload,
+            events=events,
         )
         assert receipt.result_code == "consumed"
 
@@ -181,11 +202,20 @@ class TestObservationEmit:
         occurred2 = datetime.now(UTC)
         events2 = [
             build_node_executed_emit_request(
-                run_id=run_id, command_seq=1, node_id="node_b", stage="terminal",
-                input_hash=input_hash, value=terminal["value"], occurred_at=occurred2,
+                run_id=run_id,
+                command_seq=1,
+                node_id="node_b",
+                stage="terminal",
+                input_hash=input_hash,
+                value=terminal["value"],
+                occurred_at=occurred2,
             ),
             build_lifecycle_emit_request(
-                run_id=run_id, command_seq=1, status="succeeded", run_revision=1, occurred_at=occurred2,
+                run_id=run_id,
+                command_seq=1,
+                status="succeeded",
+                run_revision=1,
+                occurred_at=occurred2,
             ),
         ]
         receipt2 = await driver.finish_delivery(claim2, outcome_kind="terminal", events=events2)
@@ -208,22 +238,32 @@ class TestObservationEmit:
         occurred = datetime.now(UTC)
         events = [
             build_lifecycle_emit_request(
-                run_id=run_id, command_seq=0, status="running", run_revision=1, occurred_at=occurred,
+                run_id=run_id,
+                command_seq=0,
+                status="running",
+                run_revision=1,
+                occurred_at=occurred,
             )
         ]
         payload = {"outcome_kind": "yield", "input_hash": input_hash, "value": yielded["value"]}
         payload_hash = canonical_hash(payload)
         await driver.finish_delivery(
-            claim, outcome_kind="yield",
+            claim,
+            outcome_kind="yield",
             continue_payload_ref=f"continue-payload:{payload_hash}",
-            continue_payload_hash=payload_hash, continue_payload=payload, events=events,
+            continue_payload_hash=payload_hash,
+            continue_payload=payload,
+            events=events,
         )
         before = len(await _runtime_events(run_id))
         # The idempotent consume path must not duplicate the observation stream.
         receipt_again = await driver.finish_delivery(
-            claim, outcome_kind="yield",
+            claim,
+            outcome_kind="yield",
             continue_payload_ref=f"continue-payload:{payload_hash}",
-            continue_payload_hash=payload_hash, continue_payload=payload, events=events,
+            continue_payload_hash=payload_hash,
+            continue_payload=payload,
+            events=events,
         )
         assert receipt_again.result_code == "consumed"
         after = len(await _runtime_events(run_id))
@@ -241,31 +281,40 @@ class TestObservationEmit:
         yielded = node_a({"stage": "start", "input_hash": input_hash, "value": 0})
         await _write_checkpoint(claim, yielded)
         occurred = datetime.now(UTC)
-        events = [build_lifecycle_emit_request(
-            run_id=run_id, command_seq=0, status="running", run_revision=1, occurred_at=occurred)]
+        events = [
+            build_lifecycle_emit_request(
+                run_id=run_id, command_seq=0, status="running", run_revision=1, occurred_at=occurred
+            )
+        ]
         payload = {"outcome_kind": "yield", "input_hash": input_hash, "value": yielded["value"]}
         payload_hash = canonical_hash(payload)
         await driver.finish_delivery(
-            claim, outcome_kind="yield",
+            claim,
+            outcome_kind="yield",
             continue_payload_ref=f"continue-payload:{payload_hash}",
-            continue_payload_hash=payload_hash, continue_payload=payload, events=events,
+            continue_payload_hash=payload_hash,
+            continue_payload=payload,
+            events=events,
         )
 
         engine = create_async_engine(API_URL)
         async with engine.connect() as conn:
             await conn.execute(text("SELECT set_config('grove.tenant_id', :t, true)"), {"t": tenant})
-            own = (await conn.execute(
-                text("SELECT count(*) FROM runtime_event WHERE run_id = :r"), {"r": run_id})).scalar()
+            own = (
+                await conn.execute(text("SELECT count(*) FROM runtime_event WHERE run_id = :r"), {"r": run_id})
+            ).scalar()
             await conn.execute(text("SELECT set_config('grove.tenant_id', :t, true)"), {"t": other})
-            cross = (await conn.execute(
-                text("SELECT count(*) FROM runtime_event WHERE run_id = :r"), {"r": run_id})).scalar()
+            cross = (
+                await conn.execute(text("SELECT count(*) FROM runtime_event WHERE run_id = :r"), {"r": run_id})
+            ).scalar()
         await engine.dispose()
         assert own == 1
         assert cross == 0
 
         engine = create_async_engine(MIGRATION_URL)
         async with engine.connect() as conn:
-            outbox = (await conn.execute(
-                text("SELECT count(*) FROM runtime_event_outbox WHERE run_id = :r"), {"r": run_id})).scalar()
+            outbox = (
+                await conn.execute(text("SELECT count(*) FROM runtime_event_outbox WHERE run_id = :r"), {"r": run_id})
+            ).scalar()
         await engine.dispose()
         assert outbox == 1

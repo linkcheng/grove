@@ -43,6 +43,8 @@ from app.build.manifest import (
     WS3_INFRASTRUCTURE_RELATIONS,
     WS3_SCHEMA_CONTRACT,
     WS3_SCHEMA_CONTRACT_VERSION,
+    WS4_BUSINESS_RELATIONS,
+    WS4_MIGRATION_HEADS,
     migration_hash,
     migration_head,
     write_content_addressed_artifact,
@@ -1991,15 +1993,24 @@ def write_report(root: Path, output: Path) -> None:
             "checkpoint relation set does not match WS-3 contract: "
             f"expected={sorted(WS3_BUSINESS_RELATIONS)!r}, actual={business_tables!r}"
         )
+    if expected_head in WS4_MIGRATION_HEADS and set(business_tables) != WS4_BUSINESS_RELATIONS:
+        raise MigrationReportError(
+            "observation relation set does not match WS-4 contract: "
+            f"expected={sorted(WS4_BUSINESS_RELATIONS)!r}, actual={business_tables!r}"
+        )
     ws3_schema: dict[str, object] | None = None
     schema_contract_version = "ws2-tenant-commands"
-    if expected_head in {
-        "ws3_execution_driver",
-        "ws3_checkpoint_fenced",
-        "ws3_cancel_acceptance",
-        "ws3_dead_letter_reconciliation",
-        "ws3_execution_authority_closure",
-    }:
+    if (
+        expected_head
+        in {
+            "ws3_execution_driver",
+            "ws3_checkpoint_fenced",
+            "ws3_cancel_acceptance",
+            "ws3_dead_letter_reconciliation",
+            "ws3_execution_authority_closure",
+        }
+        or expected_head in WS4_MIGRATION_HEADS
+    ):
         schema_contract_version = WS3_SCHEMA_CONTRACT_VERSION
         ws3_schema = ws3_database_state()
         if ws3_schema != WS3_SCHEMA_CONTRACT:

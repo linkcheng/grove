@@ -75,8 +75,13 @@ async def _submit(run_id: uuid.UUID, submission_id: uuid.UUID, tenant: str) -> N
                 "'b', :rbh, 'accepted', 0)"
             ),
             {
-                "t": tenant, "rid": run_id, "sid": submission_id, "dig": payload_hash,
-                "ssh": "b" * 64, "ssr": "execution-spec:" + "b" * 64, "rbh": BUILD_HASH,
+                "t": tenant,
+                "rid": run_id,
+                "sid": submission_id,
+                "dig": payload_hash,
+                "ssh": "b" * 64,
+                "ssr": "execution-spec:" + "b" * 64,
+                "rbh": BUILD_HASH,
             },
         )
         await conn.execute(
@@ -95,8 +100,14 @@ async def _submit(run_id: uuid.UUID, submission_id: uuid.UUID, tenant: str) -> N
                 "VALUES (:t, :cid, :rid, 'fault-worker', 'workload', 0, 'start', 'start.v1', "
                 ":dig, :pref, :ph, 'pending')"
             ),
-            {"t": tenant, "cid": uuid.uuid4(), "rid": run_id, "dig": payload_hash,
-             "ph": payload_hash, "pref": payload_ref},
+            {
+                "t": tenant,
+                "cid": uuid.uuid4(),
+                "rid": run_id,
+                "dig": payload_hash,
+                "ph": payload_hash,
+                "pref": payload_ref,
+            },
         )
     await engine.dispose()
 
@@ -124,9 +135,14 @@ async def _count(table: str, tenant: str) -> int:
     engine = create_async_engine(MIGRATION_URL)
     try:
         async with engine.connect() as conn:
-            return int((await conn.execute(
-                text(f"SELECT count(*) FROM {table} WHERE tenant_id = :t"), {"t": tenant}  # noqa: S608
-            )).scalar_one())
+            return int(
+                (
+                    await conn.execute(
+                        text(f"SELECT count(*) FROM {table} WHERE tenant_id = :t"),  # noqa: S608
+                        {"t": tenant},
+                    )
+                ).scalar_one()
+            )
     finally:
         await engine.dispose()
 
@@ -150,19 +166,31 @@ class TestFaultIsolation:
         occurred = datetime.now(UTC)
         events = [
             build_node_executed_emit_request(
-                run_id=run_id, command_seq=0, node_id="node_a", stage="start",
-                input_hash=input_hash, value=yielded["value"], occurred_at=occurred,
+                run_id=run_id,
+                command_seq=0,
+                node_id="node_a",
+                stage="start",
+                input_hash=input_hash,
+                value=yielded["value"],
+                occurred_at=occurred,
             ),
             build_lifecycle_emit_request(
-                run_id=run_id, command_seq=0, status="running", run_revision=1, occurred_at=occurred,
+                run_id=run_id,
+                command_seq=0,
+                status="running",
+                run_revision=1,
+                occurred_at=occurred,
             ),
         ]
         payload = {"outcome_kind": "yield", "input_hash": input_hash, "value": yielded["value"]}
         ph = canonical_hash(payload)
         receipt = await driver.finish_delivery(
-            claim, outcome_kind="yield",
-            continue_payload_ref=f"continue-payload:{ph}", continue_payload_hash=ph,
-            continue_payload=payload, events=events,
+            claim,
+            outcome_kind="yield",
+            continue_payload_ref=f"continue-payload:{ph}",
+            continue_payload_hash=ph,
+            continue_payload=payload,
+            events=events,
         )
         assert receipt.result_code == "consumed"
         # The run advanced despite no projection processing the outbox.
@@ -177,11 +205,20 @@ class TestFaultIsolation:
         occurred2 = datetime.now(UTC)
         events2 = [
             build_node_executed_emit_request(
-                run_id=run_id, command_seq=1, node_id="node_b", stage="terminal",
-                input_hash=input_hash, value=terminal["value"], occurred_at=occurred2,
+                run_id=run_id,
+                command_seq=1,
+                node_id="node_b",
+                stage="terminal",
+                input_hash=input_hash,
+                value=terminal["value"],
+                occurred_at=occurred2,
             ),
             build_lifecycle_emit_request(
-                run_id=run_id, command_seq=1, status="succeeded", run_revision=1, occurred_at=occurred2,
+                run_id=run_id,
+                command_seq=1,
+                status="succeeded",
+                run_revision=1,
+                occurred_at=occurred2,
             ),
         ]
         receipt2 = await driver.finish_delivery(claim2, outcome_kind="terminal", events=events2)

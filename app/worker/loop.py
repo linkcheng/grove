@@ -177,8 +177,10 @@ class RuntimeWorker:
         )
         logger.info(
             "worker.yield run=%s seq=%d continue=%s revision=%d",
-            claim.run_id, claim.command_seq,
-            receipt.continue_command_id, receipt.run_revision,
+            claim.run_id,
+            claim.command_seq,
+            receipt.continue_command_id,
+            receipt.run_revision,
         )
 
     async def _invoke_continue(self, claim: ExecutionClaim) -> None:
@@ -211,7 +213,9 @@ class RuntimeWorker:
         receipt = await self._driver.finish_delivery(claim, outcome_kind="terminal", events=events)
         logger.info(
             "worker.terminal run=%s seq=%d status=%s",
-            claim.run_id, claim.command_seq, receipt.status,
+            claim.run_id,
+            claim.command_seq,
+            receipt.status,
         )
 
     async def _write_checkpoint(self, claim: ExecutionClaim, state: ConformanceState) -> None:

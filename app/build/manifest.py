@@ -57,6 +57,22 @@ WS3_INFRASTRUCTURE_RELATIONS = frozenset({"checkpoint_migrations"})
 WS3_BUSINESS_RELATIONS = WS2_BUSINESS_RELATIONS | WS3_CHECKPOINT_RELATIONS
 WS3_SCHEMA_CONTRACT_VERSION = "ws3-execution-authority-v7"
 
+# WS-4 adds the observation slice (runtime event/outbox, rebuildable UI
+# projection read model, projection watermark, dead-letter).  These are
+# authoritative committed facts, not infrastructure; they extend the WS-3
+# business relation set.  No new infrastructure tables are introduced.
+WS4_OBSERVATION_RELATIONS = frozenset(
+    {
+        "runtime_event",
+        "runtime_event_outbox",
+        "ui_projection_event",
+        "projection_watermark",
+        "runtime_event_dead_letter",
+    }
+)
+WS4_BUSINESS_RELATIONS = WS3_BUSINESS_RELATIONS | WS4_OBSERVATION_RELATIONS
+WS4_MIGRATION_HEADS = frozenset({"ws4_observation_slice", "ws4_recon_helpers"})
+
 # v7 keeps an independent expected object inventory.  The reader must first
 # enumerate this complete public `pg_class` universe (including empty
 # relkinds) and only then project the twelve relation entries below.  This
@@ -1765,7 +1781,9 @@ WS3_AUTHORITY_DML_TARGETS = {
 }
 
 # Normalize the original seven mutation entries into the registry catalog shape.
-WS3_AUTHORITY_DML_TARGETS["public.grove_finish_delivery(p_tenant_id text, p_run_id uuid, p_command_id uuid, p_command_seq bigint, p_command_digest text, p_runtime_build_hash text, p_worker_id text, p_execution_fence bigint, p_expected_lease_until timestamp with time zone, p_outcome_kind text, p_continue_payload_ref text, p_continue_payload_hash text, p_continue_payload jsonb)"] = ("public.agent_run", "public.command_payload", "public.run_command")  # noqa: E501
+WS3_AUTHORITY_DML_TARGETS[
+    "public.grove_finish_delivery(p_tenant_id text, p_run_id uuid, p_command_id uuid, p_command_seq bigint, p_command_digest text, p_runtime_build_hash text, p_worker_id text, p_execution_fence bigint, p_expected_lease_until timestamp with time zone, p_outcome_kind text, p_continue_payload_ref text, p_continue_payload_hash text, p_continue_payload jsonb)"  # noqa: E501
+] = ("public.agent_run", "public.command_payload", "public.run_command")
 # This conversion is local to the expected registry and does not consume any
 # live catalog value, keeping the expected side independent from the reader.
 for _relation_key, _relation_entry in WS3_AUTHORITY_RELATION_REGISTRY.items():
@@ -2772,12 +2790,14 @@ def _verify_migration_report(path: Path, manifest: RuntimeBuildManifest) -> None
         else WS3_BUSINESS_RELATIONS
         if report_head
         in {
-           "ws3_checkpoint_fenced",
-           "ws3_cancel_acceptance",
-           "ws3_dead_letter_reconciliation",
-           "ws3_execution_authority_closure",
-           "ws3_runtime_worker_delivery",
+            "ws3_checkpoint_fenced",
+            "ws3_cancel_acceptance",
+            "ws3_dead_letter_reconciliation",
+            "ws3_execution_authority_closure",
+            "ws3_runtime_worker_delivery",
         }
+        else WS4_BUSINESS_RELATIONS
+        if report_head in WS4_MIGRATION_HEADS
         else frozenset()
     )
     if set(relations) != expected_relations:
@@ -2792,20 +2812,24 @@ def _verify_migration_report(path: Path, manifest: RuntimeBuildManifest) -> None
             "ws3_execution_authority_closure",
             "ws3_runtime_worker_delivery",
         }
-        and set(infrastructure_relations) != WS3_INFRASTRUCTURE_RELATIONS
-    ):
+        or report_head in WS4_MIGRATION_HEADS
+    ) and set(infrastructure_relations) != WS3_INFRASTRUCTURE_RELATIONS:
         raise ManifestError("migration report infrastructure relation set does not match migration head")
     report_contract_version = payload.get("schema_contract_version")
     if report_contract_version is not None and report_contract_version != manifest.schema_contract_version:
         raise ManifestError("migration report schema contract version does not match manifest")
-    if report_head in {
-        "ws3_execution_driver",
-        "ws3_checkpoint_fenced",
-        "ws3_cancel_acceptance",
-        "ws3_dead_letter_reconciliation",
-        "ws3_execution_authority_closure",
-        "ws3_runtime_worker_delivery",
-    }:
+    if (
+        report_head
+        in {
+            "ws3_execution_driver",
+            "ws3_checkpoint_fenced",
+            "ws3_cancel_acceptance",
+            "ws3_dead_letter_reconciliation",
+            "ws3_execution_authority_closure",
+            "ws3_runtime_worker_delivery",
+        }
+        or report_head in WS4_MIGRATION_HEADS
+    ):
         if report_contract_version != WS3_SCHEMA_CONTRACT_VERSION or payload.get("ws3_schema") != WS3_SCHEMA_CONTRACT:
             raise ManifestError("migration report WS-3 schema evidence does not match the fixed contract")
     if report_head in {"ws3_execution_authority_closure", "ws3_runtime_worker_delivery"}:
@@ -2890,6 +2914,7 @@ def build_manifest(
                 "ws3_execution_authority_closure",
                 "ws3_runtime_worker_delivery",
             }
+            or migration_head in WS4_MIGRATION_HEADS
             else "ws2-tenant-commands"
         ),
         "signing": {"status": "not_configured", "reference": None},

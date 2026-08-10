@@ -19,9 +19,7 @@ MIGRATION_URL = "postgresql+psycopg://grove_migration:grove_migration_ws0@127.0.
 
 
 def _ctx(tenant: str) -> ActiveTenantContext:
-    return ActiveTenantContext(
-        tenant_id=tenant, principal=Principal(principal_id="obs-user", kind=PrincipalKind.HUMAN)
-    )
+    return ActiveTenantContext(tenant_id=tenant, principal=Principal(principal_id="obs-user", kind=PrincipalKind.HUMAN))
 
 
 async def _seed(tenant: str, run_id: uuid.UUID, status: str, revision: int) -> None:
@@ -59,9 +57,15 @@ async def _seed(tenant: str, run_id: uuid.UUID, status: str, revision: int) -> N
                 "'b', :rbh, :status, :rev)"
             ),
             {
-                "t": tenant, "rid": run_id, "sid": uuid.uuid4(), "dig": run_id.hex.ljust(64, "0")[:64],
-                "ssh": "b" * 64, "ssr": "execution-spec:" + "b" * 64, "rbh": "a" * 64,
-                "status": status, "rev": revision,
+                "t": tenant,
+                "rid": run_id,
+                "sid": uuid.uuid4(),
+                "dig": run_id.hex.ljust(64, "0")[:64],
+                "ssh": "b" * 64,
+                "ssr": "execution-spec:" + "b" * 64,
+                "rbh": "a" * 64,
+                "status": status,
+                "rev": revision,
             },
         )
     await engine.dispose()
@@ -81,12 +85,22 @@ async def _seed_event(tenant: str, run_id: uuid.UUID, run_seq: int, status: str,
                 "VALUES (:eid, :rs, :t, :rid, :rid, :corr, NULL, NULL, 'grove.runtime_worker', :seid, "
                 "'run.lifecycle', 'v1', 'grove.runtime.run-lifecycle.v1', CAST(:p AS jsonb), :occ)"
             ),
-            {"eid": eid, "rs": run_seq, "t": tenant, "rid": run_id, "corr": str(run_id),
-             "seid": f"{run_id}:{run_seq}", "p": json.dumps(payload, sort_keys=True), "occ": occurred},
+            {
+                "eid": eid,
+                "rs": run_seq,
+                "t": tenant,
+                "rid": run_id,
+                "corr": str(run_id),
+                "seid": f"{run_id}:{run_seq}",
+                "p": json.dumps(payload, sort_keys=True),
+                "occ": occurred,
+            },
         )
         await conn.execute(
-            text("INSERT INTO runtime_event_outbox (tenant_id, run_id, event_id, run_seq, source) "
-                 "VALUES (:t, :rid, :eid, :rs, 'grove.runtime_worker')"),
+            text(
+                "INSERT INTO runtime_event_outbox (tenant_id, run_id, event_id, run_seq, source) "
+                "VALUES (:t, :rid, :eid, :rs, 'grove.runtime_worker')"
+            ),
             {"t": tenant, "rid": run_id, "eid": eid, "rs": run_seq},
         )
     await engine.dispose()
@@ -126,7 +140,7 @@ class TestObservationApiService:
         assert [u.projection_seq for u in ui] == [1, 2]
 
         streamed = []
-        async for view_event in observation.stream_ui_events(factory, tenant, run_id, 0):
+        async for view_event in observation.stream_ui_events(factory, ctx, run_id, 0):
             streamed.append(view_event)
             if len(streamed) >= 2:
                 break

@@ -58,10 +58,17 @@ async def _seed_event(
                 ")"
             ),
             {
-                "eid": event_id, "rs": run_seq, "t": tenant, "rid": run_id,
-                "corr": str(run_id), "src": source, "seid": f"{run_id}:{run_seq}",
-                "et": event_type, "schema": schema_ref,
-                "payload": json.dumps(payload, sort_keys=True), "occ": occurred,
+                "eid": event_id,
+                "rs": run_seq,
+                "t": tenant,
+                "rid": run_id,
+                "corr": str(run_id),
+                "src": source,
+                "seid": f"{run_id}:{run_seq}",
+                "et": event_type,
+                "schema": schema_ref,
+                "payload": json.dumps(payload, sort_keys=True),
+                "occ": occurred,
             },
         )
         await conn.execute(
@@ -98,10 +105,16 @@ async def _outbox_relayed(tenant: str) -> int:
     engine = create_async_engine(MIGRATION_URL)
     try:
         async with engine.connect() as conn:
-            return int((await conn.execute(
-                text("SELECT count(*) FROM runtime_event_outbox WHERE tenant_id = :t AND relayed_at IS NOT NULL"),
-                {"t": tenant},
-            )).scalar_one())
+            return int(
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT count(*) FROM runtime_event_outbox WHERE tenant_id = :t AND relayed_at IS NOT NULL"
+                        ),
+                        {"t": tenant},
+                    )
+                ).scalar_one()
+            )
     finally:
         await engine.dispose()
 
@@ -114,10 +127,12 @@ class TestProjection:
         run_id = uuid.uuid4()
         await _seed_tenant(tenant)
         e1, e2 = uuid.uuid4(), uuid.uuid4()
-        await _seed_event(tenant, run_id, e1, 1, "grove.runtime.run-lifecycle.v1",
-                          _lifecycle_payload(run_id, "running", 1))
-        await _seed_event(tenant, run_id, e2, 2, "grove.runtime.run-lifecycle.v1",
-                          _lifecycle_payload(run_id, "succeeded", 1))
+        await _seed_event(
+            tenant, run_id, e1, 1, "grove.runtime.run-lifecycle.v1", _lifecycle_payload(run_id, "running", 1)
+        )
+        await _seed_event(
+            tenant, run_id, e2, 2, "grove.runtime.run-lifecycle.v1", _lifecycle_payload(run_id, "succeeded", 1)
+        )
 
         projection = _projection()
         processed = await projection.run_once()
@@ -134,8 +149,13 @@ class TestProjection:
         run_id = uuid.uuid4()
         await _seed_tenant(tenant)
         await _seed_event(
-            tenant, run_id, uuid.uuid4(), 1, "grove.runtime.future.v9",
-            {"kind": "future"}, event_type="future.event",
+            tenant,
+            run_id,
+            uuid.uuid4(),
+            1,
+            "grove.runtime.future.v9",
+            {"kind": "future"},
+            event_type="future.event",
         )
         projection = _projection()
         await projection.run_once()
@@ -143,14 +163,18 @@ class TestProjection:
         engine = create_async_engine(MIGRATION_URL)
         try:
             async with engine.connect() as conn:
-                dead = (await conn.execute(
-                    text("SELECT count(*) FROM runtime_event_dead_letter WHERE tenant_id = :t"),
-                    {"t": tenant},
-                )).scalar_one()
-                ui = (await conn.execute(
-                    text("SELECT count(*) FROM ui_projection_event WHERE tenant_id = :t"),
-                    {"t": tenant},
-                )).scalar_one()
+                dead = (
+                    await conn.execute(
+                        text("SELECT count(*) FROM runtime_event_dead_letter WHERE tenant_id = :t"),
+                        {"t": tenant},
+                    )
+                ).scalar_one()
+                ui = (
+                    await conn.execute(
+                        text("SELECT count(*) FROM ui_projection_event WHERE tenant_id = :t"),
+                        {"t": tenant},
+                    )
+                ).scalar_one()
         finally:
             await engine.dispose()
         assert dead == 1
@@ -160,10 +184,17 @@ class TestProjection:
         tenant = f"proj-rebuild-{uuid.uuid4().hex[:8]}"
         run_id = uuid.uuid4()
         await _seed_tenant(tenant)
-        await _seed_event(tenant, run_id, uuid.uuid4(), 1, "grove.runtime.run-lifecycle.v1",
-                          _lifecycle_payload(run_id, "running", 1))
-        await _seed_event(tenant, run_id, uuid.uuid4(), 2, "grove.runtime.run-lifecycle.v1",
-                          _lifecycle_payload(run_id, "succeeded", 1))
+        await _seed_event(
+            tenant, run_id, uuid.uuid4(), 1, "grove.runtime.run-lifecycle.v1", _lifecycle_payload(run_id, "running", 1)
+        )
+        await _seed_event(
+            tenant,
+            run_id,
+            uuid.uuid4(),
+            2,
+            "grove.runtime.run-lifecycle.v1",
+            _lifecycle_payload(run_id, "succeeded", 1),
+        )
         projection = _projection()
         await projection.run_once()
         assert len(await _ui_events(tenant, run_id)) == 2
@@ -178,8 +209,9 @@ class TestProjection:
         tenant = f"proj-idem-{uuid.uuid4().hex[:8]}"
         run_id = uuid.uuid4()
         await _seed_tenant(tenant)
-        await _seed_event(tenant, run_id, uuid.uuid4(), 1, "grove.runtime.run-lifecycle.v1",
-                          _lifecycle_payload(run_id, "running", 1))
+        await _seed_event(
+            tenant, run_id, uuid.uuid4(), 1, "grove.runtime.run-lifecycle.v1", _lifecycle_payload(run_id, "running", 1)
+        )
         projection = _projection()
         await projection.run_once()
         first = len(await _ui_events(tenant, run_id))

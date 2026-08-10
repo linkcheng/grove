@@ -44,9 +44,7 @@ async def list_events(
     after_run_seq: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> ApiResponse[EventListResponse]:
-    events, next_cursor = await observation.list_runtime_events(
-        session, context, run_id, after_run_seq, limit
-    )
+    events, next_cursor = await observation.list_runtime_events(session, context, run_id, after_run_seq, limit)
     return ok(EventListResponse(events=events, next_cursor=next_cursor))
 
 
@@ -58,9 +56,7 @@ async def list_ui_events(
     after_projection_seq: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> ApiResponse[EventListResponse]:
-    events, next_cursor = await observation.list_ui_events(
-        session, context, run_id, after_projection_seq, limit
-    )
+    events, next_cursor = await observation.list_ui_events(session, context, run_id, after_projection_seq, limit)
     return ok(EventListResponse(events=events, next_cursor=next_cursor))
 
 
@@ -74,9 +70,7 @@ async def stream_ui(
     factory: async_sessionmaker[AsyncSession] = request.app.state.session_factory
 
     async def event_source() -> AsyncIterator[bytes]:
-        async for view in observation.stream_ui_events(
-            factory, context.tenant_id, run_id, after_projection_seq
-        ):
+        async for view in observation.stream_ui_events(factory, context, run_id, after_projection_seq):
             payload = json.dumps(view.model_dump(mode="json"), separators=(",", ":"))
             yield f"data: {payload}\n\n".encode()
 

@@ -32,8 +32,22 @@ _ALLOWED_LABELS: frozenset[str] = frozenset(
 )
 
 _SENSITIVE_FIELDS = frozenset(
-    {"tenant", "tenant_id", "principal", "principal_id", "run_id", "command_id",
-     "trace_id", "authorization", "credential", "token", "secret", "payload", "input", "output"}
+    {
+        "tenant",
+        "tenant_id",
+        "principal",
+        "principal_id",
+        "run_id",
+        "command_id",
+        "trace_id",
+        "authorization",
+        "credential",
+        "token",
+        "secret",
+        "payload",
+        "input",
+        "output",
+    }
 )
 
 
@@ -92,9 +106,7 @@ class BoundedTelemetryRecorder:
     def capacity(self) -> int:
         return self._capacity
 
-    def record_span(
-        self, name: str, *, duration_ms: float, labels: Mapping[str, Any] | None = None
-    ) -> None:
+    def record_span(self, name: str, *, duration_ms: float, labels: Mapping[str, Any] | None = None) -> None:
         """Record one span. Drops (and counts) when the queue is saturated."""
         if type(name) is not str or not name:
             raise ValueError("span name must be a non-empty string")
@@ -108,9 +120,7 @@ class BoundedTelemetryRecorder:
                 return
             self._spans.append(span)
 
-    def record_metric(
-        self, name: str, *, value: float, labels: Mapping[str, Any] | None = None
-    ) -> None:
+    def record_metric(self, name: str, *, value: float, labels: Mapping[str, Any] | None = None) -> None:
         """Record one metric point. Drops (and counts) when saturated."""
         if type(name) is not str or not name:
             raise ValueError("metric name must be a non-empty string")
