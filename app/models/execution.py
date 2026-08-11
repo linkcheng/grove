@@ -233,6 +233,7 @@ class RunCommand(Base):
     consumed_execution_fence: Mapped[int | None] = mapped_column(BigInteger)
     consumed_lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     consumed_claim_provenance_hash: Mapped[str | None] = mapped_column(String(64))
+    consumed_provenance_kind: Mapped[str | None] = mapped_column(String(32))
     superseded_by_command_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
     superseded_by_command_seq: Mapped[int | None] = mapped_column(BigInteger)
     superseded_by_command_digest: Mapped[str | None] = mapped_column(String(64))
@@ -293,10 +294,18 @@ class RunCommand(Base):
         CheckConstraint("length(command_digest) = 64", name="run_command_digest_ck"),
         CheckConstraint("length(payload_hash) = 64", name="run_command_payload_hash_ck"),
         CheckConstraint(
-            "(status = 'consumed' AND consumed_worker_id IS NOT NULL "
+            "(status = 'consumed' AND consumed_provenance_kind IS NOT NULL "
+            "AND consumed_provenance_kind = 'claim.v1' "
+            "AND consumed_worker_id IS NOT NULL "
             "AND consumed_execution_fence IS NOT NULL AND consumed_lease_until IS NOT NULL "
             "AND consumed_claim_provenance_hash ~ '^[0-9a-f]{64}$') OR "
-            "(status <> 'consumed' AND consumed_worker_id IS NULL "
+            "(status = 'consumed' AND consumed_provenance_kind IS NOT NULL "
+            "AND consumed_provenance_kind = 'legacy_unverified' "
+            "AND consumed_worker_id IS NULL "
+            "AND consumed_execution_fence IS NULL AND consumed_lease_until IS NULL "
+            "AND consumed_claim_provenance_hash IS NULL) OR "
+            "(status <> 'consumed' AND consumed_provenance_kind IS NULL "
+            "AND consumed_worker_id IS NULL "
             "AND consumed_execution_fence IS NULL AND consumed_lease_until IS NULL "
             "AND consumed_claim_provenance_hash IS NULL)",
             name="run_command_consumed_provenance_ck",

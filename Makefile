@@ -56,10 +56,12 @@ ws-3-check:
 	@if [[ -n "$${GROVE_MIGRATION_DATABASE_URL:-}" ]]; then \
 		GROVE_MIGRATION_DATABASE_URL="$$GROVE_MIGRATION_DATABASE_URL" \
 		uv run pytest -q tests/integration/test_ws3_postgres_execution_driver.py \
+				tests/integration/test_ws3_migration_compatibility.py \
 				tests/integration/test_catalog_authority_root.py \
 				tests/integration/test_ws3_worker_crash_recovery.py -m integration -ra; \
 	else \
 		uv run pytest -q tests/integration/test_ws3_postgres_execution_driver.py \
+			tests/integration/test_ws3_migration_compatibility.py \
 			tests/integration/test_catalog_authority_root.py \
 			tests/integration/test_ws3_worker_crash_recovery.py -m integration -ra; \
 	fi

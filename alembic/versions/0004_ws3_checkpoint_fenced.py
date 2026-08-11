@@ -39,10 +39,17 @@ def upgrade() -> None:
     op.execute("ALTER TABLE run_command ADD COLUMN consumed_execution_fence BIGINT")
     op.execute("ALTER TABLE run_command ADD COLUMN consumed_lease_until TIMESTAMPTZ")
     op.execute("ALTER TABLE run_command ADD COLUMN consumed_claim_provenance_hash TEXT")
+    op.execute("ALTER TABLE run_command ADD COLUMN consumed_provenance_kind TEXT")
     op.execute("ALTER TABLE run_command ADD COLUMN superseded_by_command_id UUID")
     op.execute("ALTER TABLE run_command ADD COLUMN superseded_by_command_seq BIGINT")
     op.execute("ALTER TABLE run_command ADD COLUMN superseded_by_command_digest TEXT")
     op.execute("ALTER TABLE run_command ADD COLUMN superseded_by_provenance_hash TEXT")
+    # 0003 allowed consumed commands but did not persist the claim identity
+    # after clearing the active lease fields.  Those historical rows cannot be
+    # upgraded into claim-bound proof without inventing worker/fence/lease
+    # facts.  Mark them with a closed legacy discriminator before installing
+    # the v1 proof constraint; runtime functions only write ``claim.v1``.
+    op.execute("UPDATE run_command SET consumed_provenance_kind = 'legacy_unverified' WHERE status = 'consumed'")
     op.execute("ALTER TABLE command_payload DROP CONSTRAINT command_payload_schema_version_ck")
     op.execute(
         "ALTER TABLE command_payload ADD CONSTRAINT command_payload_schema_version_ck "
@@ -54,10 +61,18 @@ def upgrade() -> None:
     )
     op.execute(
         "ALTER TABLE run_command ADD CONSTRAINT run_command_consumed_provenance_ck CHECK ("
-        "(status = 'consumed' AND consumed_worker_id IS NOT NULL "
+        "(status = 'consumed' AND consumed_provenance_kind IS NOT NULL "
+        "AND consumed_provenance_kind = 'claim.v1' "
+        "AND consumed_worker_id IS NOT NULL "
         "AND consumed_execution_fence IS NOT NULL AND consumed_lease_until IS NOT NULL "
         "AND consumed_claim_provenance_hash ~ '^[0-9a-f]{64}$') OR "
-        "(status <> 'consumed' AND consumed_worker_id IS NULL "
+        "(status = 'consumed' AND consumed_provenance_kind IS NOT NULL "
+        "AND consumed_provenance_kind = 'legacy_unverified' "
+        "AND consumed_worker_id IS NULL "
+        "AND consumed_execution_fence IS NULL AND consumed_lease_until IS NULL "
+        "AND consumed_claim_provenance_hash IS NULL) OR "
+        "(status <> 'consumed' AND consumed_provenance_kind IS NULL "
+        "AND consumed_worker_id IS NULL "
         "AND consumed_execution_fence IS NULL AND consumed_lease_until IS NULL "
         "AND consumed_claim_provenance_hash IS NULL))"
     )
@@ -777,6 +792,7 @@ def upgrade() -> None:
                    AND command_row.lease_until IS NOT DISTINCT FROM p_expected_lease_until THEN
                     UPDATE public.run_command AS consumed_command
                        SET status = 'consumed',
+                           consumed_provenance_kind = 'claim.v1',
                            lease_owner = NULL,
                            lease_until = NULL,
                            execution_fence = NULL,
@@ -839,6 +855,7 @@ def upgrade() -> None:
             END IF;
             UPDATE public.run_command AS consumed_command
                SET status = 'consumed',
+                   consumed_provenance_kind = 'claim.v1',
                    lease_owner = NULL,
                    lease_until = NULL,
                    execution_fence = NULL,
@@ -937,6 +954,9 @@ def downgrade() -> None:
         op.execute(f"DROP TABLE {table}")
     op.execute("DROP TABLE checkpoint_migrations")
     op.execute("ALTER TABLE run_command DROP CONSTRAINT run_command_consumed_provenance_ck")
+    # Downgrade intentionally discards both the discriminator and v1 proof.
+    # A later re-upgrade classifies every remaining consumed row as legacy,
+    # rather than pretending the discarded proof can be recovered.
     op.execute("ALTER TABLE run_command DROP CONSTRAINT run_command_superseded_provenance_ck")
     op.execute("ALTER TABLE run_command DROP CONSTRAINT run_command_superseded_target_fk")
     op.execute("ALTER TABLE agent_run DROP CONSTRAINT agent_run_latest_applied_seq_ck")
@@ -945,6 +965,7 @@ def downgrade() -> None:
         "superseded_by_command_digest",
         "superseded_by_command_seq",
         "superseded_by_command_id",
+        "consumed_provenance_kind",
         "consumed_claim_provenance_hash",
         "consumed_lease_until",
         "consumed_execution_fence",

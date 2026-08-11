@@ -347,6 +347,7 @@ def upgrade() -> None:
             IF current_proof THEN
                 UPDATE public.run_command AS consumed_command
                    SET status = 'consumed',
+                       consumed_provenance_kind = 'claim.v1',
                        lease_owner = NULL,
                        lease_until = NULL,
                        execution_fence = NULL,

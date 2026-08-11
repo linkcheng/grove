@@ -1625,7 +1625,8 @@ async def test_closed_or_terminal_wrong_build_is_not_version_unavailable(closed_
                 elif closed_state == "consumed":
                     await connection.execute(
                         text(
-                            "UPDATE run_command SET status = 'consumed', consumed_worker_id = 'fixture', "
+                            "UPDATE run_command SET status = 'consumed', consumed_provenance_kind = 'claim.v1', "
+                            "consumed_worker_id = 'fixture', "
                             "consumed_execution_fence = 1, consumed_lease_until = now(), "
                             "consumed_claim_provenance_hash = :fingerprint WHERE run_id = :run_id"
                         ),
@@ -1690,7 +1691,8 @@ async def test_locked_run_is_skipped_and_same_run_remains_single_writer() -> Non
     async with owner.begin() as connection:
         await connection.execute(
             text(
-                "UPDATE run_command SET status = 'consumed', lease_owner = NULL, lease_until = NULL, "
+                "UPDATE run_command SET status = 'consumed', consumed_provenance_kind = 'claim.v1', "
+                "lease_owner = NULL, lease_until = NULL, "
                 "execution_fence = NULL, consumed_worker_id = 'fixture', consumed_execution_fence = 1, "
                 "consumed_lease_until = now(), consumed_claim_provenance_hash = :fingerprint WHERE run_id = :run_id"
             ),
@@ -2570,6 +2572,7 @@ async def test_ws3_migration_schema_functions_and_grants_are_exact() -> None:
                 "consumed_execution_fence",
                 "consumed_lease_until",
                 "consumed_claim_provenance_hash",
+                "consumed_provenance_kind",
                 "superseded_by_command_id",
                 "superseded_by_command_seq",
                 "superseded_by_command_digest",
@@ -3504,8 +3507,12 @@ async def test_expired_reconciliation_consumes_checkpoint_proof_without_reapplyi
             row = (
                 await connection.execute(
                     text(
-                        "SELECT c.status, c.consumed_worker_id, c.consumed_execution_fence, "
+                        "SELECT c.status, c.consumed_provenance_kind, c.consumed_worker_id, "
+                        "c.consumed_execution_fence, "
                         "c.consumed_lease_until, c.consumed_claim_provenance_hash, "
+                        "grove_checkpoint_claim_provenance(c.tenant_id, c.run_id, c.command_id, "
+                        "c.command_seq, c.command_digest, r.runtime_build_hash, c.consumed_worker_id, "
+                        "c.consumed_execution_fence, c.consumed_lease_until), "
                         "r.latest_checkpoint_id, r.latest_applied_command_id, r.latest_applied_command_seq "
                         "FROM run_command c JOIN agent_run r USING (tenant_id, run_id) "
                         "WHERE c.command_id = :command_id"
@@ -3513,9 +3520,9 @@ async def test_expired_reconciliation_consumes_checkpoint_proof_without_reapplyi
                     {"command_id": claim.command_id},
                 )
             ).one()
-        assert row[0:4] == ("consumed", claim.worker_id, claim.execution_fence, claim.lease_until)
-        assert isinstance(row[4], str) and len(row[4]) == 64
-        assert row[5:] == (checkpoint["id"], claim.command_id, claim.command_seq)
+        assert row[0:5] == ("consumed", "claim.v1", claim.worker_id, claim.execution_fence, claim.lease_until)
+        assert isinstance(row[5], str) and len(row[5]) == 64 and row[5] == row[6]
+        assert row[7:] == (checkpoint["id"], claim.command_id, claim.command_seq)
     finally:
         await runtime_engine.dispose()
         await projection_engine.dispose()
@@ -3641,7 +3648,8 @@ async def test_reconcile_prior_proof_requires_consumed_command_closure(mutation:
                 await connection.execute(
                     text(
                         "UPDATE run_command SET status = :status, lease_owner = NULL, lease_until = NULL, "
-                        "execution_fence = NULL, consumed_worker_id = NULL, consumed_execution_fence = NULL, "
+                        "execution_fence = NULL, consumed_provenance_kind = NULL, consumed_worker_id = NULL, "
+                        "consumed_execution_fence = NULL, "
                         "consumed_lease_until = NULL, consumed_claim_provenance_hash = NULL "
                         "WHERE tenant_id = :tenant AND command_id = :command_id"
                     ),
@@ -3651,7 +3659,8 @@ async def test_reconcile_prior_proof_requires_consumed_command_closure(mutation:
                 await connection.execute(
                     text(
                         "UPDATE run_command SET status = 'leased', lease_owner = 'prior-mutant', "
-                        "lease_until = :expired, execution_fence = :fence, consumed_worker_id = NULL, "
+                        "lease_until = :expired, execution_fence = :fence, consumed_provenance_kind = NULL, "
+                        "consumed_worker_id = NULL, "
                         "consumed_execution_fence = NULL, consumed_lease_until = NULL, "
                         "consumed_claim_provenance_hash = NULL WHERE tenant_id = :tenant AND command_id = :command_id"
                     ),

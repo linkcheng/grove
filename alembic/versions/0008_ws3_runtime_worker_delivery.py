@@ -9,10 +9,7 @@ down_revision: str | None = "ws3_execution_authority_closure"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
-_FINISH_SIGNATURE = (
-    "TEXT, UUID, UUID, BIGINT, TEXT, TEXT, TEXT, BIGINT, TIMESTAMPTZ, "
-    "TEXT, TEXT, TEXT, JSONB"
-)
+_FINISH_SIGNATURE = "TEXT, UUID, UUID, BIGINT, TEXT, TEXT, TEXT, BIGINT, TIMESTAMPTZ, TEXT, TEXT, TEXT, JSONB"
 
 
 def _lifecycle_predicate_sql() -> str:
@@ -200,6 +197,7 @@ def _finish_delivery_sql() -> str:
             -- Mark current command consumed.
             UPDATE public.run_command AS consumed_command
                SET status = 'consumed',
+                   consumed_provenance_kind = 'claim.v1',
                    lease_owner = NULL, lease_until = NULL, execution_fence = NULL,
                    consumed_worker_id = p_worker_id,
                    consumed_execution_fence = p_execution_fence,

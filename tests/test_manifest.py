@@ -79,7 +79,7 @@ def test_ws3_function_contract_uses_complete_schema_identity_keys() -> None:
         for key, value in WS3_SCHEMA_CONTRACT["function_acl"].items()
         if "_internal(" in key
     )
-    assert WS3_SCHEMA_CONTRACT_VERSION == "ws3-execution-authority-v7"
+    assert WS3_SCHEMA_CONTRACT_VERSION == "ws3-execution-authority-v8"
     assert set(WS3_SCHEMA_CONTRACT["authority_relations"]) == {
         "public.tenant",
         "public.membership",

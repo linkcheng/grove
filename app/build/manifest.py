@@ -55,7 +55,7 @@ WS2_BUSINESS_RELATIONS = frozenset(
 WS3_CHECKPOINT_RELATIONS = frozenset({"checkpoints", "checkpoint_blobs", "checkpoint_writes"})
 WS3_INFRASTRUCTURE_RELATIONS = frozenset({"checkpoint_migrations"})
 WS3_BUSINESS_RELATIONS = WS2_BUSINESS_RELATIONS | WS3_CHECKPOINT_RELATIONS
-WS3_SCHEMA_CONTRACT_VERSION = "ws3-execution-authority-v7"
+WS3_SCHEMA_CONTRACT_VERSION = "ws3-execution-authority-v8"
 
 # WS-4 adds the observation slice (runtime event/outbox, rebuildable UI
 # projection read model, projection watermark, dead-letter).  These are
@@ -336,6 +336,7 @@ WS3_AUTHORITY_COLUMNS: dict[str, tuple[str, ...]] = {
         "consumed_execution_fence",
         "consumed_lease_until",
         "consumed_claim_provenance_hash",
+        "consumed_provenance_kind",
         "superseded_by_command_id",
         "superseded_by_command_seq",
         "superseded_by_command_digest",
@@ -476,6 +477,7 @@ WS3_SCHEMA_CONTRACT: dict[str, Any] = {
         "run_command.lease_owner": ["text", "YES", None],
         "run_command.lease_until": ["timestamp with time zone", "YES", None],
         "run_command.consumed_claim_provenance_hash": ["text", "YES", None],
+        "run_command.consumed_provenance_kind": ["text", "YES", None],
         "run_command.consumed_execution_fence": ["bigint", "YES", None],
         "run_command.consumed_lease_until": ["timestamp with time zone", "YES", None],
         "run_command.consumed_worker_id": ["text", "YES", None],
@@ -583,9 +585,15 @@ WS3_SCHEMA_CONTRACT: dict[str, Any] = {
             "CHECK (latest_applied_command_seq IS NULL OR latest_applied_command_seq >= 0)"
         ),
         "run_command_consumed_provenance_ck": (
-            "CHECK (status = 'consumed'::text AND consumed_worker_id IS NOT NULL "
+            "CHECK (status = 'consumed'::text AND consumed_provenance_kind IS NOT NULL "
+            "AND consumed_provenance_kind = 'claim.v1'::text AND consumed_worker_id IS NOT NULL "
             "AND consumed_execution_fence IS NOT NULL AND consumed_lease_until IS NOT NULL "
-            "AND consumed_claim_provenance_hash ~ '^[0-9a-f]{64}$'::text OR status <> 'consumed'::text "
+            "AND consumed_claim_provenance_hash ~ '^[0-9a-f]{64}$'::text "
+            "OR status = 'consumed'::text AND consumed_provenance_kind IS NOT NULL "
+            "AND consumed_provenance_kind = 'legacy_unverified'::text AND consumed_worker_id IS NULL "
+            "AND consumed_execution_fence IS NULL AND consumed_lease_until IS NULL "
+            "AND consumed_claim_provenance_hash IS NULL "
+            "OR status <> 'consumed'::text AND consumed_provenance_kind IS NULL "
             "AND consumed_worker_id IS NULL AND consumed_execution_fence IS NULL "
             "AND consumed_lease_until IS NULL AND consumed_claim_provenance_hash IS NULL)"
         ),
@@ -762,7 +770,7 @@ WS3_SCHEMA_CONTRACT: dict[str, Any] = {
             "owner": "grove_migration",
             "security_definer": True,
             "settings": ["search_path=pg_catalog, public"],
-            "definition_sha256": "2e2a44b0a8182962dca2a56727de0943bd8fd6264de5e6cb48ecc47d2aa8155f",
+            "definition_sha256": "afe7cb6fe0903ff597dffdd0da02e677e9e84d47cb4e5c1bc02fdef544e3db13",
         },
         (
             "public.grove_dead_letter_run_command("
@@ -811,7 +819,7 @@ WS3_SCHEMA_CONTRACT: dict[str, Any] = {
             "owner": "grove_migration",
             "security_definer": True,
             "settings": ["search_path=pg_catalog, public"],
-            "definition_sha256": "8eafc0e8c3eab0a96c380daf04f3f270f71a91f963c2c6e5fb208aa4b076a430",
+            "definition_sha256": "62c7d6ef60331441a024e2a082a437bf44d01757b5ad4d450badc5071d069525",
         },
     },
     "function_acl": {
@@ -1220,9 +1228,15 @@ _WS3_AUTHORITY_CONSTRAINT_DEFINITIONS: dict[str, tuple[str, str]] = {
     "public.run_command.run_command_consumed_provenance_ck": (
         "c",
         (
-            "CHECK (status = 'consumed'::text AND consumed_worker_id IS NOT NULL AND "
+            "CHECK (status = 'consumed'::text AND consumed_provenance_kind IS NOT NULL AND "
+            "consumed_provenance_kind = 'claim.v1'::text AND consumed_worker_id IS NOT NULL AND "
             "consumed_execution_fence IS NOT NULL AND consumed_lease_until IS NOT NULL AND "
-            "consumed_claim_provenance_hash ~ '^[0-9a-f]{64}$'::text OR status <> 'consumed'::text AND "
+            "consumed_claim_provenance_hash ~ '^[0-9a-f]{64}$'::text OR "
+            "status = 'consumed'::text AND consumed_provenance_kind IS NOT NULL AND "
+            "consumed_provenance_kind = 'legacy_unverified'::text AND consumed_worker_id IS NULL AND "
+            "consumed_execution_fence IS NULL AND consumed_lease_until IS NULL AND "
+            "consumed_claim_provenance_hash IS NULL OR "
+            "status <> 'consumed'::text AND consumed_provenance_kind IS NULL AND "
             "consumed_worker_id IS NULL AND consumed_execution_fence IS NULL AND "
             "consumed_lease_until IS NULL AND consumed_claim_provenance_hash IS NULL)"
         ),
@@ -1858,7 +1872,7 @@ WS3_SCHEMA_CONTRACT["functions"].update(
             "owner": "grove_migration",
             "security_definer": True,
             "settings": ["search_path=pg_catalog, public"],
-            "definition_sha256": "e9372922a3a6209b9e18a12238b3a559d5194562e42d5aa8c588f07e08ce278f",
+            "definition_sha256": "3f5c15a9a70dbce72c076d3250919cdfed8a81cc97a55834aedd15e4d387f7c7",
         },
     }
 )
