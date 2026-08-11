@@ -285,8 +285,9 @@ async def test_real_http_postgres_submit_is_idempotent_and_concurrent() -> None:
                             "LEFT JOIN agent_run r ON r.tenant_id = s.tenant_id "
                             "AND r.skill_spec_hash = s.skill_spec_hash "
                             "AND r.skill_spec_ref = s.spec_ref "
-                            "WHERE r.run_id IS NULL"
-                        )
+                            "WHERE s.tenant_id = :tenant_id AND r.run_id IS NULL"
+                        ),
+                        {"tenant_id": tenant_id},
                     )
                 ).scalar_one()
                 orphan_payload = (
@@ -297,8 +298,9 @@ async def test_real_http_postgres_submit_is_idempotent_and_concurrent() -> None:
                             "AND c.payload_ref = p.payload_ref "
                             "AND c.payload_hash = p.payload_hash "
                             "AND c.command_schema_version = p.command_schema_version "
-                            "WHERE c.command_id IS NULL"
-                        )
+                            "WHERE p.tenant_id = :tenant_id AND c.command_id IS NULL"
+                        ),
+                        {"tenant_id": tenant_id},
                     )
                 ).scalar_one()
                 assert orphan_spec == 0
