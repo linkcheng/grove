@@ -33,6 +33,7 @@ def check(root: Path, database_url: str) -> None:
         "ws4_observation_slice",
         "ws4_recon_helpers",
         "ws4_authority_audit_emitters",
+        "ws3_consumed_provenance_compat",
     }
     if expected_head not in _WS3_PREFLIGHT_HEADS:
         raise WS3PreflightError(

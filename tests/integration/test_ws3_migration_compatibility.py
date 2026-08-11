@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -19,6 +20,20 @@ _LEGACY_COMMAND_ID = uuid.UUID("10000000-0000-0000-0000-000000000001")
 _PENDING_COMMAND_ID = uuid.UUID("10000000-0000-0000-0000-000000000002")
 _RUN_ID = uuid.UUID("20000000-0000-0000-0000-000000000001")
 _SUBMISSION_ID = uuid.UUID("30000000-0000-0000-0000-000000000001")
+_CLAIM_PROVENANCE_ASSIGNMENT = "consumed_provenance_kind = 'claim.v1',"
+_PROVENANCE_WRITER_SIGNATURES = (
+    (
+        "public.grove_consume_run_command_internal("
+        "text,uuid,uuid,bigint,text,text,text,bigint,timestamp with time zone)",
+        2,
+    ),
+    ("public.grove_reconcile_expired_run_command_internal(text,uuid)", 1),
+    (
+        "public.grove_finish_delivery("
+        "text,uuid,uuid,bigint,text,text,text,bigint,timestamp with time zone,text,text,text,jsonb)",
+        1,
+    ),
+)
 
 
 def _raw_url(url: URL) -> str:
@@ -52,7 +67,7 @@ def _temporary_database() -> Iterator[URL]:
                 cursor.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(database_name)))
 
 
-def _run_alembic(database_url: URL, command: str, target: str) -> None:
+def _invoke_alembic(database_url: URL, command: str, target: str) -> subprocess.CompletedProcess[str]:
     child_env = {name: value for name, value in os.environ.items() if not name.startswith("GROVE_")}
     child_env.update(
         {
@@ -60,7 +75,7 @@ def _run_alembic(database_url: URL, command: str, target: str) -> None:
             "GROVE_ROLE": "api",
         }
     )
-    result = subprocess.run(  # noqa: S603 - fixed interpreter/module/command allowlist
+    return subprocess.run(  # noqa: S603 - fixed interpreter/module/command allowlist
         [sys.executable, "-m", "alembic", command, target],
         cwd=_PROJECT_ROOT,
         env=child_env,
@@ -69,6 +84,10 @@ def _run_alembic(database_url: URL, command: str, target: str) -> None:
         timeout=60,
         check=False,
     )
+
+
+def _run_alembic(database_url: URL, command: str, target: str) -> None:
+    result = _invoke_alembic(database_url, command, target)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -180,6 +199,119 @@ def _assert_head_legacy_semantics(database_url: URL) -> None:
             assert cursor.fetchone() == ("stale",)
 
 
+def _simulate_published_head_without_provenance_discriminator(database_url: URL) -> None:
+    with psycopg.connect(_raw_url(database_url), autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "UPDATE run_command SET consumed_provenance_kind = 'claim.v1', "
+                "consumed_worker_id = 'published-worker', consumed_execution_fence = 7, "
+                "consumed_lease_until = %s, consumed_claim_provenance_hash = %s "
+                "WHERE command_id = %s",
+                (datetime(2030, 1, 1, tzinfo=UTC), "9" * 64, _LEGACY_COMMAND_ID),
+            )
+            for signature, expected_count in _PROVENANCE_WRITER_SIGNATURES:
+                cursor.execute("SELECT pg_get_functiondef(to_regprocedure(%s))", (signature,))
+                row = cursor.fetchone()
+                assert row is not None
+                old_definition, replacement_count = re.subn(
+                    r"(?m)^[ \t]*consumed_provenance_kind = 'claim\.v1',\n",
+                    "",
+                    row[0],
+                )
+                assert replacement_count == expected_count
+                cursor.execute(old_definition)
+            cursor.execute("ALTER TABLE run_command DROP CONSTRAINT run_command_consumed_provenance_ck")
+            cursor.execute("ALTER TABLE run_command DROP COLUMN consumed_provenance_kind")
+            cursor.execute(
+                "ALTER TABLE run_command ADD CONSTRAINT run_command_consumed_provenance_ck CHECK ("
+                "(status = 'consumed' AND consumed_worker_id IS NOT NULL "
+                "AND consumed_execution_fence IS NOT NULL AND consumed_lease_until IS NOT NULL "
+                "AND consumed_claim_provenance_hash ~ '^[0-9a-f]{64}$') OR "
+                "(status <> 'consumed' AND consumed_worker_id IS NULL "
+                "AND consumed_execution_fence IS NULL AND consumed_lease_until IS NULL "
+                "AND consumed_claim_provenance_hash IS NULL))"
+            )
+
+
+def _assert_published_head_forward_migration(database_url: URL) -> None:
+    with psycopg.connect(_raw_url(database_url), autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT version_num FROM alembic_version")
+            assert cursor.fetchone() == ("ws3_consumed_provenance_compat",)
+            cursor.execute(
+                "SELECT status, consumed_provenance_kind, consumed_worker_id, "
+                "consumed_execution_fence, consumed_lease_until, consumed_claim_provenance_hash "
+                "FROM run_command WHERE command_id = %s",
+                (_LEGACY_COMMAND_ID,),
+            )
+            assert cursor.fetchone() == (
+                "consumed",
+                "claim.v1",
+                "published-worker",
+                7,
+                datetime(2030, 1, 1, tzinfo=UTC),
+                "9" * 64,
+            )
+            cursor.execute(
+                "SELECT consumed_provenance_kind FROM run_command WHERE command_id = %s",
+                (_PENDING_COMMAND_ID,),
+            )
+            assert cursor.fetchone() == (None,)
+            for signature, expected_count in _PROVENANCE_WRITER_SIGNATURES:
+                cursor.execute("SELECT pg_get_functiondef(to_regprocedure(%s))", (signature,))
+                row = cursor.fetchone()
+                assert row is not None
+                assert row[0].count(_CLAIM_PROVENANCE_ASSIGNMENT) == expected_count
+
+
+def _tamper_consume_writer(database_url: URL) -> str:
+    signature = _PROVENANCE_WRITER_SIGNATURES[0][0]
+    with psycopg.connect(_raw_url(database_url), autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_get_functiondef(to_regprocedure(%s))", (signature,))
+            row = cursor.fetchone()
+            assert row is not None
+            tampered_definition = row[0].replace(
+                "AS $function$\n",
+                "AS $function$\n        -- compatibility hash drift\n",
+                1,
+            )
+            assert tampered_definition != row[0]
+            cursor.execute(tampered_definition)
+            cursor.execute("SELECT pg_get_functiondef(to_regprocedure(%s))", (signature,))
+            persisted = cursor.fetchone()
+            assert persisted is not None
+            return str(persisted[0])
+
+
+def _assert_failed_upgrade_rolled_back(
+    database_url: URL,
+    tampered_definition: str,
+    *,
+    expected_column: bool,
+) -> None:
+    signature = _PROVENANCE_WRITER_SIGNATURES[0][0]
+    with psycopg.connect(_raw_url(database_url), autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT version_num FROM alembic_version")
+            assert cursor.fetchone() == ("ws4_authority_audit_emitters",)
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'run_command' "
+                "AND column_name = 'consumed_provenance_kind')"
+            )
+            assert cursor.fetchone() == (expected_column,)
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_constraint "
+                "WHERE conrelid = 'public.run_command'::regclass "
+                "AND conname = 'run_command_consumed_provenance_ck')"
+            )
+            assert cursor.fetchone() == (True,)
+            cursor.execute("SELECT pg_get_functiondef(to_regprocedure(%s))", (signature,))
+            row = cursor.fetchone()
+            assert row == (tampered_definition,)
+
+
 @pytest.mark.integration
 def test_0003_consumed_rows_survive_upgrade_downgrade_upgrade_without_forged_provenance() -> None:
     with _temporary_database() as database_url:
@@ -203,3 +335,47 @@ def test_0003_consumed_rows_survive_upgrade_downgrade_upgrade_without_forged_pro
 
         _run_alembic(database_url, "upgrade", "head")
         _assert_head_legacy_semantics(database_url)
+
+
+@pytest.mark.integration
+def test_published_head_upgrades_forward_without_replaying_rewritten_revisions() -> None:
+    with _temporary_database() as database_url:
+        _run_alembic(database_url, "upgrade", "ws3_execution_driver")
+        _seed_0003_consumed_command(database_url)
+        _run_alembic(database_url, "upgrade", "ws4_authority_audit_emitters")
+        _simulate_published_head_without_provenance_discriminator(database_url)
+
+        _run_alembic(database_url, "upgrade", "head")
+
+        _assert_published_head_forward_migration(database_url)
+
+
+@pytest.mark.integration
+def test_published_head_hash_drift_rejects_upgrade_and_rolls_back_all_ddl() -> None:
+    with _temporary_database() as database_url:
+        _run_alembic(database_url, "upgrade", "ws3_execution_driver")
+        _seed_0003_consumed_command(database_url)
+        _run_alembic(database_url, "upgrade", "ws4_authority_audit_emitters")
+        _simulate_published_head_without_provenance_discriminator(database_url)
+        tampered_definition = _tamper_consume_writer(database_url)
+
+        result = _invoke_alembic(database_url, "upgrade", "head")
+
+        assert result.returncode != 0
+        assert "published provenance writer definition drift" in result.stderr
+        _assert_failed_upgrade_rolled_back(database_url, tampered_definition, expected_column=False)
+
+
+@pytest.mark.integration
+def test_current_writer_hash_drift_rejects_upgrade_and_rolls_back_all_ddl() -> None:
+    with _temporary_database() as database_url:
+        _run_alembic(database_url, "upgrade", "ws3_execution_driver")
+        _seed_0003_consumed_command(database_url)
+        _run_alembic(database_url, "upgrade", "ws4_authority_audit_emitters")
+        tampered_definition = _tamper_consume_writer(database_url)
+
+        result = _invoke_alembic(database_url, "upgrade", "head")
+
+        assert result.returncode != 0
+        assert "current provenance writer definition drift" in result.stderr
+        _assert_failed_upgrade_rolled_back(database_url, tampered_definition, expected_column=True)

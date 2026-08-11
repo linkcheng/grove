@@ -71,7 +71,14 @@ WS4_OBSERVATION_RELATIONS = frozenset(
     }
 )
 WS4_BUSINESS_RELATIONS = WS3_BUSINESS_RELATIONS | WS4_OBSERVATION_RELATIONS
-WS4_MIGRATION_HEADS = frozenset({"ws4_observation_slice", "ws4_recon_helpers", "ws4_authority_audit_emitters"})
+WS4_MIGRATION_HEADS = frozenset(
+    {
+        "ws4_observation_slice",
+        "ws4_recon_helpers",
+        "ws4_authority_audit_emitters",
+        "ws3_consumed_provenance_compat",
+    }
+)
 
 # v7 keeps an independent expected object inventory.  The reader must first
 # enumerate this complete public `pg_class` universe (including empty
