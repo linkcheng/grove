@@ -1,0 +1,12 @@
+{
+  "id": "ws4-sse",
+  "title": "WS-4 SSE 交付",
+  "owner": "core-api",
+  "slo": "RuntimeEvent to SSE P95 <= 2s; bounded connections and reconnect",
+  "runbook": "docs/runbooks/ws4-observation.md#sse-延迟或重连风暴",
+  "panels": [
+    {"title": "Active connections", "query": "sum(grove_sse_connections{grove_role=\"api\"})"},
+    {"title": "Backfill latency", "query": "histogram_quantile(0.95, sum(rate(grove_operation_duration_seconds_bucket{grove_operation=\"sse_backfill\"}[5m])) by (le))"},
+    {"title": "Reconnect and gaps", "query": "sum(rate(grove_sse_event_count_total{grove_outcome=~\"reconnect|gap\"}[5m])) by (grove_outcome)"}
+  ]
+}

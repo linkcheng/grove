@@ -196,8 +196,10 @@ def test_lifespan_owns_one_engine_and_disposes_it(monkeypatch: pytest.MonkeyPatc
         return engine
 
     monkeypatch.setattr("app.main.create_engine", fake_create_engine)
-    with TestClient(create_app()):
+    app = create_app()
+    with TestClient(app):
         assert len(created) == 1
+        assert app.state.telemetry_export_runtime.running is False
     assert disposed == created
 
 

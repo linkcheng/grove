@@ -1,0 +1,12 @@
+{
+  "id": "ws4-telemetry",
+  "title": "WS-4 Telemetry 饱和与丢弃",
+  "owner": "platform-observability",
+  "slo": "telemetry outage never blocks online execution",
+  "runbook": "docs/runbooks/ws4-observation.md#collector-或-backend-不可用",
+  "panels": [
+    {"title": "Exporter enqueue failures", "query": "sum(rate(otelcol_exporter_enqueue_failed_spans[5m]))"},
+    {"title": "Exporter send failures", "query": "sum(rate(otelcol_exporter_send_failed_spans[5m]))"},
+    {"title": "Queue saturation", "query": "max(otelcol_exporter_queue_size / clamp_min(otelcol_exporter_queue_capacity, 1)) by (exporter)"}
+  ]
+}

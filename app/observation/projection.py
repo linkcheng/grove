@@ -19,7 +19,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
+from time import perf_counter
 from typing import Any, Literal
 from uuid import UUID
 
@@ -27,7 +28,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.contracts.canonical import ProjectionSourceRef, canonical_hash
+from app.core.telemetry import default_recorder, record_operation
 from app.observation.facts import (
+    EXECUTION_AUDIT_SCHEMA_REF,
     NODE_EXECUTED_SCHEMA_REF,
     RUN_LIFECYCLE_SCHEMA_REF,
     RunLifecyclePayload,
@@ -42,7 +45,7 @@ POLL_INTERVAL_SECONDS = 0.5
 BATCH_SIZE = 100
 UI_TARGET_KIND: Literal["run", "orchestration"] = "run"
 UI_SCHEMA_REF = "grove.ui.run-status-changed.v1"
-_AUDIT_ONLY_SCHEMAS = frozenset({NODE_EXECUTED_SCHEMA_REF})
+_AUDIT_ONLY_SCHEMAS = frozenset({NODE_EXECUTED_SCHEMA_REF, EXECUTION_AUDIT_SCHEMA_REF})
 
 
 class ProjectionShutdown(Exception):
@@ -52,6 +55,10 @@ class ProjectionShutdown(Exception):
 async def _scope_tenant(session: AsyncSession, tenant_id: str) -> None:
     await session.execute(text("SET LOCAL statement_timeout = '5000ms'"))
     await session.execute(text("SET LOCAL lock_timeout = '2000ms'"))
+    await session.execute(text("SELECT set_config('grove.tenant_id', :t, true)"), {"t": tenant_id})
+
+
+async def _set_tenant(session: AsyncSession, tenant_id: str) -> None:
     await session.execute(text("SELECT set_config('grove.tenant_id', :t, true)"), {"t": tenant_id})
 
 
@@ -117,8 +124,28 @@ class ProjectionReconciler:
         rows = await self._fetch_pending()
         if not rows:
             return 0
-        for row in rows:
-            await self._process_row(row)
+        started = perf_counter()
+        observed_rows: list[tuple[datetime, str]] = []
+        async with self._session_factory() as session, session.begin():
+            await session.execute(text("SET LOCAL statement_timeout = '5000ms'"))
+            await session.execute(text("SET LOCAL lock_timeout = '2000ms'"))
+            for row in rows:
+                outbox_id, tenant_id, run_id, event_id, run_seq, source = row
+                await _set_tenant(session, tenant_id)
+                observed = await self._apply_outbox_row(
+                    session,
+                    tenant_id=tenant_id,
+                    outbox_id=outbox_id,
+                    run_id=run_id,
+                    event_id=event_id,
+                    run_seq=run_seq,
+                    source=source,
+                )
+                if observed is not None:
+                    observed_rows.append(observed)
+        per_event_duration_ms = float((perf_counter() - started) * 1000) / len(rows)
+        for observed in observed_rows:
+            self._record_applied(observed, per_event_duration_ms)
         return len(rows)
 
     async def _fetch_pending(self) -> list[Any]:
@@ -128,19 +155,36 @@ class ProjectionReconciler:
             )
             return list(result.fetchall())
 
-    async def _process_row(self, row: tuple[Any, ...]) -> None:
-        outbox_id, tenant_id, run_id, event_id, run_seq, source = row
-        async with self._session_factory() as session, session.begin():
-            await _scope_tenant(session, tenant_id)
-            await self._apply_outbox_row(
-                session,
-                tenant_id=tenant_id,
-                outbox_id=outbox_id,
-                run_id=run_id,
-                event_id=event_id,
-                run_seq=run_seq,
-                source=source,
-            )
+    def _record_applied(self, observed: tuple[datetime, str], duration_ms: float) -> None:
+        record_operation(
+            "projector.apply",
+            duration_ms=duration_ms,
+            role="projection_reconciliation",
+            operation="apply",
+            outcome="ok",
+        )
+        occurred_at, schema_ref = observed
+        schema_outcome = (
+            "unknown_schema"
+            if schema_ref
+            not in {
+                RUN_LIFECYCLE_SCHEMA_REF,
+                *_AUDIT_ONLY_SCHEMAS,
+            }
+            else "projected"
+        )
+        default_recorder().record_metric(
+            "projection.lag.seconds",
+            value=max(0.0, (datetime.now(UTC) - occurred_at).total_seconds()),
+            labels={"role": "projection_reconciliation", "operation": "apply", "outcome": schema_outcome},
+            kind="histogram",
+        )
+        default_recorder().record_metric(
+            "observation.event.count",
+            value=1,
+            labels={"role": "projection_reconciliation", "operation": "apply", "outcome": schema_outcome},
+            kind="counter",
+        )
 
     async def _apply_outbox_row(
         self,
@@ -152,7 +196,7 @@ class ProjectionReconciler:
         event_id: UUID,
         run_seq: int,
         source: str,
-    ) -> None:
+    ) -> tuple[datetime, str] | None:
         event_row = (
             await session.execute(
                 text(
@@ -165,8 +209,7 @@ class ProjectionReconciler:
         ).one_or_none()
         if event_row is None:
             await self._relay(session, outbox_id)
-            return
-
+            return None
         event_type, schema_ref, payload, occurred_at = event_row[0], event_row[1], event_row[2], event_row[3]
         correlation_id, causation_id, trace_id, source_event_id = (
             event_row[4],
@@ -206,6 +249,7 @@ class ProjectionReconciler:
             )
         await self._advance_watermark(session, tenant_id, source, outbox_id, run_seq)
         await self._relay(session, outbox_id)
+        return occurred_at, schema_ref
 
     async def _project_lifecycle(
         self,
@@ -374,8 +418,17 @@ class ProjectionReconciler:
         async with self._session_factory() as session:
             result = (await session.execute(text("SELECT * FROM grove_observation_health()"))).one_or_none()
         if result is None:
-            return {"status": "ready", "backlog": 0, "unknown_schema": 0}
-        return {"status": "ready", "backlog": result[0], "unknown_schema": result[1]}
+            backlog = 0
+            unknown_schema = 0
+        else:
+            backlog = int(result[0])
+            unknown_schema = int(result[1])
+        default_recorder().record_metric(
+            "observation.backlog",
+            value=backlog,
+            labels={"role": "projection_reconciliation", "operation": "health", "outcome": "ready"},
+        )
+        return {"status": "ready", "backlog": backlog, "unknown_schema": unknown_schema}
 
 
 __all__ = ["ProjectionReconciler", "ProjectionShutdown"]

@@ -8,6 +8,7 @@ source-event-id dedup is idempotent, and tenant isolation holds via RLS.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -18,18 +19,29 @@ from app.contracts.canonical import canonical_hash
 from app.execution import PostgresExecutionDriver
 from app.execution.checkpoint import FencedPostgresSaver
 from app.execution.conformance_graph import ConformanceState, compute_input_hash, node_a, node_b
+from app.observation.emitter import emit_runtime_events
 from app.observation.facts import (
+    API_COMMAND_SOURCE,
+    RUNTIME_WORKER_SOURCE,
+    build_execution_audit_emit_request,
     build_lifecycle_emit_request,
     build_node_executed_emit_request,
 )
 from langchain_core.runnables.config import RunnableConfig
 from langgraph.checkpoint.base import ChannelVersions, CheckpointMetadata, empty_checkpoint
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-RUNTIME_URL = "postgresql+psycopg://grove_runtime:grove_runtime_ws0@127.0.0.1:54329/grove"
-API_URL = "postgresql+psycopg://grove_api:grove_api_ws0@127.0.0.1:54329/grove"
-MIGRATION_URL = "postgresql+psycopg://grove_migration:grove_migration_ws0@127.0.0.1:54329/grove"
+RUNTIME_URL = os.environ.get(
+    "WS4_RUNTIME_DATABASE_URL",
+    "postgresql+psycopg://grove_runtime:grove_runtime_ws0@127.0.0.1:54329/grove",
+)
+API_URL = os.environ.get("WS4_API_DATABASE_URL", "postgresql+psycopg://grove_api:grove_api_ws0@127.0.0.1:54329/grove")
+MIGRATION_URL = os.environ.get(
+    "WS4_MIGRATION_DATABASE_URL",
+    "postgresql+psycopg://grove_migration:grove_migration_ws0@127.0.0.1:54329/grove",
+)
 BUILD_HASH = "a" * 64
 CONFERENCE_INPUT = "grove-conformance"
 
@@ -150,6 +162,81 @@ async def _runtime_events(run_id: uuid.UUID) -> list[dict[str, Any]]:
 @pytest.mark.integration
 @pytest.mark.asyncio
 class TestObservationEmit:
+    async def test_emitter_enforces_payload_bound_in_utf8_bytes(self) -> None:
+        tenant = f"obs-size-{uuid.uuid4().hex[:8]}"
+        run_id = uuid.uuid4()
+        await _submit_run(run_id, uuid.uuid4(), tenant)
+        descriptor = [
+            {
+                "event_type": "execution.command_applied",
+                "source": RUNTIME_WORKER_SOURCE,
+                "source_event_id": f"{run_id}:oversized",
+                "payload_schema_ref": "grove.runtime.execution-audit.v1",
+                "payload": {"blob": "界" * 22_000},
+                "occurred_at": datetime.now(UTC).isoformat(),
+            }
+        ]
+        runtime_factory = async_sessionmaker(create_async_engine(RUNTIME_URL), expire_on_commit=False)
+        with pytest.raises(DBAPIError, match="64 KiB"):
+            async with runtime_factory() as session, session.begin():
+                await session.execute(text("SELECT set_config('grove.tenant_id', :t, true)"), {"t": tenant})
+                await session.execute(
+                    text("SELECT * FROM grove_emit_runtime_events(:t, :r, :r, :c, NULL, NULL, CAST(:events AS jsonb))"),
+                    {"t": tenant, "r": run_id, "c": str(run_id), "events": json.dumps(descriptor)},
+                )
+
+        assert await _runtime_events(run_id) == []
+
+    async def test_emitter_binds_database_role_to_closed_source(self) -> None:
+        tenant = f"obs-role-{uuid.uuid4().hex[:8]}"
+        run_id = uuid.uuid4()
+        await _submit_run(run_id, uuid.uuid4(), tenant)
+        command_id = uuid.uuid4()
+        valid = build_execution_audit_emit_request(
+            source=API_COMMAND_SOURCE,
+            run_id=run_id,
+            command_id=command_id,
+            command_seq=0,
+            command_type="start",
+            action="command_accepted",
+            result_code="accepted",
+            occurred_at=datetime.now(UTC),
+            transition_key=f"{command_id}:accepted",
+        )
+        api_factory = async_sessionmaker(create_async_engine(API_URL), expire_on_commit=False)
+        async with api_factory() as session, session.begin():
+            await session.execute(text("SELECT set_config('grove.tenant_id', :t, true)"), {"t": tenant})
+            await emit_runtime_events(
+                session,
+                tenant_id=tenant,
+                run_id=run_id,
+                causation_id=command_id,
+                events=[valid],
+            )
+
+        forged_command_id = uuid.uuid4()
+        forged = build_execution_audit_emit_request(
+            source=RUNTIME_WORKER_SOURCE,
+            run_id=run_id,
+            command_id=forged_command_id,
+            command_seq=0,
+            command_type="start",
+            action="worker_claimed",
+            result_code="claimed",
+            occurred_at=datetime.now(UTC),
+            transition_key="forged-runtime-source",
+        )
+        with pytest.raises(DBAPIError):
+            async with api_factory() as session, session.begin():
+                await session.execute(text("SELECT set_config('grove.tenant_id', :t, true)"), {"t": tenant})
+                await emit_runtime_events(
+                    session,
+                    tenant_id=tenant,
+                    run_id=run_id,
+                    causation_id=forged_command_id,
+                    events=[forged],
+                )
+
     async def test_emit_atomic_monotonic_and_idempotent(self) -> None:
         tenant = f"obs-emit-{uuid.uuid4().hex[:8]}"
         run_id = uuid.uuid4()
@@ -193,7 +280,15 @@ class TestObservationEmit:
         assert receipt.result_code == "consumed"
 
         rows = await _runtime_events(run_id)
-        assert [r["run_seq"] for r in rows] == [1, 2]
+        assert [r["run_seq"] for r in rows] == [1, 2, 3, 4, 5, 6]
+        assert [r["event_type"] for r in rows] == [
+            "execution.worker_claimed",
+            "execution.checkpoint_applied",
+            "node.executed",
+            "run.lifecycle",
+            "execution.command_applied",
+            "execution.command_accepted",
+        ]
 
         claim2 = await driver.claim(worker_id="obs-worker", runtime_build_hash=BUILD_HASH, tenant_id=tenant)
         assert claim2 is not None
@@ -222,8 +317,20 @@ class TestObservationEmit:
         assert receipt2.result_code == "consumed"
 
         rows = await _runtime_events(run_id)
-        assert [r["run_seq"] for r in rows] == [1, 2, 3, 4]
-        assert [r["event_type"] for r in rows] == ["node.executed", "run.lifecycle", "node.executed", "run.lifecycle"]
+        assert [r["run_seq"] for r in rows] == list(range(1, 12))
+        assert [r["event_type"] for r in rows] == [
+            "execution.worker_claimed",
+            "execution.checkpoint_applied",
+            "node.executed",
+            "run.lifecycle",
+            "execution.command_applied",
+            "execution.command_accepted",
+            "execution.worker_takeover",
+            "execution.checkpoint_applied",
+            "node.executed",
+            "run.lifecycle",
+            "execution.command_applied",
+        ]
 
     async def test_emit_is_idempotent_on_duplicate_source(self) -> None:
         tenant = f"obs-dedup-{uuid.uuid4().hex[:8]}"
@@ -308,7 +415,7 @@ class TestObservationEmit:
                 await conn.execute(text("SELECT count(*) FROM runtime_event WHERE run_id = :r"), {"r": run_id})
             ).scalar()
         await engine.dispose()
-        assert own == 1
+        assert own == 5
         assert cross == 0
 
         engine = create_async_engine(MIGRATION_URL)
@@ -317,4 +424,4 @@ class TestObservationEmit:
                 await conn.execute(text("SELECT count(*) FROM runtime_event_outbox WHERE run_id = :r"), {"r": run_id})
             ).scalar()
         await engine.dispose()
-        assert outbox == 1
+        assert outbox == 5

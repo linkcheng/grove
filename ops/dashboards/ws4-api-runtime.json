@@ -1,0 +1,12 @@
+{
+  "id": "ws4-api-runtime",
+  "title": "WS-4 API 与 Runtime 推进",
+  "owner": "core-runtime",
+  "slo": "online request P95/P99 and command advancement",
+  "runbook": "docs/runbooks/ws4-observation.md#api-或-runtime-推进异常",
+  "panels": [
+    {"title": "API latency P95/P99", "query": "histogram_quantile(0.95, sum(rate(grove_operation_duration_seconds_bucket{grove_role=\"api\"}[5m])) by (le,grove_operation))"},
+    {"title": "Command advancement", "query": "sum(rate(grove_operation_count_total{grove_role=\"runtime_worker\",grove_outcome=\"ok\"}[5m])) by (grove_operation)"},
+    {"title": "Runtime failures", "query": "sum(rate(grove_operation_count_total{grove_role=\"runtime_worker\",grove_outcome=\"error\"}[5m])) by (grove_operation)"}
+  ]
+}

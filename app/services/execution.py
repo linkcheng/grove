@@ -7,6 +7,7 @@ never invokes a Graph, provider, worker, or interaction command.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from time import perf_counter
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -23,6 +24,9 @@ from app.core.errors import (
     RunNotFoundError,
     SubmissionConflictError,
 )
+from app.core.telemetry import record_operation
+from app.observation.emitter import emit_runtime_events
+from app.observation.facts import API_COMMAND_SOURCE, build_execution_audit_emit_request
 from app.releases.fixture import (
     FIXTURE_CONSTRAINTS_PAYLOAD,
     FixtureReleaseError,
@@ -315,6 +319,34 @@ async def submit(session: AsyncSession, context: ActiveTenantContext, request: S
         command_digest=digest,
         payload_ref=payload_ref,
         payload_hash=payload_hash,
+    )
+    observation_started = perf_counter()
+    await emit_runtime_events(
+        session,
+        tenant_id=context.tenant_id,
+        run_id=run.run_id,
+        causation_id=command.command_id,
+        events=[
+            build_execution_audit_emit_request(
+                source=API_COMMAND_SOURCE,
+                run_id=run.run_id,
+                command_id=command.command_id,
+                command_seq=command.command_seq,
+                command_type="start",
+                action="command_accepted",
+                result_code="accepted",
+                run_revision=run.revision,
+                occurred_at=datetime.now(UTC),
+                transition_key=f"{command.command_id}:accepted",
+            )
+        ],
+    )
+    record_operation(
+        "command.accept",
+        duration_ms=float((perf_counter() - observation_started) * 1000),
+        role="api",
+        operation="submit",
+        outcome="ok",
     )
     return _run_handle(run, command)
 

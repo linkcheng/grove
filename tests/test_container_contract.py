@@ -40,7 +40,8 @@ def test_docker_build_context_excludes_non_runtime_files() -> None:
 
 def test_postgres_port_is_bound_to_loopback_only() -> None:
     compose = Path("compose.yaml").read_text()
-    assert '"127.0.0.1:54329:5432"' in compose
+    assert '"127.0.0.1:${INTEGRATION_HOST_DB_PORT:-54329}:5432"' in compose
+    assert '"127.0.0.1:${INTEGRATION_HOST_API_PORT:-8000}:8000"' in compose
 
 
 def test_integration_proves_independent_build_digests_and_extension_loading() -> None:
@@ -62,6 +63,7 @@ def test_integration_proves_independent_build_digests_and_extension_loading() ->
     assert "cleanroom-check:" in makefile
     assert "COMPOSE_PROJECT_NAME=grove-ws0-cleanroom-$$$$" in makefile
     assert "CLEANROOM_REMOVE_VOLUMES=1" in makefile
+    assert "INTEGRATION_HOST_DB_PORT=0 INTEGRATION_HOST_API_PORT=0" in makefile
 
 
 def test_github_ci_runs_strict_release_gate() -> None:

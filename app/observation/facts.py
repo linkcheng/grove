@@ -48,8 +48,32 @@ TERMINAL_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 
 RUN_LIFECYCLE_SCHEMA_REF = "grove.runtime.run-lifecycle.v1"
 NODE_EXECUTED_SCHEMA_REF = "grove.runtime.node-executed.v1"
+EXECUTION_AUDIT_SCHEMA_REF = "grove.runtime.execution-audit.v1"
 
-KNOWN_RUNTIME_PAYLOAD_SCHEMAS: frozenset[str] = frozenset({RUN_LIFECYCLE_SCHEMA_REF, NODE_EXECUTED_SCHEMA_REF})
+RUNTIME_WORKER_SOURCE: Literal["grove.runtime_worker"] = "grove.runtime_worker"
+API_COMMAND_SOURCE: Literal["grove.api.command"] = "grove.api.command"
+RECONCILIATION_SOURCE: Literal["grove.projection_reconciliation"] = "grove.projection_reconciliation"
+type ObservationSource = Literal[
+    "grove.runtime_worker",
+    "grove.api.command",
+    "grove.projection_reconciliation",
+]
+type ExecutionAuditAction = Literal[
+    "command_accepted",
+    "worker_claimed",
+    "worker_takeover",
+    "lease_renewed",
+    "checkpoint_applied",
+    "command_applied",
+    "cancel_accepted",
+    "command_dead_lettered",
+    "expired_command_consumed",
+    "expired_command_requeued",
+]
+
+KNOWN_RUNTIME_PAYLOAD_SCHEMAS: frozenset[str] = frozenset(
+    {RUN_LIFECYCLE_SCHEMA_REF, NODE_EXECUTED_SCHEMA_REF, EXECUTION_AUDIT_SCHEMA_REF}
+)
 
 
 class RunLifecyclePayload(CanonicalModel):
@@ -71,11 +95,31 @@ class NodeExecutedPayload(CanonicalModel):
     value: int = Field(ge=0)
 
 
+class ExecutionAuditPayload(CanonicalModel):
+    """A safe, versioned audit fact for one committed execution transition.
+
+    Worker identity, lease timestamps, fence values, payload references and
+    failure detail deliberately stay out of this public fact.  Their authority
+    remains in WS-3 tables; the audit stream records only the transition class
+    and stable public command/run identity.
+    """
+
+    kind: Literal["execution_audit"]
+    action: ExecutionAuditAction
+    run_id: UUID
+    command_id: UUID
+    command_seq: int = Field(ge=0)
+    command_type: Literal["start", "resume", "cancel", "continue", "signal"] | None = None
+    run_revision: int | None = Field(default=None, ge=0)
+    result_code: str = Field(min_length=1, max_length=64)
+
+
 # Registry of the only schema refs the projection may materialise.  An unknown
 # ref never reaches a Python payload model; the projection dead-letters it.
 RUNTIME_PAYLOAD_REGISTRY: Mapping[str, type[CanonicalModel]] = {
     RUN_LIFECYCLE_SCHEMA_REF: RunLifecyclePayload,
     NODE_EXECUTED_SCHEMA_REF: NodeExecutedPayload,
+    EXECUTION_AUDIT_SCHEMA_REF: ExecutionAuditPayload,
 }
 
 
@@ -101,8 +145,6 @@ def parse_runtime_payload(schema_ref: str, raw: Any) -> CanonicalModel:
 # Emit request crossing the persistence seam (run_seq allocated by the DB).
 # ---------------------------------------------------------------------------
 
-# The runtime worker is the single observation source for the conformance slice.
-RUNTIME_WORKER_SOURCE = "grove.runtime_worker"
 MAX_RUNTIME_EVENT_BYTES = 65_536
 
 
@@ -161,6 +203,47 @@ def derive_source_event_id(run_id: UUID, command_seq: int, event_type: str, inde
     if type(index) is not int or index < 0:
         raise ValueError("index must be a non-negative int")
     return f"{run_id}:{command_seq}:{event_type}:{index}"
+
+
+def build_execution_audit_emit_request(
+    *,
+    source: ObservationSource,
+    run_id: UUID,
+    command_id: UUID,
+    command_seq: int,
+    action: ExecutionAuditAction,
+    result_code: str,
+    occurred_at: datetime,
+    transition_key: str,
+    command_type: Literal["start", "resume", "cancel", "continue", "signal"] | None = None,
+    run_revision: int | None = None,
+) -> EmitEventRequest:
+    """Build an idempotent audit fact for an exact committed transition."""
+
+    import hashlib
+
+    if type(transition_key) is not str or not transition_key or len(transition_key) > 1024:
+        raise ValueError("transition_key must be a non-empty bounded string")
+    transition_hash = hashlib.sha256(transition_key.encode("utf-8")).hexdigest()
+    event_type = f"execution.{action}"
+    payload = ExecutionAuditPayload(
+        kind="execution_audit",
+        action=action,
+        run_id=run_id,
+        command_id=command_id,
+        command_seq=command_seq,
+        command_type=command_type,
+        run_revision=run_revision,
+        result_code=result_code,
+    )
+    return EmitEventRequest(
+        event_type=event_type,
+        source=source,
+        source_event_id=f"{run_id}:{action}:{transition_hash}",
+        payload_schema_ref=EXECUTION_AUDIT_SCHEMA_REF,
+        payload=payload,
+        occurred_at=occurred_at,
+    )
 
 
 def build_lifecycle_emit_request(
@@ -359,6 +442,10 @@ def ui_payload_adapter() -> TypeAdapter[Any]:
 __all__ = [
     "EventCursor",
     "EmitEventRequest",
+    "ExecutionAuditAction",
+    "ExecutionAuditPayload",
+    "EXECUTION_AUDIT_SCHEMA_REF",
+    "API_COMMAND_SOURCE",
     "MAX_RUNTIME_EVENT_BYTES",
     "NODE_EXECUTED_SCHEMA_REF",
     "NodeExecutedPayload",
@@ -366,6 +453,7 @@ __all__ = [
     "ProjectionCursor",
     "RUN_LIFECYCLE_SCHEMA_REF",
     "RUNTIME_WORKER_SOURCE",
+    "RECONCILIATION_SOURCE",
     "RUNTIME_PAYLOAD_REGISTRY",
     "RunInspectView",
     "RunLifecyclePayload",
@@ -385,6 +473,7 @@ __all__ = [
     "PublicRunStatus",
     "build_lifecycle_emit_request",
     "build_node_executed_emit_request",
+    "build_execution_audit_emit_request",
     "build_ui_projection_meta",
     "derive_source_event_id",
     "lifecycle_to_run_status_changed",

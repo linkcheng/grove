@@ -63,6 +63,8 @@ class _Session:
 
     async def execute(self, statement: object, _params: Mapping[str, object] | None = None) -> _Result:
         self.calls.append((statement, _params))
+        if not self.results and "grove_emit_runtime_events" in str(statement):
+            return _Result()
         return self.results.pop(0)
 
 
@@ -231,7 +233,7 @@ async def test_claim_maps_database_outcomes_at_the_public_seam() -> None:
     )
     actual = await driver.claim(claim.worker_id, claim.runtime_build_hash, claim.tenant_id)
     assert actual == claim
-    assert len(factory.session.calls) == 4
+    assert len(factory.session.calls) == 5
 
 
 @pytest.mark.asyncio
@@ -254,13 +256,13 @@ async def test_cancel_dispatch_maps_database_receipt_and_stable_conflicts() -> N
     assert actual.command_id == cancel.command_id
     assert actual.command_seq == 1
     assert actual.status == "pending"
-    assert "grove_accept_cancel_run" in str(factory.session.calls[-1][0])
+    assert "grove_accept_cancel_run" in str(factory.session.calls[-2][0])
     no_reason_params = factory.session.calls[3][1]
     assert no_reason_params is not None
     assert no_reason_params["payload_ref"] == f"command-payload:{canonical_hash({})}"
     assert no_reason_params["payload_hash"] == canonical_hash({})
     assert no_reason_params["payload"] == "{}\n"
-    function_params = factory.session.calls[-1][1]
+    function_params = factory.session.calls[-2][1]
     assert function_params is not None
     assert function_params["payload"] == "{}\n"
 
@@ -537,7 +539,7 @@ async def test_claim_accepts_valid_lease_durations_through_fake_database_result(
     actual = await driver.claim(claim.worker_id, claim.runtime_build_hash, claim.tenant_id, duration)
     assert actual == claim
     assert factory.calls == 1
-    assert len(factory.session.calls) == 4
+    assert len(factory.session.calls) == 5
 
 
 @pytest.mark.asyncio
@@ -553,7 +555,7 @@ async def test_heartbeat_accepts_valid_lease_durations_through_fake_database_res
     assert actual.lease_until == extended
     assert actual.execution_fence == claim.execution_fence
     assert factory.calls == 1
-    assert len(factory.session.calls) == 4
+    assert len(factory.session.calls) == 5
 
 
 def _consumed_row(claim: ExecutionClaim, *, result_code: str = "consumed") -> dict[str, object]:
@@ -611,9 +613,9 @@ async def test_dead_letter_maps_receipt_and_stable_database_outcomes() -> None:
     assert receipt.tenant_id == claim.tenant_id
     assert receipt.status == "dead_letter"
     assert factory.calls == 1
-    assert len(factory.session.calls) == 4
-    assert "grove_dead_letter_run_command" in str(factory.session.calls[-1][0])
-    assert factory.session.calls[-1][1]["reason_ref"] == "worker-timeout"  # type: ignore[index]
+    assert len(factory.session.calls) == 5
+    assert "grove_dead_letter_run_command" in str(factory.session.calls[-2][0])
+    assert factory.session.calls[-2][1]["reason_ref"] == "worker-timeout"  # type: ignore[index]
 
     for result_code, error in (
         ("stale", StaleExecutionFence),
@@ -666,8 +668,8 @@ async def test_reconcile_expired_uses_projection_factory_and_maps_outcomes() -> 
     assert receipt.status == "consumed"
     assert runtime_factory.calls == 0
     assert projection_factory.calls == 1
-    assert len(projection_factory.session.calls) == 4
-    assert "grove_reconcile_expired_run_command" in str(projection_factory.session.calls[-1][0])
+    assert len(projection_factory.session.calls) == 5
+    assert "grove_reconcile_expired_run_command" in str(projection_factory.session.calls[-2][0])
 
     driver, runtime_factory = _driver([])
     projection_factory = _Factory(_scope_results(_Result(row=_reconciled_row(claim, result_code="requeued"))))
@@ -705,7 +707,7 @@ async def test_consume_maps_authoritative_receipt_and_business_failures() -> Non
     assert receipt.tenant_id == claim.tenant_id
     assert receipt.status == "consumed"
     assert factory.calls == 1
-    assert len(factory.session.calls) == 4
+    assert len(factory.session.calls) == 5
 
     for result_code, error in (("stale", StaleExecutionFence), ("no_proof", RunStateConflict)):
         driver, factory = _driver(_scope_results(_Result(row=_consumed_row(claim, result_code=result_code))))

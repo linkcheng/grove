@@ -255,9 +255,10 @@ async def test_fenced_saver_writes_and_reads_on_the_same_scoped_connection(monke
         ("grove.checkpoint.lease_until", claim.lease_until.isoformat()),
         ("grove.checkpoint.blob_channels", '["state"]'),
     ]
-    assert len(parameters) == 12
+    assert len(parameters) == 13
     assert "ON CONFLICT (thread_id, checkpoint_ns, channel, version) DO UPDATE" in connection.statements[10][0]
     assert "ON CONFLICT (thread_id, checkpoint_ns, checkpoint_id) DO UPDATE" in connection.statements[11][0]
+    assert "grove_emit_runtime_events" in connection.statements[12][0]
     assert await saver.aget_tuple(returned_config) is expected_tuple
     assert [item async for item in saver.alist(returned_config)] == [expected_tuple]
     assert connection.transaction_count == connection.transaction_exits == 3

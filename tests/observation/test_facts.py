@@ -7,12 +7,16 @@ from uuid import UUID, uuid4
 
 import pytest
 from app.observation.facts import (
+    EXECUTION_AUDIT_SCHEMA_REF,
     NODE_EXECUTED_SCHEMA_REF,
     RUN_LIFECYCLE_SCHEMA_REF,
+    RUNTIME_WORKER_SOURCE,
     EmitEventRequest,
+    ExecutionAuditPayload,
     NodeExecutedPayload,
     RunLifecyclePayload,
     UnknownRuntimeSchemaError,
+    build_execution_audit_emit_request,
     build_lifecycle_emit_request,
     build_node_executed_emit_request,
     build_ui_projection_meta,
@@ -46,6 +50,20 @@ class TestPayloads:
     def test_node_executed_rejects_bad_hash(self) -> None:
         with pytest.raises(ValidationError):
             NodeExecutedPayload(kind="node_executed", node_id="node_a", stage="start", input_hash="bad", value=0)
+
+    def test_execution_audit_payload_is_safe_and_closed(self) -> None:
+        payload = ExecutionAuditPayload(
+            kind="execution_audit",
+            action="worker_claimed",
+            run_id=RUN_ID,
+            command_id=uuid4(),
+            command_seq=0,
+            command_type="start",
+            result_code="claimed",
+        )
+        assert "worker_id" not in payload.model_dump(mode="json")
+        with pytest.raises(ValidationError):
+            ExecutionAuditPayload.model_validate({**payload.model_dump(), "execution_fence": 1})
 
 
 class TestParseRuntimePayload:
@@ -82,6 +100,33 @@ class TestEmitEventRequest:
             occurred_at=NOW,
         )
         assert request.payload_schema_ref == NODE_EXECUTED_SCHEMA_REF
+
+    def test_audit_request_identity_is_deterministic_per_transition(self) -> None:
+        command_id = uuid4()
+        first = build_execution_audit_emit_request(
+            source=RUNTIME_WORKER_SOURCE,
+            run_id=RUN_ID,
+            command_id=command_id,
+            command_seq=0,
+            command_type="start",
+            action="worker_claimed",
+            result_code="claimed",
+            occurred_at=NOW,
+            transition_key=f"{command_id}:1:claimed",
+        )
+        second = build_execution_audit_emit_request(
+            source=RUNTIME_WORKER_SOURCE,
+            run_id=RUN_ID,
+            command_id=command_id,
+            command_seq=0,
+            command_type="start",
+            action="worker_claimed",
+            result_code="claimed",
+            occurred_at=NOW,
+            transition_key=f"{command_id}:1:claimed",
+        )
+        assert first.payload_schema_ref == EXECUTION_AUDIT_SCHEMA_REF
+        assert first.source_event_id == second.source_event_id
 
     def test_unknown_schema_ref_rejected(self) -> None:
         payload = RunLifecyclePayload(kind="run_lifecycle", run_id=RUN_ID, status="running", run_revision=1)

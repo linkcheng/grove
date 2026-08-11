@@ -39,6 +39,22 @@ class TestBounded:
         with pytest.raises(ValueError):
             rec.record_span("s1", duration_ms=-1.0)
 
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_values_rejected(self, value: float) -> None:
+        rec = BoundedTelemetryRecorder()
+        with pytest.raises(ValueError, match="finite"):
+            rec.record_metric("m", value=value)
+        with pytest.raises(ValueError, match="non-negative"):
+            rec.record_span("s", duration_ms=value)
+
+    def test_metric_kind_and_sign_are_closed(self) -> None:
+        rec = BoundedTelemetryRecorder()
+        rec.record_metric("connections", value=-1, kind="up_down_counter")
+        with pytest.raises(ValueError, match="non-negative"):
+            rec.record_metric("count", value=-1, kind="counter")
+        with pytest.raises(ValueError, match="kind"):
+            rec.record_metric("count", value=1, kind="unknown")  # type: ignore[arg-type]
+
 
 class TestTrace:
     def test_span_carries_trace_context(self) -> None:

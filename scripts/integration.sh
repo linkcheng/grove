@@ -3,6 +3,8 @@ set -euo pipefail
 
 project="${COMPOSE_PROJECT_NAME:-grove-ws0-test}"
 cleanroom_remove_volumes="${CLEANROOM_REMOVE_VOLUMES:-0}"
+host_db_port="${INTEGRATION_HOST_DB_PORT:-54329}"
+host_api_port="${INTEGRATION_HOST_API_PORT:-8000}"
 compose=(docker compose -p "$project" -f compose.yaml)
 api_response=""
 lock_holder_pid=""
@@ -11,6 +13,12 @@ if [[ "$cleanroom_remove_volumes" != "0" && "$cleanroom_remove_volumes" != "1" ]
   printf 'CLEANROOM_REMOVE_VOLUMES must be 0 or 1\n' >&2
   exit 1
 fi
+for port in "$host_db_port" "$host_api_port"; do
+  if [[ ! "$port" =~ ^[0-9]+$ ]] || ((10#$port > 65535)); then
+    printf 'integration host ports must be integers from 0 through 65535\n' >&2
+    exit 1
+  fi
+done
 
 cleanup() {
   if [[ -n "$lock_holder_pid" ]]; then
@@ -128,6 +136,7 @@ printf 'independent application image IDs: %s -> %s\n' "$first_build_image_id" "
 printf 'independent application runtime tree digests match: %s\n' "$second_runtime_tree_digest"
 "${compose[@]}" up -d db
 db_container="$("${compose[@]}" ps -q db)"
+host_db_port="$(docker inspect --format '{{(index (index .NetworkSettings.Ports "5432/tcp") 0).HostPort}}' "$db_container")"
 for _attempt in $(seq 1 60); do
   health="$(docker inspect --format '{{.State.Health.Status}}' "$db_container")"
   if [[ "$health" == "healthy" ]]; then
@@ -294,10 +303,12 @@ for role_service in runtime-worker projection-reconciliation offline-governance;
 done
 
 "${compose[@]}" up -d api
+api_container="$("${compose[@]}" ps -q api)"
+host_api_port="$(docker inspect --format '{{(index (index .NetworkSettings.Ports "8000/tcp") 0).HostPort}}' "$api_container")"
 api_response="$(mktemp)"
 api_ready=0
 for _attempt in $(seq 1 60); do
-  if curl --fail --silent -H 'X-Request-ID: integration_trace' http://127.0.0.1:8000/api/v1/health/live -o "$api_response"; then
+  if curl --fail --silent -H 'X-Request-ID: integration_trace' "http://127.0.0.1:${host_api_port}/api/v1/health/live" -o "$api_response"; then
     api_ready=1
     break
   fi
@@ -307,9 +318,9 @@ if [[ "$api_ready" != "1" ]]; then
   printf 'API did not become ready in time\n' >&2
   exit 1
 fi
-curl --fail --silent --show-error -H 'X-Request-ID: integration_trace' http://127.0.0.1:8000/api/v1/health/live
+curl --fail --silent --show-error -H 'X-Request-ID: integration_trace' "http://127.0.0.1:${host_api_port}/api/v1/health/live"
 printf '\n'
-curl --fail --silent --show-error -H 'X-Request-ID: integration_ready' http://127.0.0.1:8000/api/v1/health/ready
+curl --fail --silent --show-error -H 'X-Request-ID: integration_ready' "http://127.0.0.1:${host_api_port}/api/v1/health/ready"
 printf '\n'
 
 expected_head="$(uv run alembic heads 2>/dev/null | tail -1 | awk '{print $1}')"
@@ -318,9 +329,16 @@ if [[ -z "$expected_head" ]]; then
   exit 1
 fi
 "${compose[@]}" exec -T db psql -U grove_migration -d grove -Atc "SELECT version_num FROM alembic_version" | grep -Fx "$expected_head"
-GROVE_DATABASE_URL=postgresql+psycopg://grove_api:grove_api_ws0@localhost:54329/grove \
-GROVE_MIGRATION_DATABASE_URL=postgresql+psycopg://grove_migration:grove_migration_ws0@localhost:54329/grove \
-GROVE_API_BASE_URL=http://127.0.0.1:8000 \
+GROVE_DATABASE_URL="postgresql+psycopg://grove_api:grove_api_ws0@127.0.0.1:${host_db_port}/grove" \
+GROVE_MIGRATION_DATABASE_URL="postgresql+psycopg://grove_migration:grove_migration_ws0@127.0.0.1:${host_db_port}/grove" \
+WS3_API_DATABASE_URL="postgresql+psycopg://grove_api:grove_api_ws0@127.0.0.1:${host_db_port}/grove" \
+WS3_RUNTIME_DATABASE_URL="postgresql+psycopg://grove_runtime:grove_runtime_ws0@127.0.0.1:${host_db_port}/grove" \
+WS3_MIGRATION_DATABASE_URL="postgresql+psycopg://grove_migration:grove_migration_ws0@127.0.0.1:${host_db_port}/grove" \
+WS4_API_DATABASE_URL="postgresql+psycopg://grove_api:grove_api_ws0@127.0.0.1:${host_db_port}/grove" \
+WS4_RUNTIME_DATABASE_URL="postgresql+psycopg://grove_runtime:grove_runtime_ws0@127.0.0.1:${host_db_port}/grove" \
+WS4_PROJECTION_DATABASE_URL="postgresql+psycopg://grove_projection:grove_projection_ws0@127.0.0.1:${host_db_port}/grove" \
+WS4_MIGRATION_DATABASE_URL="postgresql+psycopg://grove_migration:grove_migration_ws0@127.0.0.1:${host_db_port}/grove" \
+GROVE_API_BASE_URL="http://127.0.0.1:${host_api_port}" \
 uv run pytest tests/integration -m integration -ra
 
 app_image_id="$(docker image inspect grove-ws0:local --format '{{.Id}}')"

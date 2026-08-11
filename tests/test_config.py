@@ -143,6 +143,24 @@ def test_readiness_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
         load_settings()
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("GROVE_DATABASE_POOL_SIZE", "0"),
+        ("GROVE_DATABASE_MAX_OVERFLOW", "51"),
+        ("GROVE_DATABASE_POOL_TIMEOUT_SECONDS", "31"),
+    ],
+)
+def test_database_pool_configuration_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ConfigurationError):
+        load_settings()
+
+
 def test_cli_role_conflict_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GROVE_ROLE", "runtime_worker")
     with pytest.raises(ConfigurationError, match="conflicts"):

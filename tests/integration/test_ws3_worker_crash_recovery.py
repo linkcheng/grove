@@ -10,21 +10,34 @@ These tests use real PostgreSQL with the grove_runtime role.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import subprocess
+import sys
 import uuid
+from pathlib import Path
 from typing import Any
 
 import psycopg
 import pytest
 from app.execution import PostgresExecutionDriver, StaleExecutionFence
 from app.execution.conformance_graph import compute_input_hash, node_a, node_b
+from app.worker.loop import RuntimeWorker
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-API_URL = "postgresql+psycopg://grove_api:grove_api_ws0@127.0.0.1:54329/grove"
-RUNTIME_URL = "postgresql+psycopg://grove_runtime:grove_runtime_ws0@127.0.0.1:54329/grove"
-MIGRATION_URL = "postgresql+psycopg://grove_migration:grove_migration_ws0@127.0.0.1:54329/grove"
+API_URL = os.environ.get("WS3_API_DATABASE_URL", "postgresql+psycopg://grove_api:grove_api_ws0@127.0.0.1:54329/grove")
+RUNTIME_URL = os.environ.get(
+    "WS3_RUNTIME_DATABASE_URL",
+    "postgresql+psycopg://grove_runtime:grove_runtime_ws0@127.0.0.1:54329/grove",
+)
+MIGRATION_URL = os.environ.get(
+    "WS3_MIGRATION_DATABASE_URL",
+    "postgresql+psycopg://grove_migration:grove_migration_ws0@127.0.0.1:54329/grove",
+)
 BUILD_HASH = "a" * 64
 TENANT_BASE = "crash-test-tenant"
+_CRASH_HELPER = Path(__file__).parents[1] / "helpers" / "ws3_crash_worker.py"
 
 
 async def _submit_run(
@@ -152,10 +165,74 @@ async def _get_run_state(run_id: uuid.UUID, tenant: str = TENANT_BASE) -> dict[s
     }
 
 
+async def _audit_actions(run_id: uuid.UUID, tenant: str) -> list[str]:
+    engine = create_async_engine(MIGRATION_URL)
+    async with engine.connect() as conn:
+        rows = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT payload->>'action' FROM runtime_event "
+                        "WHERE tenant_id = :t AND run_id = :r "
+                        "AND payload_schema_ref = 'grove.runtime.execution-audit.v1' ORDER BY run_seq"
+                    ),
+                    {"t": tenant, "r": run_id},
+                )
+            )
+            .scalars()
+            .all()
+        )
+    await engine.dispose()
+    return list(rows)
+
+
 def _make_runtime_driver() -> PostgresExecutionDriver:
     engine = create_async_engine(RUNTIME_URL)
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     return PostgresExecutionDriver(session_factory=session_maker, lease_seconds=30.0)
+
+
+def _start_crash_process(*, tenant: str, run_id: uuid.UUID, stop_after: str) -> subprocess.Popen[str]:
+    return subprocess.Popen(  # noqa: S603 - fixed interpreter and local test helper
+        [
+            sys.executable,
+            str(_CRASH_HELPER),
+            "--runtime-url",
+            RUNTIME_URL,
+            "--tenant",
+            tenant,
+            "--run-id",
+            str(run_id),
+            "--build-hash",
+            BUILD_HASH,
+            "--stop-after",
+            stop_after,
+        ],
+        cwd=Path(__file__).parents[2],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _wait_for_stage(process: subprocess.Popen[str], expected: str) -> dict[str, Any]:
+    assert process.stdout is not None
+    while True:
+        line = process.stdout.readline()
+        if not line:
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            raise AssertionError(f"crash helper exited before {expected}: {stderr}")
+        record = json.loads(line)
+        if not isinstance(record, dict):
+            raise AssertionError("crash helper emitted a non-object record")
+        if record.get("stage") == expected:
+            return record
+
+
+def _kill_process(process: subprocess.Popen[str]) -> None:
+    process.kill()
+    process.wait(timeout=5)
+    assert process.returncode is not None and process.returncode < 0
 
 
 @pytest.mark.integration
@@ -201,6 +278,80 @@ class TestWorkerCrashRecovery:
         assert claim_b.worker_id == "worker-b"
         assert claim_b.command_id == claim_a.command_id
         assert claim_b.execution_fence > claim_a.execution_fence
+
+    async def test_production_worker_loop_emits_full_committed_audit_chain(self) -> None:
+        tenant = f"worker-audit-{uuid.uuid4().hex[:8]}"
+        run_id = uuid.uuid4()
+        await _submit_run(run_id, uuid.uuid4(), tenant)
+        worker = RuntimeWorker(
+            driver=_make_runtime_driver(),
+            tenant_id=tenant,
+            worker_id="worker-audit",
+            runtime_build_hash=BUILD_HASH,
+            database_url=RUNTIME_URL.replace("postgresql+psycopg://", "postgresql+asyncpg://"),
+            poll_interval=0.01,
+        )
+
+        assert await worker._poll_once() is True
+        assert await worker._poll_once() is True
+
+        state = await _get_run_state(run_id, tenant)
+        assert state["status"] == "succeeded"
+        actions = await _audit_actions(run_id, tenant)
+        assert actions == [
+            "worker_claimed",
+            "checkpoint_applied",
+            "command_applied",
+            "command_accepted",
+            "worker_takeover",
+            "checkpoint_applied",
+            "command_applied",
+        ]
+
+    @pytest.mark.parametrize("stop_after", ["claim", "checkpoint", "finish"])
+    async def test_real_process_kill_matrix_preserves_single_writer(
+        self,
+        stop_after: str,
+    ) -> None:
+        """SIGKILL at three durable boundaries, then recover with worker B."""
+
+        tenant = f"crash-process-{uuid.uuid4().hex[:8]}"
+        run_id = uuid.uuid4()
+        await _submit_run(run_id, uuid.uuid4(), tenant)
+
+        process = _start_crash_process(tenant=tenant, run_id=run_id, stop_after=stop_after)
+        try:
+            marker = await asyncio.to_thread(_wait_for_stage, process, stop_after)
+            first_fence = marker.get("fence")
+            await asyncio.to_thread(_kill_process, process)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+
+        if stop_after != "finish":
+            await asyncio.sleep(2.0)
+
+        driver_b = _make_runtime_driver()
+        claim_b = await driver_b.claim(
+            worker_id="worker-b-after-sigkill",
+            runtime_build_hash=BUILD_HASH,
+            tenant_id=tenant,
+            lease_seconds=30.0,
+        )
+        assert claim_b is not None
+        if stop_after != "finish":
+            assert isinstance(first_fence, int)
+            assert claim_b.execution_fence > first_fence
+            assert claim_b.command_seq == 0
+        else:
+            assert claim_b.command_seq == 1
+
+        state = await _get_run_state(run_id, tenant)
+        leased = [command for command in state["commands"] if command["status"] == "leased"]
+        assert len(leased) == 1
+        assert leased[0]["lease_owner"] == "worker-b-after-sigkill"
+        assert sum(command["type"] == "continue" for command in state["commands"]) <= 1
 
     async def test_checkpoint_survives_crash_second_worker_finishes(self) -> None:
         tenant = f"crash-test-{uuid.uuid4().hex[:8]}"

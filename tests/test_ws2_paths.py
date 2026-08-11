@@ -316,7 +316,7 @@ async def test_submit_service_persists_spec_payload_run_and_command(monkeypatch:
     context = _context()
     request = _request()
     run = SimpleNamespace(run_id=uuid4(), submission_id=request.submission_id, revision=0, skill_spec_hash="a" * 64)
-    command = SimpleNamespace(command_id=uuid4())
+    command = SimpleNamespace(command_id=uuid4(), command_seq=0)
     monkeypatch.setattr(execution, "_authorize", lambda *_args, **_kwargs: _scopes())
     monkeypatch.setattr(execution, "lock_submission", lambda *_args, **_kwargs: _async_value(None))
     monkeypatch.setattr(execution, "get_run_by_submission", lambda *_args, **_kwargs: _async_value(None))
@@ -333,6 +333,7 @@ async def test_submit_service_persists_spec_payload_run_and_command(monkeypatch:
     monkeypatch.setattr(execution, "insert_payload_if_absent", lambda *_args, **_kwargs: _async_value(None))
     monkeypatch.setattr(execution, "insert_run_if_absent", lambda *_args, **_kwargs: _async_value(run))
     monkeypatch.setattr(execution, "insert_command", lambda *_args, **_kwargs: _async_value(command))
+    monkeypatch.setattr(execution, "emit_runtime_events", lambda *_args, **_kwargs: _async_value(None))
     handle = await execution.submit(_session(), context, request)
     assert handle.run_id == run.run_id and handle.command_id == command.command_id
 

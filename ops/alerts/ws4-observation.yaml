@@ -1,0 +1,12 @@
+{
+  "groups": [{
+    "name": "grove-ws4-observation",
+    "rules": [
+      {"alert": "GroveRuntimeNotAdvancing", "expr": "sum(rate(grove_operation_count_total{grove_role=\"runtime_worker\",grove_outcome=\"ok\"}[10m])) == 0 and max(grove_observation_backlog) > 0", "for": "5m", "labels": {"severity": "page", "owner": "core-runtime"}, "annotations": {"runbook": "docs/runbooks/ws4-observation.md#api-或-runtime-推进异常"}},
+      {"alert": "GroveProjectionLag", "expr": "max(grove_projection_lag_seconds) > 5", "for": "5m", "labels": {"severity": "ticket", "owner": "core-observation"}, "annotations": {"runbook": "docs/runbooks/ws4-observation.md#projection-lag-或-dead-letter"}},
+      {"alert": "GroveProjectionRecoveryExceeded", "expr": "max(grove_projection_lag_seconds) > 120", "for": "1m", "labels": {"severity": "page", "owner": "core-observation"}, "annotations": {"runbook": "docs/runbooks/ws4-observation.md#projection-lag-或-dead-letter"}},
+      {"alert": "GroveSSELatency", "expr": "histogram_quantile(0.95, sum(rate(grove_sse_delivery_seconds_bucket[5m])) by (le)) > 2", "for": "5m", "labels": {"severity": "ticket", "owner": "core-api"}, "annotations": {"runbook": "docs/runbooks/ws4-observation.md#sse-延迟或重连风暴"}},
+      {"alert": "GroveTelemetrySaturated", "expr": "max(otelcol_exporter_queue_size / clamp_min(otelcol_exporter_queue_capacity, 1)) > 0.9 or sum(rate(otelcol_exporter_enqueue_failed_spans[5m])) + sum(rate(otelcol_exporter_send_failed_spans[5m])) > 0", "for": "5m", "labels": {"severity": "ticket", "owner": "platform-observability"}, "annotations": {"runbook": "docs/runbooks/ws4-observation.md#collector-或-backend-不可用"}}
+    ]
+  }]
+}

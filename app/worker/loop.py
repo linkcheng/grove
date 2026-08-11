@@ -12,6 +12,7 @@ import asyncio
 import logging
 import signal
 from datetime import UTC, datetime, timedelta
+from time import perf_counter
 from typing import cast
 
 import psycopg
@@ -19,6 +20,7 @@ from langchain_core.runnables.config import RunnableConfig
 from langgraph.checkpoint.base import ChannelVersions, CheckpointMetadata, empty_checkpoint
 
 from app.contracts.canonical import canonical_hash
+from app.core.telemetry import record_operation
 from app.execution import (
     ExecutionClaim,
     PostgresExecutionDriver,
@@ -31,7 +33,10 @@ from app.execution.conformance_graph import (
     node_a,
     node_b,
 )
-from app.observation.facts import build_lifecycle_emit_request, build_node_executed_emit_request
+from app.observation.facts import (
+    build_lifecycle_emit_request,
+    build_node_executed_emit_request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,17 +119,46 @@ class RuntimeWorker:
             claim = await self._driver.heartbeat(claim, lease_seconds=LEASE_SECONDS)
 
         try:
+            invoke_started = perf_counter()
             async with asyncio.timeout(TOTAL_BUDGET_SECONDS):
                 if is_start:
                     await self._invoke_start(claim)
                 else:
                     await self._invoke_continue(claim)
+            record_operation(
+                "run.invoke",
+                duration_ms=float((perf_counter() - invoke_started) * 1000),
+                role="runtime_worker",
+                operation="invoke",
+                outcome="ok",
+            )
         except StaleExecutionFence:
+            record_operation(
+                "run.invoke",
+                duration_ms=float((perf_counter() - invoke_started) * 1000),
+                role="runtime_worker",
+                operation="invoke",
+                outcome="stale",
+            )
             logger.warning("worker.stale_fence run=%s seq=%d", claim.run_id, claim.command_seq)
         except TimeoutError:
+            record_operation(
+                "run.invoke",
+                duration_ms=float((perf_counter() - invoke_started) * 1000),
+                role="runtime_worker",
+                operation="invoke",
+                outcome="error",
+            )
             logger.error("worker.budget_exceeded run=%s seq=%d", claim.run_id, claim.command_seq)
             await self._safe_dead_letter(claim, "budget-exceeded")
         except Exception:
+            record_operation(
+                "run.invoke",
+                duration_ms=float((perf_counter() - invoke_started) * 1000),
+                role="runtime_worker",
+                operation="invoke",
+                outcome="error",
+            )
             logger.exception("worker.invoke_error run=%s seq=%d", claim.run_id, claim.command_seq)
             await self._safe_dead_letter(claim, "invoke-error")
 
@@ -137,7 +171,15 @@ class RuntimeWorker:
     async def _invoke_start(self, claim: ExecutionClaim) -> None:
         """First stage: node_a -> yield, write checkpoint, finish delivery(yield)."""
         input_hash = compute_input_hash(CONFERENCE_INPUT)
+        node_started = perf_counter()
         yielded = node_a({"stage": "start", "input_hash": input_hash, "value": 0})
+        record_operation(
+            "graph.node",
+            duration_ms=float((perf_counter() - node_started) * 1000),
+            role="runtime_worker",
+            operation="node_a",
+            outcome="ok",
+        )
 
         await self._write_checkpoint(claim, yielded)
 
@@ -187,7 +229,15 @@ class RuntimeWorker:
         """Second stage: node_b -> terminal, write checkpoint, finish delivery(terminal)."""
         input_hash = compute_input_hash(CONFERENCE_INPUT)
         yielded = node_a({"stage": "start", "input_hash": input_hash, "value": 0})
+        node_started = perf_counter()
         terminal = node_b(yielded)
+        record_operation(
+            "graph.node",
+            duration_ms=float((perf_counter() - node_started) * 1000),
+            role="runtime_worker",
+            operation="node_b",
+            outcome="ok",
+        )
 
         await self._write_checkpoint(claim, terminal)
 

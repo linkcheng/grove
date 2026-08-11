@@ -11,14 +11,15 @@ import asyncio
 import json
 import re
 from collections.abc import Sequence
-from datetime import UTC
+from datetime import UTC, datetime
+from time import perf_counter
 from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.contracts.canonical import canonical_bytes, canonical_hash
-from app.core.trace import current_trace_id
+from app.core.telemetry import record_operation
 from app.execution.contracts import (
     BIGINT_MAX,
     CancelRun,
@@ -38,7 +39,15 @@ from app.execution.contracts import (
     _strict_claim,
     _strict_command,
 )
-from app.observation.facts import EmitEventRequest
+from app.observation.emitter import emit_runtime_events
+from app.observation.facts import (
+    API_COMMAND_SOURCE,
+    RECONCILIATION_SOURCE,
+    RUNTIME_WORKER_SOURCE,
+    EmitEventRequest,
+    ExecutionAuditAction,
+    build_execution_audit_emit_request,
+)
 
 MAX_LEASE_SECONDS = 90.0
 
@@ -116,6 +125,7 @@ class PostgresExecutionDriver:
         tenant_id: str,
         lease_seconds: float | None = None,
     ) -> ExecutionClaim | None:
+        started = perf_counter()
         worker = _bounded_text(worker_id, label="worker_id", maximum=256)
         build_hash = _runtime_hash(runtime_build_hash)
         tenant = _bounded_text(tenant_id, label="tenant_id", maximum=128)
@@ -144,7 +154,7 @@ class PostgresExecutionDriver:
                     raise ExecutionFenceExhausted("execution fence cannot be incremented safely")
                 if row["result_code"] != "claimed":
                     raise RuntimeError("database returned an unknown claim result")
-                return ExecutionClaim.model_validate(
+                claim = ExecutionClaim.model_validate(
                     {
                         "command_id": row["command_id"],
                         "tenant_id": tenant,
@@ -157,6 +167,32 @@ class PostgresExecutionDriver:
                         "lease_until": row["lease_until"].astimezone(UTC),
                     }
                 )
+                action: ExecutionAuditAction = "worker_takeover" if claim.execution_fence > 1 else "worker_claimed"
+                await self._emit_observation_events(
+                    session,
+                    claim,
+                    [
+                        build_execution_audit_emit_request(
+                            source=RUNTIME_WORKER_SOURCE,
+                            run_id=claim.run_id,
+                            command_id=claim.command_id,
+                            command_seq=claim.command_seq,
+                            command_type="start" if claim.command_seq == 0 else "continue",
+                            action=action,
+                            result_code="claimed",
+                            occurred_at=datetime.now(UTC),
+                            transition_key=f"{claim.command_id}:{claim.execution_fence}:claimed",
+                        )
+                    ],
+                )
+                record_operation(
+                    "worker.claim",
+                    duration_ms=float((perf_counter() - started) * 1000),
+                    role="runtime_worker",
+                    operation="claim",
+                    outcome="ok",
+                )
+                return claim
 
     async def dispatch(self, command: ExecutionCommand) -> RunCommandReceipt:
         """Atomically accept the production ``CancelRun`` command.
@@ -226,7 +262,7 @@ class PostgresExecutionDriver:
                     raise ExecutionFenceExhausted("cancel execution fence cannot be incremented safely")
                 if result_code not in {"accepted", "idempotent"}:
                     raise RuntimeError("database returned an unknown cancel acceptance result")
-                return RunCommandReceipt.model_validate(
+                receipt = RunCommandReceipt.model_validate(
                     {
                         "command_id": row["command_id"],
                         "tenant_id": row["tenant_id"],
@@ -239,6 +275,26 @@ class PostgresExecutionDriver:
                         "status": row["status"],
                     }
                 )
+                await emit_runtime_events(
+                    session,
+                    tenant_id=receipt.tenant_id,
+                    run_id=receipt.run_id,
+                    causation_id=receipt.command_id,
+                    events=[
+                        build_execution_audit_emit_request(
+                            source=API_COMMAND_SOURCE,
+                            run_id=receipt.run_id,
+                            command_id=receipt.command_id,
+                            command_seq=receipt.command_seq,
+                            command_type="cancel",
+                            action="cancel_accepted",
+                            result_code=result_code,
+                            occurred_at=datetime.now(UTC),
+                            transition_key=f"{receipt.command_id}:cancel-accepted",
+                        )
+                    ],
+                )
+                return receipt
 
     @staticmethod
     async def _insert_cancel_payload(
@@ -319,11 +375,31 @@ class PostgresExecutionDriver:
                 lease_until = result.scalar_one_or_none()
                 if lease_until is None:
                     raise StaleExecutionFence("claim no longer owns a current database lease")
-                return _replace_strict(
+                renewed = _replace_strict(
                     trusted,
                     ExecutionClaim,
                     lease_until=lease_until.astimezone(UTC),
                 )
+                await self._emit_observation_events(
+                    session,
+                    renewed,
+                    [
+                        build_execution_audit_emit_request(
+                            source=RUNTIME_WORKER_SOURCE,
+                            run_id=renewed.run_id,
+                            command_id=renewed.command_id,
+                            command_seq=renewed.command_seq,
+                            command_type="start" if renewed.command_seq == 0 else "continue",
+                            action="lease_renewed",
+                            result_code="renewed",
+                            occurred_at=datetime.now(UTC),
+                            transition_key=(
+                                f"{renewed.command_id}:{renewed.execution_fence}:{renewed.lease_until.isoformat()}"
+                            ),
+                        )
+                    ],
+                )
+                return renewed
 
     async def consume(self, claim: ExecutionClaim) -> RunCommandReceipt:
         """Consume only after the database proves an authoritative checkpoint."""
@@ -361,7 +437,7 @@ class PostgresExecutionDriver:
                     raise RunStateConflict("authoritative checkpoint proof is missing")
                 if result_code != "consumed":
                     raise RuntimeError("database returned an unknown consume result")
-                return RunCommandReceipt.model_validate(
+                receipt = RunCommandReceipt.model_validate(
                     {
                         "command_id": row["command_id"],
                         "tenant_id": row["tenant_id"],
@@ -374,6 +450,24 @@ class PostgresExecutionDriver:
                         "status": row["status"],
                     }
                 )
+                await self._emit_observation_events(
+                    session,
+                    trusted,
+                    [
+                        build_execution_audit_emit_request(
+                            source=RUNTIME_WORKER_SOURCE,
+                            run_id=receipt.run_id,
+                            command_id=receipt.command_id,
+                            command_seq=receipt.command_seq,
+                            command_type=receipt.command_type,
+                            action="command_applied",
+                            result_code="consumed",
+                            occurred_at=datetime.now(UTC),
+                            transition_key=f"{receipt.command_id}:{trusted.execution_fence}:consumed",
+                        )
+                    ],
+                )
+                return receipt
 
     async def dead_letter(self, claim: ExecutionClaim, reason_ref: str) -> RunCommandReceipt:
         """Move one still-owned, unexpired claim to the durable dead-letter state."""
@@ -413,7 +507,7 @@ class PostgresExecutionDriver:
                     raise RunStateConflict("authoritative checkpoint proof prevents dead-lettering")
                 if result_code != "dead_letter":
                     raise RuntimeError("database returned an unknown dead-letter result")
-                return RunCommandReceipt.model_validate(
+                receipt = RunCommandReceipt.model_validate(
                     {
                         "command_id": row["command_id"],
                         "tenant_id": row["tenant_id"],
@@ -426,6 +520,24 @@ class PostgresExecutionDriver:
                         "status": row["status"],
                     }
                 )
+                await self._emit_observation_events(
+                    session,
+                    trusted,
+                    [
+                        build_execution_audit_emit_request(
+                            source=RUNTIME_WORKER_SOURCE,
+                            run_id=receipt.run_id,
+                            command_id=receipt.command_id,
+                            command_seq=receipt.command_seq,
+                            command_type=receipt.command_type,
+                            action="command_dead_lettered",
+                            result_code="dead_letter",
+                            occurred_at=datetime.now(UTC),
+                            transition_key=(f"{receipt.command_id}:{trusted.execution_fence}:dead-letter:{reason}"),
+                        )
+                    ],
+                )
+                return receipt
 
     async def reconcile_expired(self, tenant_id: str, run_id: UUID) -> RunCommandReceipt | None:
         """Reconcile one expired lease using the explicitly isolated projection role.
@@ -452,7 +564,7 @@ class PostgresExecutionDriver:
                     return None
                 if row["result_code"] not in {"consumed", "requeued"}:
                     raise RuntimeError("database returned an unknown expired reconciliation result")
-                return RunCommandReceipt.model_validate(
+                receipt = RunCommandReceipt.model_validate(
                     {
                         "command_id": row["command_id"],
                         "tenant_id": row["tenant_id"],
@@ -465,6 +577,29 @@ class PostgresExecutionDriver:
                         "status": row["status"],
                     }
                 )
+                reconcile_action: ExecutionAuditAction = (
+                    "expired_command_consumed" if row["result_code"] == "consumed" else "expired_command_requeued"
+                )
+                await emit_runtime_events(
+                    session,
+                    tenant_id=receipt.tenant_id,
+                    run_id=receipt.run_id,
+                    causation_id=receipt.command_id,
+                    events=[
+                        build_execution_audit_emit_request(
+                            source=RECONCILIATION_SOURCE,
+                            run_id=receipt.run_id,
+                            command_id=receipt.command_id,
+                            command_seq=receipt.command_seq,
+                            command_type=receipt.command_type,
+                            action=reconcile_action,
+                            result_code=row["result_code"],
+                            occurred_at=datetime.now(UTC),
+                            transition_key=f"{receipt.command_id}:{reconcile_action}:{receipt.status}",
+                        )
+                    ],
+                )
+                return receipt
 
     @staticmethod
     async def _scope_transaction(session: AsyncSession, tenant_id: str) -> None:
@@ -489,35 +624,12 @@ class PostgresExecutionDriver:
         outbox rows; it never mutates WS-3 authority state.
         """
 
-        descriptors = []
-        for request in events:
-            payload_obj = json.loads(request.canonical_payload_bytes())
-            descriptors.append(
-                {
-                    "event_type": request.event_type,
-                    "source": request.source,
-                    "source_event_id": request.source_event_id,
-                    "payload_schema_ref": request.payload_schema_ref,
-                    "payload": payload_obj,
-                    "occurred_at": request.occurred_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
-                }
-            )
-        events_json = json.dumps(descriptors, separators=(",", ":"), ensure_ascii=False)
-        await session.execute(
-            text(
-                "SELECT * FROM grove_emit_runtime_events("
-                ":tenant_id, :run_id, :orchestration_id, :correlation_id, "
-                ":causation_id, :trace_id, CAST(:events AS jsonb))"
-            ),
-            {
-                "tenant_id": claim.tenant_id,
-                "run_id": claim.run_id,
-                "orchestration_id": claim.run_id,
-                "correlation_id": str(claim.run_id),
-                "causation_id": claim.command_id,
-                "trace_id": current_trace_id(),
-                "events": events_json,
-            },
+        await emit_runtime_events(
+            session,
+            tenant_id=claim.tenant_id,
+            run_id=claim.run_id,
+            causation_id=claim.command_id,
+            events=events,
         )
 
     async def finish_delivery(
@@ -583,6 +695,34 @@ class PostgresExecutionDriver:
                     raise RunStateConflict("authoritative checkpoint proof is missing")
                 if code != "consumed":
                     raise RuntimeError("database returned an unknown delivery result")
-                if events:
-                    await self._emit_observation_events(session, trusted, events)
+                audit_events = [
+                    build_execution_audit_emit_request(
+                        source=RUNTIME_WORKER_SOURCE,
+                        run_id=trusted.run_id,
+                        command_id=trusted.command_id,
+                        command_seq=trusted.command_seq,
+                        command_type="start" if trusted.command_seq == 0 else "continue",
+                        action="command_applied",
+                        result_code=outcome_kind,
+                        run_revision=row["run_revision"],
+                        occurred_at=datetime.now(UTC),
+                        transition_key=f"{trusted.command_id}:{trusted.execution_fence}:finish:{outcome_kind}",
+                    )
+                ]
+                if outcome_kind == "yield" and row["continue_command_id"] is not None:
+                    audit_events.append(
+                        build_execution_audit_emit_request(
+                            source=RUNTIME_WORKER_SOURCE,
+                            run_id=trusted.run_id,
+                            command_id=row["continue_command_id"],
+                            command_seq=trusted.command_seq + 1,
+                            command_type="continue",
+                            action="command_accepted",
+                            result_code="accepted",
+                            run_revision=row["run_revision"],
+                            occurred_at=datetime.now(UTC),
+                            transition_key=f"{row['continue_command_id']}:accepted",
+                        )
+                    )
+                await self._emit_observation_events(session, trusted, [*(events or ()), *audit_events])
                 return DeliveryReceipt.model_validate(dict(row))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
 from time import monotonic
 from typing import Any
@@ -110,6 +111,80 @@ async def authorize_operation(session: AsyncSession, context: ActiveTenantContex
         return ()
     effective = tuple(sorted(set(grants)))
     return effective if operation in effective else ()
+
+
+async def authorize_owned_run_query(
+    session: AsyncSession,
+    context: ActiveTenantContext,
+    run_id: UUID,
+) -> bool:
+    """Authorize ``execution.query`` and run ownership in one RLS-scoped read.
+
+    SSE can have hundreds of concurrent clients.  Replaying the general
+    authorization helper as four separate round trips on every durable-cursor
+    iteration would make idle observation traffic consume the API pool.  This
+    query preserves the same live authority inputs and closed-grant semantics
+    while proving ownership atomically in one database snapshot.
+    """
+
+    allowed = json.dumps(sorted(ALLOWED_OPERATIONS))
+    result = await session.execute(
+        text(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                  FROM tenant AS t
+                  JOIN execution_principal AS ep
+                    ON ep.tenant_id = t.tenant_id
+                  LEFT JOIN membership AS m
+                    ON ep.principal_kind = 'human'
+                   AND m.tenant_id = ep.tenant_id
+                   AND m.principal_id = ep.principal_id
+                   AND m.principal_kind = ep.principal_kind
+                  LEFT JOIN workload_principal AS w
+                    ON ep.principal_kind = 'workload'
+                   AND w.tenant_id = ep.tenant_id
+                   AND w.principal_id = ep.principal_id
+                   AND w.principal_kind = ep.principal_kind
+                  JOIN agent_run AS r
+                    ON r.tenant_id = ep.tenant_id
+                   AND r.principal_id = ep.principal_id
+                   AND r.principal_kind = ep.principal_kind
+                 WHERE t.tenant_id = :tenant_id
+                   AND t.status = 'active'
+                   AND ep.principal_id = :principal_id
+                   AND ep.principal_kind = :principal_kind
+                   AND ep.active IS TRUE
+                   AND CASE ep.principal_kind
+                       WHEN 'human' THEN m.active
+                       WHEN 'workload' THEN w.active
+                       ELSE false
+                   END IS TRUE
+                   AND jsonb_typeof(CASE ep.principal_kind
+                       WHEN 'human' THEN m.roles
+                       WHEN 'workload' THEN w.scopes
+                   END) = 'array'
+                   AND (CASE ep.principal_kind
+                       WHEN 'human' THEN m.roles
+                       WHEN 'workload' THEN w.scopes
+                   END) ? 'execution.query'
+                   AND (CASE ep.principal_kind
+                       WHEN 'human' THEN m.roles
+                       WHEN 'workload' THEN w.scopes
+                   END) <@ CAST(:allowed AS jsonb)
+                   AND r.run_id = :run_id
+            )
+            """
+        ),
+        {
+            "tenant_id": context.tenant_id,
+            "principal_id": context.principal.principal_id,
+            "principal_kind": context.principal.kind.value,
+            "allowed": allowed,
+            "run_id": run_id,
+        },
+    )
+    return bool(result.scalar_one())
 
 
 async def get_run_by_submission(

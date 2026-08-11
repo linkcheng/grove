@@ -18,7 +18,8 @@ import threading
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from math import isfinite
+from typing import Any, Literal
 
 from app.core.trace import current_trace_id
 
@@ -81,6 +82,7 @@ class MetricRecord:
     name: str
     labels: dict[str, str]
     value: float
+    kind: Literal["counter", "histogram", "up_down_counter", "gauge"]
 
 
 @dataclass(slots=True)
@@ -110,7 +112,7 @@ class BoundedTelemetryRecorder:
         """Record one span. Drops (and counts) when the queue is saturated."""
         if type(name) is not str or not name:
             raise ValueError("span name must be a non-empty string")
-        if type(duration_ms) is not float or duration_ms < 0:
+        if type(duration_ms) is not float or not isfinite(duration_ms) or duration_ms < 0:
             raise ValueError("duration_ms must be a non-negative float")
         validated = _validate_labels(labels)
         span = SpanRecord(name=name, labels=validated, duration_ms=duration_ms, trace_id=current_trace_id())
@@ -120,14 +122,25 @@ class BoundedTelemetryRecorder:
                 return
             self._spans.append(span)
 
-    def record_metric(self, name: str, *, value: float, labels: Mapping[str, Any] | None = None) -> None:
+    def record_metric(
+        self,
+        name: str,
+        *,
+        value: float,
+        labels: Mapping[str, Any] | None = None,
+        kind: Literal["counter", "histogram", "up_down_counter", "gauge"] = "gauge",
+    ) -> None:
         """Record one metric point. Drops (and counts) when saturated."""
         if type(name) is not str or not name:
             raise ValueError("metric name must be a non-empty string")
-        if type(value) not in {int, float} or isinstance(value, bool):
+        if type(value) not in {int, float} or isinstance(value, bool) or not isfinite(value):
             raise ValueError("metric value must be a finite number")
+        if kind not in {"counter", "histogram", "up_down_counter", "gauge"}:
+            raise ValueError("metric kind is invalid")
+        if kind in {"counter", "histogram"} and value < 0:
+            raise ValueError(f"{kind} metric value must be non-negative")
         validated = _validate_labels(labels)
-        metric = MetricRecord(name=name, labels=validated, value=float(value))
+        metric = MetricRecord(name=name, labels=validated, value=float(value), kind=kind)
         with self._lock:
             if len(self._metrics) >= self._capacity:
                 self._dropped += 1
@@ -160,6 +173,28 @@ def default_recorder() -> BoundedTelemetryRecorder:
     return _default_recorder
 
 
+def record_operation(
+    name: str,
+    *,
+    duration_ms: float,
+    role: str,
+    operation: str,
+    outcome: str,
+) -> None:
+    """Record the standard WS-4 span, count and duration metric tuple."""
+
+    labels = {"role": role, "operation": operation, "outcome": outcome}
+    recorder = default_recorder()
+    recorder.record_span(name, duration_ms=duration_ms, labels=labels)
+    recorder.record_metric("operation.count", value=1, labels=labels, kind="counter")
+    recorder.record_metric(
+        "operation.duration.seconds",
+        value=duration_ms / 1000,
+        labels=labels,
+        kind="histogram",
+    )
+
+
 __all__ = [
     "BoundedTelemetryRecorder",
     "MetricRecord",
@@ -167,4 +202,5 @@ __all__ = [
     "TELEMETRY_QUEUE_CAPACITY",
     "TelemetrySnapshot",
     "default_recorder",
+    "record_operation",
 ]

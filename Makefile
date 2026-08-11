@@ -4,7 +4,7 @@ EVIDENCE_DIR := ci-evidence
 COMPOSE_PROJECT := grove-ws0-test
 COMPOSE := docker compose -p $(COMPOSE_PROJECT) -f compose.yaml
 
-.PHONY: install verify manifest-check ws-3-check ws-4-check integration cleanroom-check ci release-check
+.PHONY: install verify manifest-check ws-3-check ws-4-check ws-4-capacity-smoke ws-4-capacity-check integration cleanroom-check ci release-check
 
 install:
 	uv sync --frozen
@@ -31,7 +31,7 @@ manifest-check:
 	bash scripts/reverse_validation.sh
 
 ws-3-check:
-	@printf 'WS-3 current gate (checkpoint, cancel, execution-authority closure candidates; not full WS-3)\n'
+	@printf 'WS-3 implementation gate (authority, checkpoint, worker and crash recovery)\n'
 	uv run pytest -q \
 		tests/test_ws3_checkpoint.py \
 		tests/test_ws3_execution_driver.py \
@@ -55,20 +55,25 @@ ws-3-check:
 	fi
 	@if [[ -n "$${GROVE_MIGRATION_DATABASE_URL:-}" ]]; then \
 		GROVE_MIGRATION_DATABASE_URL="$$GROVE_MIGRATION_DATABASE_URL" \
-			uv run pytest -q tests/integration/test_ws3_postgres_execution_driver.py \
-				tests/integration/test_catalog_authority_root.py -m integration -ra; \
+		uv run pytest -q tests/integration/test_ws3_postgres_execution_driver.py \
+				tests/integration/test_catalog_authority_root.py \
+				tests/integration/test_ws3_worker_crash_recovery.py -m integration -ra; \
 	else \
 		uv run pytest -q tests/integration/test_ws3_postgres_execution_driver.py \
-			tests/integration/test_catalog_authority_root.py -m integration -ra; \
+			tests/integration/test_catalog_authority_root.py \
+			tests/integration/test_ws3_worker_crash_recovery.py -m integration -ra; \
 	fi
 
 ws-4-check:
-	@printf 'WS-4 current gate (observation facts, projection, reducer, API, telemetry; not full WS-4)\n'
+	@printf 'WS-4 implementation gate (facts, projection, API/SSE, telemetry and operations)\n'
+	uv run python scripts/ws4_operational_drill.py
 	uv run pytest -q \
 		tests/observation/test_facts.py \
 		tests/observation/test_reducer.py \
 		tests/observation/test_observation_api.py \
 		tests/observation/test_telemetry.py \
+		tests/observation/test_telemetry_export.py \
+		tests/observation/test_operational_assets.py \
 		tests/test_manifest.py \
 		tests/test_migration_contract.py \
 		tests/test_migration_report.py \
@@ -84,12 +89,25 @@ ws-4-check:
 		tests/integration/test_ws4_fault_isolation.py \
 		-m integration -ra
 
+ws-4-capacity-smoke:
+	@for key in WS4_MIGRATION_DATABASE_URL WS4_RUNTIME_DATABASE_URL WS4_PROJECTION_DATABASE_URL WS4_API_DATABASE_URL; do \
+		if [[ -z "$${!key:-}" ]]; then printf '%s is required\n' "$$key" >&2; exit 2; fi; \
+	done
+	uv run python scripts/ws4_capacity_probe.py
+
+ws-4-capacity-check:
+	@for key in WS4_MIGRATION_DATABASE_URL WS4_RUNTIME_DATABASE_URL WS4_PROJECTION_DATABASE_URL WS4_API_DATABASE_URL; do \
+		if [[ -z "$${!key:-}" ]]; then printf '%s is required\n' "$$key" >&2; exit 2; fi; \
+	done
+	WS4_TARGET_CAPACITY_CHECK=1 uv run python scripts/ws4_capacity_probe.py --target
+
 integration:
 	$(MAKE) manifest-check
 	bash scripts/integration.sh
 
 cleanroom-check:
-	COMPOSE_PROJECT_NAME=grove-ws0-cleanroom-$$$$ CLEANROOM_REMOVE_VOLUMES=1 bash scripts/integration.sh
+	COMPOSE_PROJECT_NAME=grove-ws0-cleanroom-$$$$ CLEANROOM_REMOVE_VOLUMES=1 \
+		INTEGRATION_HOST_DB_PORT=0 INTEGRATION_HOST_API_PORT=0 bash scripts/integration.sh
 
 ci:
 	@printf 'development CI: this target does not certify WS-0 release completion\n'

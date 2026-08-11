@@ -14,7 +14,7 @@ services:
       retries: 30
       start_period: 3s
     ports:
-      - "127.0.0.1:54329:5432"
+      - "127.0.0.1:${INTEGRATION_HOST_DB_PORT:-54329}:5432"
     volumes:
       - grove_ws0_pgdata:/var/lib/postgresql/data
       - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/001-grove-roles.sql:ro
@@ -34,7 +34,7 @@ services:
       db:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "127.0.0.1:${INTEGRATION_HOST_API_PORT:-8000}:8000"
     volumes:
       - ./ci-evidence:/app/ci-evidence
 

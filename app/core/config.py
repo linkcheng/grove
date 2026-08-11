@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     app_image_id: str = Field(default="not_built", min_length=1, max_length=128)
     postgres_image_id: str = Field(default="not_resolved", min_length=1, max_length=128)
     readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
+    database_pool_size: int = Field(default=10, ge=1, le=50)
+    database_max_overflow: int = Field(default=10, ge=0, le=50)
+    database_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     auth_mode: Literal["disabled", "fixture"] = "disabled"
     worker_tenant_id: str = Field(default="default", min_length=1, max_length=128)
     worker_id: str = Field(default="grove-worker-1", min_length=1, max_length=256)
@@ -87,6 +90,9 @@ class Settings(BaseSettings):
             "app_image_id": self.app_image_id,
             "postgres_image_id": self.postgres_image_id,
             "readiness_timeout_seconds": self.readiness_timeout_seconds,
+            "database_pool_size": self.database_pool_size,
+            "database_max_overflow": self.database_max_overflow,
+            "database_pool_timeout_seconds": self.database_pool_timeout_seconds,
             "auth_mode": self.auth_mode,
         }
 

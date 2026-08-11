@@ -14,6 +14,7 @@ afterwards proves it catches up at the watermark without data loss.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -31,9 +32,18 @@ from langgraph.checkpoint.base import ChannelVersions, CheckpointMetadata, empty
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-RUNTIME_URL = "postgresql+psycopg://grove_runtime:grove_runtime_ws0@127.0.0.1:54329/grove"
-MIGRATION_URL = "postgresql+psycopg://grove_migration:grove_migration_ws0@127.0.0.1:54329/grove"
-PROJECTION_URL = "postgresql+psycopg://grove_projection:grove_projection_ws0@127.0.0.1:54329/grove"
+RUNTIME_URL = os.environ.get(
+    "WS4_RUNTIME_DATABASE_URL",
+    "postgresql+psycopg://grove_runtime:grove_runtime_ws0@127.0.0.1:54329/grove",
+)
+MIGRATION_URL = os.environ.get(
+    "WS4_MIGRATION_DATABASE_URL",
+    "postgresql+psycopg://grove_migration:grove_migration_ws0@127.0.0.1:54329/grove",
+)
+PROJECTION_URL = os.environ.get(
+    "WS4_PROJECTION_DATABASE_URL",
+    "postgresql+psycopg://grove_projection:grove_projection_ws0@127.0.0.1:54329/grove",
+)
 BUILD_HASH = "a" * 64
 CONFERENCE_INPUT = "grove-conformance"
 
@@ -194,7 +204,7 @@ class TestFaultIsolation:
         )
         assert receipt.result_code == "consumed"
         # The run advanced despite no projection processing the outbox.
-        assert await _count("runtime_event", tenant) == 2
+        assert await _count("runtime_event", tenant) == 6
         assert await _count("ui_projection_event", tenant) == 0
 
         # Stage 2: continue -> terminal with observation events (projection STILL not running)
@@ -223,15 +233,15 @@ class TestFaultIsolation:
         ]
         receipt2 = await driver.finish_delivery(claim2, outcome_kind="terminal", events=events2)
         assert receipt2.result_code == "consumed"
-        assert await _count("runtime_event", tenant) == 4
+        assert await _count("runtime_event", tenant) == 11
         assert await _count("ui_projection_event", tenant) == 0
 
         # Now start the projection: it must catch up from the outbox without data loss.
         projection = ProjectionReconciler(async_sessionmaker(create_async_engine(PROJECTION_URL)))
         processed = await projection.run_once()
-        assert processed >= 4
+        assert processed >= 11
         assert await _count("ui_projection_event", tenant) == 2
-        assert await _count("runtime_event_outbox", tenant) == 4  # all relayed
+        assert await _count("runtime_event_outbox", tenant) == 11  # all relayed
 
     async def test_telemetry_recorder_drop_does_not_block(self) -> None:
         """Telemetry saturation drops events but never blocks the caller."""

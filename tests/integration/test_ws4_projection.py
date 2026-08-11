@@ -8,6 +8,7 @@ unknown-schema dead-letter, and a full rebuild from authoritative facts.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -17,8 +18,14 @@ from app.observation.projection import ProjectionReconciler
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-PROJECTION_URL = "postgresql+psycopg://grove_projection:grove_projection_ws0@127.0.0.1:54329/grove"
-MIGRATION_URL = "postgresql+psycopg://grove_migration:grove_migration_ws0@127.0.0.1:54329/grove"
+PROJECTION_URL = os.environ.get(
+    "WS4_PROJECTION_DATABASE_URL",
+    "postgresql+psycopg://grove_projection:grove_projection_ws0@127.0.0.1:54329/grove",
+)
+MIGRATION_URL = os.environ.get(
+    "WS4_MIGRATION_DATABASE_URL",
+    "postgresql+psycopg://grove_migration:grove_migration_ws0@127.0.0.1:54329/grove",
+)
 
 
 def _projection() -> ProjectionReconciler:

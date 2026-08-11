@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 from app.core.telemetry import BoundedTelemetryRecorder
-from app.core.telemetry_export import OTLPExporter, TelemetryPolicy
+from app.core.telemetry_export import OTLPExporter, TelemetryExportRuntime, TelemetryPolicy
 
 
 def _recorder() -> BoundedTelemetryRecorder:
@@ -44,6 +46,14 @@ class TestTelemetryPolicy:
         with pytest.raises(ValueError):
             TelemetryPolicy(max_retries=-1)
 
+    @pytest.mark.parametrize(
+        "endpoint",
+        ["grpc://collector:4318", "http://user:secret@collector:4318", "http://collector:4318?token=x"],
+    )
+    def test_endpoint_rejects_unsupported_or_secret_bearing_urls(self, endpoint: str) -> None:
+        with pytest.raises(ValueError, match="credential-free"):
+            TelemetryPolicy(endpoint=endpoint)
+
 
 class TestOTLPExporter:
     def test_disabled_exporter_counts_drops(self) -> None:
@@ -55,20 +65,78 @@ class TestOTLPExporter:
         assert stats["exported"] == 0
         assert stats["dropped"] == 2  # 1 span + 1 metric
 
-    def test_enabled_exporter_best_effort(self) -> None:
+    def test_enabled_exporter_best_effort(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class FakeSpan:
+            def __enter__(self) -> FakeSpan:
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def set_attribute(self, _name: str, _value: object) -> None:
+                return None
+
+        class FakeTracer:
+            def start_as_current_span(self, _name: str, **_kwargs: object) -> FakeSpan:
+                return FakeSpan()
+
+        class FakeInstrument:
+            def record(self, _value: float, **_kwargs: object) -> None:
+                return None
+
+            def set(self, _value: float, **_kwargs: object) -> None:
+                return None
+
+            def add(self, _value: float, **_kwargs: object) -> None:
+                return None
+
+        class FakeMeter:
+            def create_gauge(self, _name: str) -> FakeInstrument:
+                return FakeInstrument()
+
+        monkeypatch.setattr(OTLPExporter, "_build_providers", lambda _self: (FakeTracer(), FakeMeter()))
         rec = _recorder()
         exporter = OTLPExporter(rec, TelemetryPolicy(endpoint="http://nonexistent:4318"))
         snapshot = rec.drain()
-        # Export should not raise even with an unreachable endpoint.
         exporter.export(snapshot)
-        # The tracer may be built but export is best-effort; stats should be accessible.
         stats = exporter.stats()
-        assert isinstance(stats["exported"], int)
-        assert isinstance(stats["failed"], int)
+        assert stats["exported"] == 2
+        assert stats["failed"] == 0
 
-    def test_empty_snapshot_is_noop(self) -> None:
+    def test_empty_snapshot_is_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(OTLPExporter, "_build_providers", lambda _self: (None, None))
         rec = BoundedTelemetryRecorder()
         exporter = OTLPExporter(rec, TelemetryPolicy(endpoint="http://collector:4318"))
         snapshot = rec.drain()
         exporter.export(snapshot)
         assert exporter.stats()["exported"] == 0
+
+
+class TestTelemetryExportRuntime:
+    def test_disabled_exporter_does_not_start_thread(self) -> None:
+        runtime = TelemetryExportRuntime(
+            OTLPExporter(BoundedTelemetryRecorder(), TelemetryPolicy(endpoint="")),
+            interval_seconds=0.01,
+        )
+        runtime.start()
+        assert runtime.running is False
+        runtime.stop()
+
+    def test_enabled_exporter_drains_periodically_and_on_stop(self) -> None:
+        drained = threading.Event()
+
+        class FakeExporter:
+            enabled = True
+
+            def drain_and_export(self) -> None:
+                drained.set()
+
+            def shutdown(self) -> None:
+                return None
+
+        runtime = TelemetryExportRuntime(FakeExporter(), interval_seconds=0.01)  # type: ignore[arg-type]
+        runtime.start()
+        assert drained.wait(timeout=0.5)
+        assert runtime.running is True
+        runtime.stop()
+        assert runtime.running is False

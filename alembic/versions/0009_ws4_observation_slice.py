@@ -206,7 +206,7 @@ def _emit_function_sql() -> str:
                     RAISE EXCEPTION 'malformed observation event descriptor' USING ERRCODE = '22023';
                 END IF;
                 -- Resource boundary: a single event payload must stay bounded.
-                IF length(evt_payload::text) > 65536 THEN
+                IF octet_length(evt_payload::text) > 65536 THEN
                     RAISE EXCEPTION 'runtime event payload exceeds 64 KiB bound' USING ERRCODE = '22023';
                 END IF;
 

@@ -1,0 +1,12 @@
+{
+  "id": "ws4-projection",
+  "title": "WS-4 Projection 与 Reconciliation",
+  "owner": "core-observation",
+  "slo": "normal projection P95 <= 5s; recovery <= 120s",
+  "runbook": "docs/runbooks/ws4-observation.md#projection-lag-或-dead-letter",
+  "panels": [
+    {"title": "Outbox backlog", "query": "max(grove_observation_backlog{grove_role=\"projection_reconciliation\"})"},
+    {"title": "Projection lag", "query": "histogram_quantile(0.95, sum(rate(grove_projection_lag_seconds_bucket[5m])) by (le))"},
+    {"title": "Unknown schema and dead-letter", "query": "sum(grove_observation_event_count_total{grove_outcome=~\"unknown_schema|dead_letter\"}) by (grove_outcome)"}
+  ]
+}

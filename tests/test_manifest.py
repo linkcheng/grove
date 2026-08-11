@@ -341,7 +341,7 @@ def test_workspace_manifest_has_no_absolute_path_and_missing_lock_fails(tmp_path
     root = Path.cwd()
     generated = build_manifest_from_workspace(root)
     assert verify_manifest(generated, root=root)
-    assert generated["migration"]["head"] == "ws4_recon_helpers"
+    assert generated["migration"]["head"] == "ws4_authority_audit_emitters"
     assert str(root) not in canonical_bytes(generated).decode()
     assert verify_manifest(RuntimeBuildManifest.model_validate(generated), root=root)
     with pytest.raises(ManifestError, match="uv.lock"):

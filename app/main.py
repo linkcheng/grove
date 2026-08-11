@@ -25,10 +25,13 @@ from app.auth.context import active_tenant_context
 from app.core.config import ConfigurationError, Role, Settings, load_settings
 from app.core.errors import AppError
 from app.core.observability import active_logging_runtime, configure_logging, log_event
+from app.core.telemetry import record_operation
+from app.core.telemetry_export import TelemetryExportRuntime
 from app.core.trace import resolve_trace_id, trace_id_context
 from app.db.session import create_engine, session_factory
 from app.roles import run_role_self_check
 from app.schemas.response import ApiResponse, fail
+from app.services.observation import SSEBackfillCoalescer
 
 
 def _response_content(response: ApiResponse[Any]) -> dict[str, Any]:
@@ -48,9 +51,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine = create_engine(settings)
         app.state.db_engine = engine
         app.state.session_factory = session_factory(engine)
+        app.state.sse_backfill_coalescer = SSEBackfillCoalescer()
+        telemetry_runtime = TelemetryExportRuntime()
+        app.state.telemetry_export_runtime = telemetry_runtime
+        telemetry_runtime.start()
         try:
             yield
         finally:
+            telemetry_runtime.stop()
             await engine.dispose()
     finally:
         if owns_logging_runtime:
@@ -86,15 +94,37 @@ async def request_trace_middleware(request: Request, call_next: Callable[[Reques
             route=_route_template(request),
             error=type(exc).__name__,
         )
+        record_operation(
+            "api.request",
+            duration_ms=float(duration_ms),
+            role="api",
+            operation="request",
+            outcome="error",
+        )
         raise
     else:
         duration_ms = round((perf_counter() - started) * 1000, 3)
+        if response.status_code < 400:
+            outcome = "ok"
+        elif response.status_code == 409:
+            outcome = "conflict"
+        elif response.status_code < 500:
+            outcome = "rejected"
+        else:
+            outcome = "error"
         log_event(
             "request_complete",
             trace_id=trace_id,
             duration_ms=duration_ms,
             status=response.status_code,
             route=_route_template(request),
+        )
+        record_operation(
+            "api.request",
+            duration_ms=float(duration_ms),
+            role="api",
+            operation="request",
+            outcome=outcome,
         )
     finally:
         trace_id_context.reset(token)
@@ -135,6 +165,15 @@ async def http_exception_handler(request: Request, exc: Exception) -> JSONRespon
         503: "DependencyUnavailable",
     }.get(http_exc.status_code, "InternalServerError" if http_exc.status_code >= 500 else "BadRequest")
     body = fail(code, str(http_exc.detail), trace_id=request.state.trace_id, error_code=error_code)
+    if http_exc.status_code in {401, 403}:
+        log_event(
+            "security_rejection",
+            trace_id=request.state.trace_id,
+            duration_ms=round((perf_counter() - getattr(request.state, "started_at", perf_counter())) * 1000, 3),
+            status=http_exc.status_code,
+            route=_route_template(request),
+            reason_class="authentication" if http_exc.status_code == 401 else "authorization",
+        )
     return JSONResponse(
         status_code=http_exc.status_code,
         content=_response_content(body),
@@ -174,6 +213,15 @@ async def app_error_handler(request: Request, exc: Exception) -> JSONResponse:
     headers = {"x-request-id": request.state.trace_id}
     if app_error.retry_after is not None:
         headers["retry-after"] = str(app_error.retry_after)
+    if app_error.status_code == 403:
+        log_event(
+            "security_rejection",
+            trace_id=request.state.trace_id,
+            duration_ms=round((perf_counter() - getattr(request.state, "started_at", perf_counter())) * 1000, 3),
+            status=403,
+            route=_route_template(request),
+            reason_class="authorization",
+        )
     return JSONResponse(
         status_code=app_error.status_code,
         content=_response_content(body),
@@ -257,15 +305,20 @@ def _run_runtime_worker(settings: Settings) -> int:
         session_factory=session_maker,
         lease_seconds=30.0,
     )
-    asyncio.run(
-        run_worker(
-            driver=driver,
-            tenant_id=settings.worker_tenant_id,
-            worker_id=settings.worker_id,
-            runtime_build_hash=settings.runtime_build_hash,
-            database_url=settings.database_url_value(),
+    telemetry_runtime = TelemetryExportRuntime()
+    telemetry_runtime.start()
+    try:
+        asyncio.run(
+            run_worker(
+                driver=driver,
+                tenant_id=settings.worker_tenant_id,
+                worker_id=settings.worker_id,
+                runtime_build_hash=settings.runtime_build_hash,
+                database_url=settings.database_url_value(),
+            )
         )
-    )
+    finally:
+        telemetry_runtime.stop()
     return 0
 
 
@@ -274,7 +327,12 @@ def _run_projection_reconciliation(settings: Settings) -> int:
 
     engine = create_engine(settings)
     session_maker = session_factory(engine)
-    asyncio.run(_run_projection_loop(session_maker))
+    telemetry_runtime = TelemetryExportRuntime()
+    telemetry_runtime.start()
+    try:
+        asyncio.run(_run_projection_loop(session_maker))
+    finally:
+        telemetry_runtime.stop()
     return 0
 
 

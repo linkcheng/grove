@@ -14,6 +14,8 @@ import json
 import math
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from time import perf_counter
 from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
@@ -31,7 +33,10 @@ from langgraph.checkpoint.serde.base import SerializerProtocol
 from langgraph.checkpoint.serde.types import _DeltaSnapshot
 from psycopg.types.json import Jsonb
 
+from app.core.telemetry import record_operation
 from app.execution.contracts import ExecutionClaim, _strict_claim
+from app.observation.emitter import emit_runtime_events_psycopg
+from app.observation.facts import RUNTIME_WORKER_SOURCE, build_execution_audit_emit_request
 
 _RESERVED_METADATA_KEYS = frozenset(
     {
@@ -490,6 +495,7 @@ class FencedPostgresSaver(BaseCheckpointSaver[str]):
         metadata: CheckpointMetadata,
         new_versions: ChannelVersions,
     ) -> RunnableConfig:
+        started = perf_counter()
         safe_config, checkpoint_data, safe_metadata, versions = self._prepare_checkpoint(
             config, checkpoint, metadata, new_versions
         )
@@ -502,6 +508,33 @@ class FencedPostgresSaver(BaseCheckpointSaver[str]):
                 if blob_rows:
                     await cursor.executemany(_FENCED_UPSERT_CHECKPOINT_BLOBS_SQL, blob_rows)
                 await cursor.execute(_FENCED_UPSERT_CHECKPOINTS_SQL, checkpoint_row)
+            checkpoint_id = checkpoint_data["id"]
+            await emit_runtime_events_psycopg(
+                self._connection,
+                tenant_id=self._claim.tenant_id,
+                run_id=self._claim.run_id,
+                causation_id=self._claim.command_id,
+                events=[
+                    build_execution_audit_emit_request(
+                        source=RUNTIME_WORKER_SOURCE,
+                        run_id=self._claim.run_id,
+                        command_id=self._claim.command_id,
+                        command_seq=self._claim.command_seq,
+                        command_type="start" if self._claim.command_seq == 0 else "continue",
+                        action="checkpoint_applied",
+                        result_code="applied",
+                        occurred_at=datetime.now(UTC),
+                        transition_key=(f"{self._claim.command_id}:{self._claim.execution_fence}:{checkpoint_id}"),
+                    )
+                ],
+            )
+        record_operation(
+            "checkpoint.apply",
+            duration_ms=float((perf_counter() - started) * 1000),
+            role="runtime_worker",
+            operation="checkpoint",
+            outcome="ok",
+        )
         return next_config
 
     async def aput_writes(
