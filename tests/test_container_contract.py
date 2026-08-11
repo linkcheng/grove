@@ -8,6 +8,8 @@ import subprocess
 import tarfile
 from pathlib import Path
 
+import pytest
+
 
 def test_application_container_is_non_root() -> None:
     dockerfile = Path("Dockerfile").read_text()
@@ -31,6 +33,7 @@ def test_docker_build_context_excludes_non_runtime_files() -> None:
         "scripts/*",
     } <= patterns
     assert "!scripts/migration_report.py" in patterns
+    assert "!scripts/ws3_downgrade.py" in patterns
     assert "app/" not in patterns
     assert "alembic/" not in patterns
     assert "pyproject.toml" not in patterns
@@ -42,6 +45,38 @@ def test_postgres_port_is_bound_to_loopback_only() -> None:
     compose = Path("compose.yaml").read_text()
     assert '"127.0.0.1:${INTEGRATION_HOST_DB_PORT:-54329}:5432"' in compose
     assert '"127.0.0.1:${INTEGRATION_HOST_API_PORT:-8000}:8000"' in compose
+    assert "GROVE_POSTGRES_IMAGE_ID:?" in compose
+
+
+@pytest.mark.parametrize(
+    ("failure", "retryable"),
+    [
+        ("psycopg.OperationalError: connection refused", True),
+        ("FATAL: the database system is starting up (SQLSTATE 57P03)", True),
+        ("canceling statement due to lock timeout (SQLSTATE 55P03)", True),
+        ("psycopg.errors.CheckViolation: 23514", False),
+        ("migration drift: expected hash mismatch", False),
+        ("syntax error at or near ALTER", False),
+    ],
+)
+def test_migration_retry_classifier_only_accepts_transient_failures(failure: str, retryable: bool) -> None:
+    env = os.environ.copy()
+    env["GROVE_INTEGRATION_LIBRARY"] = "1"
+    bash = shutil.which("bash") or "/bin/bash"
+    result = subprocess.run(  # noqa: S603
+        [
+            bash,
+            "-c",
+            'source scripts/integration.sh; migration_failure_is_retryable "$1"',
+            "classifier",
+            failure,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert (result.returncode == 0) is retryable
 
 
 def test_integration_proves_independent_build_digests_and_extension_loading() -> None:
@@ -60,6 +95,9 @@ def test_integration_proves_independent_build_digests_and_extension_loading() ->
     assert "WorkingDir" in integration
     assert 'project="${COMPOSE_PROJECT_NAME:-grove-ws0-test}"' in integration
     assert 'cleanroom_remove_volumes="${CLEANROOM_REMOVE_VOLUMES:-0}"' in integration
+    assert 'export GROVE_POSTGRES_IMAGE_ID="$resolved_postgres_image_ref"' in integration
+    assert "migration_failure_is_retryable" in integration
+    assert "seq 1 60" not in integration[integration.index("migration_ok=0") : integration.index("# Fault probes")]
     assert "cleanroom-check:" in makefile
     assert "COMPOSE_PROJECT_NAME=grove-ws0-cleanroom-$$$$" in makefile
     assert "CLEANROOM_REMOVE_VOLUMES=1" in makefile

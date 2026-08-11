@@ -38,6 +38,7 @@ MIGRATION_EXECUTION_FILES = (
     "alembic/env.py",
     "alembic/script.py.mako",
     "app/build/catalog_authority.py",
+    "app/build/downgrade_preflight.py",
     "app/build/ws3_catalog_authority_v1.json",
 )
 WS2_BUSINESS_RELATIONS = frozenset(

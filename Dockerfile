@@ -30,7 +30,7 @@ RUN --mount=type=bind,target=/context,ro \
     && tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --numeric-owner --owner=0 --group=0 \
       -C /context -cf - alembic.ini | tar -C /app -xf - \
     && tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --numeric-owner --owner=0 --group=0 \
-      -C /context/scripts -cf - migration_report.py | tar -C /app/scripts -xf - \
+      -C /context/scripts -cf - migration_report.py ws3_downgrade.py | tar -C /app/scripts -xf - \
     && find /app -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 RUN uv sync --frozen --no-dev --no-editable --no-cache \

@@ -26,8 +26,9 @@ Redis/Celery，它不新增 broker、双写窗口和第二套 retry 语义。
   已消费、证明不可恢复”，不能作为 claim-bound 消费证明、checkpoint applied
   proof、supersession proof 或幂等 consume 成功依据；runtime 函数只能产生
   `claim.v1` 并同时保存完整、可重算的凭证。
-- `ws3_checkpoint_fenced` 降级会不可逆删除消费凭证，因此降级到 0003 时统一映射为
-  旧 `consumed`，再次升级时重新标记为 `legacy_unverified`。不得根据当前 fence、
-  猜测的 worker/lease 或占位 hash 伪造已丢失的 claim。
+- `ws3_checkpoint_fenced` 的历史 downgrade implementation 会不可逆删除消费凭证；该
+  路径只保留给 ADR-0025 定义的空白、可销毁迁移验证数据库。含运行事实的数据库必须在
+  DDL 前拒绝 downgrade，不再通过降级到 0003 后标记 `legacy_unverified` 接受证明丢失。
+  任何路径都不得根据当前 fence、猜测的 worker/lease 或占位 hash 伪造已丢失的 claim。
 - 若未来采用 LangGraph Agent Server，必须以新 ADR 明确它如何完整替代该
   Driver interface 和已有恢复证据。

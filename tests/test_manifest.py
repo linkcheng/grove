@@ -900,7 +900,13 @@ def test_release_manifest_requires_content_addressed_evidence() -> None:
 
 def test_migration_hash_covers_execution_closure(tmp_path: Path) -> None:
     (tmp_path / "alembic" / "versions").mkdir(parents=True)
-    for relative_path in ("alembic.ini", "alembic/env.py", "alembic/script.py.mako", "alembic/versions/001.py"):
+    for relative_path in (
+        "alembic.ini",
+        "alembic/env.py",
+        "alembic/script.py.mako",
+        "alembic/versions/001.py",
+        "app/build/downgrade_preflight.py",
+    ):
         path = tmp_path / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(relative_path)
@@ -910,7 +916,9 @@ def test_migration_hash_covers_execution_closure(tmp_path: Path) -> None:
     second = migration_hash(tmp_path)
     (tmp_path / "alembic.ini").write_text("changed config")
     third = migration_hash(tmp_path)
-    assert len({first, second, third}) == 3
+    (tmp_path / "app/build/downgrade_preflight.py").write_text("changed preflight")
+    fourth = migration_hash(tmp_path)
+    assert len({first, second, third, fourth}) == 4
 
 
 def test_migration_hash_covers_non_python_revision_assets(tmp_path: Path) -> None:

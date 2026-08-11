@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
+import psycopg
 import pytest
 from app.build.manifest import WS3_SCHEMA_CONTRACT
 from scripts import migration_report
@@ -29,14 +32,137 @@ def test_ws3_trigger_catalog_is_relation_qualified_and_not_name_whitelisted() ->
 
 
 def test_migration_subprocess_has_a_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    calls: list[object] = []
+    calls: list[tuple[object, str, bool]] = []
 
-    def fake_run(*_args: object, **kwargs: object) -> None:
-        calls.append(kwargs["timeout"])
+    def fake_run(*_args: object, **kwargs: Any) -> None:
+        calls.append(
+            (
+                kwargs["timeout"],
+                kwargs["env"]["GROVE_DATABASE_URL"],
+                "GROVE_API_BASE_URL" in kwargs["env"],
+            )
+        )
 
+    monkeypatch.setenv("GROVE_API_BASE_URL", "http://integration-only")
     monkeypatch.setattr(subprocess, "run", fake_run)
-    migration_report.run_migration(tmp_path, "upgrade head")
-    assert calls == [migration_report.MIGRATION_TIMEOUT_SECONDS]
+    migration_report.run_migration(tmp_path, "upgrade head", "postgresql://migration@db/temp")
+    assert calls == [(migration_report.MIGRATION_TIMEOUT_SECONDS, "postgresql://migration@db/temp", False)]
+    assert os.environ.get("GROVE_DATABASE_URL") != "postgresql://migration@db/temp"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("failed"), subprocess.TimeoutExpired("alembic", 30), KeyboardInterrupt()],
+)
+def test_temporary_migration_database_is_dropped_for_all_exit_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        migration_report,
+        "_create_temporary_database",
+        lambda _url: ("grove_migration_report_" + "a" * 32, "postgresql://migration@db/temp"),
+    )
+    monkeypatch.setattr(
+        migration_report,
+        "_drop_temporary_database",
+        lambda url, name: calls.append((url, name)),
+    )
+    monkeypatch.setattr(migration_report, "_initialize_temporary_database", lambda _url: None)
+
+    with pytest.raises(type(failure)):
+        with migration_report.temporary_migration_database("postgresql://migration@db/grove"):
+            raise failure
+
+    assert calls == [("postgresql://migration@db/grove", "grove_migration_report_" + "a" * 32)]
+
+
+def test_temporary_migration_database_is_dropped_after_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        migration_report,
+        "_create_temporary_database",
+        lambda _url: ("grove_migration_report_" + "b" * 32, "postgresql://migration@db/temp"),
+    )
+    monkeypatch.setattr(
+        migration_report,
+        "_drop_temporary_database",
+        lambda url, name: calls.append((url, name)),
+    )
+    monkeypatch.setattr(migration_report, "_initialize_temporary_database", lambda _url: None)
+
+    with migration_report.temporary_migration_database("postgresql://migration@db/grove") as database_url:
+        assert database_url == "postgresql://migration@db/temp"
+
+    assert calls == [("postgresql://migration@db/grove", "grove_migration_report_" + "b" * 32)]
+
+
+def test_temporary_migration_database_is_dropped_when_capability_initialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        migration_report,
+        "_create_temporary_database",
+        lambda _url: ("grove_migration_report_" + "c" * 32, "postgresql://migration@db/temp"),
+    )
+    monkeypatch.setattr(
+        migration_report,
+        "_drop_temporary_database",
+        lambda url, name: calls.append((url, name)),
+    )
+    monkeypatch.setattr(
+        migration_report,
+        "_initialize_temporary_database",
+        lambda _url: (_ for _ in ()).throw(RuntimeError("extension init failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="extension init failed"):
+        with migration_report.temporary_migration_database("postgresql://migration@db/grove"):
+            raise AssertionError("unreachable")
+
+    assert calls == [("postgresql://migration@db/grove", "grove_migration_report_" + "c" * 32)]
+
+
+def test_temporary_capabilities_use_the_same_owner_as_integration(monkeypatch: pytest.MonkeyPatch) -> None:
+    statements: list[str] = []
+
+    class Cursor:
+        def __enter__(self) -> Cursor:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def execute(self, statement: object) -> None:
+            statements.append(str(statement))
+
+    class Connection:
+        def __enter__(self) -> Connection:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def cursor(self) -> Cursor:
+            return Cursor()
+
+    monkeypatch.setattr(psycopg, "connect", lambda *_args, **_kwargs: Connection())
+
+    migration_report._initialize_temporary_database("postgresql://migration@db/grove_migration_report_" + "d" * 32)
+
+    assert statements[0] == "SET ROLE grove"
+    assert statements[1] == "REVOKE CREATE ON SCHEMA public FROM PUBLIC"
+    assert "GRANT CONNECT ON DATABASE" in statements[2]
+    assert statements[3:7] == [
+        "GRANT USAGE ON SCHEMA public TO grove_api, grove_runtime, grove_projection, grove_governance",
+        "GRANT USAGE, CREATE ON SCHEMA public TO grove_migration",
+        "CREATE EXTENSION postgis",
+        "CREATE EXTENSION vector",
+    ]
+    assert statements[7] == "RESET ROLE"
 
 
 def test_authority_dml_targets_are_actual_and_do_not_preseed_expected() -> None:
@@ -91,8 +217,39 @@ def test_authority_dml_targets_accept_qualified_alias_and_for_update_without_fal
 
 
 def test_migration_report_writes_content_addressed_copy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(migration_report, "run_migration", lambda _root, _command: None)
-    monkeypatch.setattr(migration_report, "database_state", lambda: ("baseline", []))
+    calls: list[tuple[str, str]] = []
+
+    class TemporaryDatabase:
+        def __enter__(self) -> str:
+            return "postgresql://migration@db/grove_migration_report_private"
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(migration_report, "temporary_migration_database", lambda _url: TemporaryDatabase())
+    monkeypatch.setattr(
+        migration_report,
+        "run_migration",
+        lambda _root, command, database_url: calls.append((command, database_url)),
+    )
+    monkeypatch.setattr(
+        migration_report,
+        "database_state",
+        lambda database_url: (
+            ("baseline", [])
+            if database_url == "postgresql://migration@db/grove_migration_report_private"
+            else (_ for _ in ()).throw(AssertionError("migration report inspected the integration database"))
+        ),
+    )
+    monkeypatch.setattr(
+        migration_report,
+        "load_settings",
+        lambda: type(
+            "Settings",
+            (),
+            {"database_url_value": lambda self: "postgresql://migration@db/grove"},
+        )(),
+    )
     monkeypatch.setattr(migration_report, "migration_head", lambda _root: "baseline")
     output = tmp_path / "ci-evidence" / "migrations.json"
 
@@ -101,13 +258,30 @@ def test_migration_report_writes_content_addressed_copy(monkeypatch: pytest.Monk
     payload = output.read_bytes()
     report = json.loads(payload)
     assert report["status"] == "completed"
+    assert "grove_migration_report_private" not in payload.decode()
+    assert calls == [
+        (command, "postgresql://migration@db/grove_migration_report_private") for command in migration_report.ROUND_TRIP
+    ]
     digest = hashlib.sha256(payload).hexdigest()
     assert (output.parent / "sha256" / digest / output.name).read_bytes() == payload
 
 
 def test_migration_report_rejects_database_head_not_in_graph(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(migration_report, "run_migration", lambda _root, _command: None)
-    monkeypatch.setattr(migration_report, "database_state", lambda: ("stale", []))
+    class TemporaryDatabase:
+        def __enter__(self) -> str:
+            return "postgresql://migration@db/temp"
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(migration_report, "temporary_migration_database", lambda _url: TemporaryDatabase())
+    monkeypatch.setattr(migration_report, "run_migration", lambda _root, _command, _database_url: None)
+    monkeypatch.setattr(migration_report, "database_state", lambda _url: ("stale", []))
+    monkeypatch.setattr(
+        migration_report,
+        "load_settings",
+        lambda: type("Settings", (), {"database_url_value": lambda self: "postgresql://migration@db/grove"})(),
+    )
     monkeypatch.setattr(migration_report, "migration_head", lambda _root: "baseline")
     with pytest.raises(migration_report.MigrationReportError, match="does not match Alembic graph"):
         migration_report.write_report(tmp_path, tmp_path / "migrations.json")

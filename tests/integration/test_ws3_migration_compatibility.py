@@ -13,6 +13,7 @@ from pathlib import Path
 import psycopg
 import pytest
 from psycopg import sql
+from scripts import migration_report
 from sqlalchemy.engine import URL, make_url
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -65,6 +66,17 @@ def _temporary_database() -> Iterator[URL]:
                     (database_name,),
                 )
                 cursor.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(database_name)))
+
+
+def _migration_report_database_names(database_url: URL) -> list[str]:
+    admin_url = database_url.set(database="postgres")
+    with psycopg.connect(_raw_url(admin_url), autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT datname FROM pg_database WHERE datname LIKE %s ORDER BY datname",
+                (migration_report.TEMPORARY_DATABASE_PREFIX + "%",),
+            )
+            return [str(row[0]) for row in cursor.fetchall()]
 
 
 def _invoke_alembic(database_url: URL, command: str, target: str) -> subprocess.CompletedProcess[str]:
@@ -312,29 +324,62 @@ def _assert_failed_upgrade_rolled_back(
             assert row == (tampered_definition,)
 
 
+def _downgrade_snapshot(database_url: URL) -> tuple[object, ...]:
+    with psycopg.connect(_raw_url(database_url), autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT version_num FROM alembic_version")
+            head = cursor.fetchone()
+            cursor.execute(
+                "SELECT status, command_seq, consumed_provenance_kind, consumed_worker_id, "
+                "consumed_execution_fence, consumed_lease_until, consumed_claim_provenance_hash "
+                "FROM run_command WHERE command_id = %s",
+                (_LEGACY_COMMAND_ID,),
+            )
+            command = cursor.fetchone()
+            cursor.execute(
+                "SELECT pg_get_functiondef(to_regprocedure(%s))",
+                (_PROVENANCE_WRITER_SIGNATURES[0][0],),
+            )
+            function_definition = cursor.fetchone()
+            cursor.execute(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conrelid = 'run_command'::regclass "
+                "AND conname = 'run_command_consumed_provenance_ck'"
+            )
+            constraint_definition = cursor.fetchone()
+    return head, command, function_definition, constraint_definition
+
+
 @pytest.mark.integration
-def test_0003_consumed_rows_survive_upgrade_downgrade_upgrade_without_forged_provenance() -> None:
+def test_migration_report_round_trip_isolated_and_temporary_database_removed(tmp_path: Path) -> None:
+    database_url = _migration_url()
+    before = _migration_report_database_names(database_url)
+    output = tmp_path / "migrations.json"
+
+    migration_report.write_report(
+        _PROJECT_ROOT,
+        output,
+        database_url=database_url.render_as_string(hide_password=False),
+    )
+
+    assert _migration_report_database_names(database_url) == before
+    assert migration_report.TEMPORARY_DATABASE_PREFIX not in output.read_text()
+
+
+@pytest.mark.integration
+def test_live_downgrade_rejects_consumed_command_before_any_ddl() -> None:
     with _temporary_database() as database_url:
         _run_alembic(database_url, "upgrade", "ws3_execution_driver")
         _seed_0003_consumed_command(database_url)
-
         _run_alembic(database_url, "upgrade", "head")
         _assert_head_legacy_semantics(database_url)
+        before = _downgrade_snapshot(database_url)
 
-        _run_alembic(database_url, "downgrade", "ws3_execution_driver")
-        with psycopg.connect(_raw_url(database_url)) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT status FROM run_command WHERE command_id = %s", (_LEGACY_COMMAND_ID,))
-                assert cursor.fetchone() == ("consumed",)
-                cursor.execute(
-                    "SELECT count(*) FROM information_schema.columns "
-                    "WHERE table_schema = 'public' AND table_name = 'run_command' "
-                    "AND column_name LIKE 'consumed_%'"
-                )
-                assert cursor.fetchone() == (0,)
+        result = _invoke_alembic(database_url, "downgrade", "base")
 
-        _run_alembic(database_url, "upgrade", "head")
-        _assert_head_legacy_semantics(database_url)
+        assert result.returncode != 0
+        assert "WS3_DOWNGRADE_INCOMPATIBLE_LIVE_DATA" in result.stderr
+        assert _downgrade_snapshot(database_url) == before
 
 
 @pytest.mark.integration

@@ -5064,7 +5064,7 @@ async def test_cancel_data_bearing_downgrade_fails_closed_before_ddl() -> None:
             check=False,
         )
         assert result.returncode != 0
-        assert "cancel artifacts require operator data migration" in (result.stdout + result.stderr)
+        assert "WS3_DOWNGRADE_INCOMPATIBLE_LIVE_DATA" in (result.stdout + result.stderr)
         async with owner_engine.connect() as connection:
             after = (
                 await connection.execute(
@@ -6633,7 +6633,11 @@ async def test_checkpoint_commit_then_worker_crash_allows_takeover_consume_witho
     driver = PostgresExecutionDriver(async_sessionmaker(runtime_engine, expire_on_commit=False))
     raw_url = runtime_url.replace("postgresql+psycopg://", "postgresql://", 1)
     try:
-        old_claim = await driver.claim("crashed-worker", runtime_hash, tenant_id, 0.1)
+        # The checkpoint commit must happen while the original claim is valid;
+        # the crash window begins only after that durable write.  A 100 ms
+        # lease made this test depend on host load and could expire during the
+        # connection/checkpoint setup itself.
+        old_claim = await driver.claim("crashed-worker", runtime_hash, tenant_id, 5.0)
         assert old_claim is not None
         config = cast(
             RunnableConfig,
@@ -6651,7 +6655,7 @@ async def test_checkpoint_commit_then_worker_crash_allows_takeover_consume_witho
             )
         assert before_takeover == 1
 
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(5.1)
         new_claim = await driver.claim("reclaimed-worker", runtime_hash, tenant_id, 10)
         assert new_claim is not None
         assert new_claim.execution_fence == old_claim.execution_fence + 1

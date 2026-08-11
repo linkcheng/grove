@@ -37,7 +37,51 @@ cleanup() {
     printf 'integration cleanup could not remove compose resources\n' >&2
   fi
 }
+
+migration_failure_is_retryable() {
+  local failure="$1"
+  case "$failure" in
+    *"SQLSTATE 08"* | *"connection refused"* | *"could not connect to server"* | \
+      *"server closed the connection unexpectedly"* | *"connection reset by peer"* | \
+      *"the database system is starting up"* | *"SQLSTATE 57P03"* | \
+      *"lock timeout"* | *"SQLSTATE 55P03"* | *"could not obtain lock"*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+run_migration_with_retry() {
+  local label="$1"
+  shift
+  local attempt output status
+  for attempt in 1 2 3 4 5; do
+    status=0
+    output="$("$@" 2>&1)" || status=$?
+    if [[ "$status" == "0" ]]; then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    printf '%s\n' "$output" >&2
+    if ! migration_failure_is_retryable "$output"; then
+      printf '%s failed deterministically; retry suppressed\n' "$label" >&2
+      return "$status"
+    fi
+    if [[ "$attempt" == "5" ]]; then
+      printf '%s exhausted transient retry limit\n' "$label" >&2
+      return "$status"
+    fi
+    sleep 1
+  done
+}
+
 if [[ "${GROVE_INTEGRATION_LIBRARY:-0}" != "1" ]]; then
+  resolved_postgres_image_ref="$(docker image inspect pgvector-postgis:pg16 --format '{{.Id}}')"
+  if [[ ! "$resolved_postgres_image_ref" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    printf 'PostgreSQL test image did not resolve to an immutable sha256 image ID\n' >&2
+    exit 1
+  fi
+  export GROVE_POSTGRES_IMAGE_ID="$resolved_postgres_image_ref"
   trap cleanup EXIT
 fi
 
@@ -233,20 +277,37 @@ mkdir -p ci-evidence
 # entire evidence tree world-writable so the container can write CAS
 # artifacts, temp files, and subdirectories.
 chmod -R a+rwX ci-evidence
-migration_ok=0
-for _attempt in $(seq 1 60); do
-  if "${compose[@]}" run --rm \
+run_migration_report() {
+  "${compose[@]}" run --rm \
     -e GROVE_DATABASE_URL=postgresql+psycopg://grove_migration:grove_migration_ws0@db:5432/grove \
     -e PGCONNECT_TIMEOUT=10 \
     -e PGOPTIONS='-c statement_timeout=60000 -c lock_timeout=30000' \
-    api sh -c 'umask 0000 && python scripts/migration_report.py --output /app/ci-evidence/migrations.json'; then
-    migration_ok=1
-    break
-  fi
-  sleep 1
-done
+    api sh -c 'umask 0000 && python scripts/migration_report.py --output /app/ci-evidence/migrations.json'
+}
+
+upgrade_integration_database() {
+  "${compose[@]}" run --rm \
+    -e GROVE_DATABASE_URL=postgresql+psycopg://grove_migration:grove_migration_ws0@db:5432/grove \
+    -e PGCONNECT_TIMEOUT=10 \
+    -e PGOPTIONS='-c statement_timeout=60000 -c lock_timeout=30000' \
+    api python -m alembic upgrade head
+}
+
+migration_ok=0
+if run_migration_with_retry "migration report" run_migration_report; then
+  migration_ok=1
+fi
 if [[ "$migration_ok" != "1" ]]; then
-  printf 'migration report did not complete within the bounded retry window\n' >&2
+  printf 'migration report did not complete within the classified retry window\n' >&2
+  exit 1
+fi
+
+integration_upgrade_ok=0
+if run_migration_with_retry "integration database upgrade" upgrade_integration_database; then
+  integration_upgrade_ok=1
+fi
+if [[ "$integration_upgrade_ok" != "1" ]]; then
+  printf 'integration database upgrade did not complete within the classified retry window\n' >&2
   exit 1
 fi
 
@@ -342,7 +403,7 @@ GROVE_API_BASE_URL="http://127.0.0.1:${host_api_port}" \
 uv run pytest tests/integration -m integration -ra
 
 app_image_id="$(docker image inspect grove-ws0:local --format '{{.Id}}')"
-postgres_image_id="$(docker image inspect pgvector-postgis:pg16 --format '{{.Id}}')"
+postgres_image_id="$(docker image inspect "$GROVE_POSTGRES_IMAGE_ID" --format '{{.Id}}')"
 GROVE_APP_IMAGE_ID="$app_image_id" GROVE_POSTGRES_IMAGE_ID="$postgres_image_id" make manifest-check
 manifest_dirty="$(uv run python -c 'import json, sys; print(str(json.load(open(sys.argv[1]))["source"]["dirty"]).lower())' ci-evidence/runtime-build-manifest.json)"
 case "$manifest_dirty" in

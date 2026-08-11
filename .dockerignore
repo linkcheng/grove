@@ -36,3 +36,4 @@ Makefile
 compose.yaml
 scripts/*
 !scripts/migration_report.py
+!scripts/ws3_downgrade.py

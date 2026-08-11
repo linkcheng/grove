@@ -6,11 +6,17 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import signal
 import subprocess
 import sys
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
+from types import FrameType
 from typing import Any, cast
 
 import psycopg
@@ -50,9 +56,12 @@ from app.build.manifest import (
     write_content_addressed_artifact,
 )
 from app.core.config import load_settings
+from psycopg import sql
+from sqlalchemy.engine import make_url
 
 ROUND_TRIP = ("upgrade head", "downgrade base", "upgrade head")
 MIGRATION_TIMEOUT_SECONDS = 30
+TEMPORARY_DATABASE_PREFIX = "grove_migration_report_"
 EXPECTED_BUSINESS_RELATIONS = WS2_BUSINESS_RELATIONS
 _WS3_TRIGGER_CATALOG_SQL = """
     SELECT n.nspname, c.relname, t.tgname, t.tgenabled, pg_get_triggerdef(t.oid, true),
@@ -142,6 +151,10 @@ _WS3_TRIGGER_TARGET_FAMILY_SQL = """
 
 class MigrationReportError(RuntimeError):
     """Raised when live database evidence does not match the baseline contract."""
+
+
+class MigrationCancelled(MigrationReportError):
+    """Raised on SIGINT/SIGTERM so temporary database cleanup still runs."""
 
 
 def _legacy_acl_items(value: object) -> list[str]:
@@ -277,13 +290,17 @@ def _function_facts(
     }
 
 
-def run_migration(root: Path, command: str) -> None:
-    """Run one Alembic command against the configured database."""
+def run_migration(root: Path, command: str, database_url: str) -> None:
+    """Run one Alembic command against the isolated migration database."""
 
     revision, target = command.split(" ", maxsplit=1)
+    child_env = {name: value for name, value in os.environ.items() if not name.startswith("GROVE_")}
+    child_env["GROVE_DATABASE_URL"] = database_url
+    child_env["GROVE_ROLE"] = "api"
     subprocess.run(  # noqa: S603
         [sys.executable, "-m", "alembic", revision, target],
         cwd=root,
+        env=child_env,
         check=True,
         timeout=MIGRATION_TIMEOUT_SECONDS,
     )
@@ -291,6 +308,96 @@ def run_migration(root: Path, command: str) -> None:
 
 def _psycopg_url(url: str) -> str:
     return url.replace("postgresql+psycopg://", "postgresql://", 1)
+
+
+def _admin_database_url(database_url: str) -> str:
+    configured = make_url(database_url)
+    if not configured.drivername.startswith("postgresql"):
+        raise MigrationReportError("migration database URL must use PostgreSQL")
+    return configured.set(database="postgres").render_as_string(hide_password=False)
+
+
+def _temporary_database_url(database_url: str, database_name: str) -> str:
+    return make_url(database_url).set(database=database_name).render_as_string(hide_password=False)
+
+
+def _create_temporary_database(database_url: str) -> tuple[str, str]:
+    database_name = f"{TEMPORARY_DATABASE_PREFIX}{uuid.uuid4().hex}"
+    admin_url = _admin_database_url(database_url)
+    with psycopg.connect(_psycopg_url(admin_url), connect_timeout=10, autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(sql.SQL("CREATE DATABASE {} OWNER grove").format(sql.Identifier(database_name)))
+    return database_name, _temporary_database_url(database_url, database_name)
+
+
+def _drop_temporary_database(database_url: str, database_name: str) -> None:
+    if not re.fullmatch(rf"{TEMPORARY_DATABASE_PREFIX}[0-9a-f]{{32}}", database_name):
+        raise MigrationReportError("temporary migration database name failed the strict cleanup guard")
+    admin_url = _admin_database_url(database_url)
+    with psycopg.connect(_psycopg_url(admin_url), connect_timeout=10, autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(sql.SQL("REVOKE CONNECT ON DATABASE {} FROM PUBLIC").format(sql.Identifier(database_name)))
+            cursor.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()",
+                (database_name,),
+            )
+            cursor.execute(sql.SQL("DROP DATABASE {}").format(sql.Identifier(database_name)))
+
+
+def _initialize_temporary_database(database_url: str) -> None:
+    """Install the same fixed PostgreSQL capability baseline as the integration database."""
+
+    database_name = make_url(database_url).database
+    if database_name is None or not re.fullmatch(rf"{TEMPORARY_DATABASE_PREFIX}[0-9a-f]{{32}}", database_name):
+        raise MigrationReportError("temporary migration database URL failed the strict initialization guard")
+    with psycopg.connect(_psycopg_url(database_url), connect_timeout=10, autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SET ROLE grove")
+            try:
+                cursor.execute("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
+                cursor.execute(
+                    sql.SQL(
+                        "GRANT CONNECT ON DATABASE {} TO grove_api, grove_runtime, "
+                        "grove_projection, grove_governance, grove_migration"
+                    ).format(sql.Identifier(database_name))
+                )
+                cursor.execute(
+                    "GRANT USAGE ON SCHEMA public TO grove_api, grove_runtime, grove_projection, grove_governance"
+                )
+                cursor.execute("GRANT USAGE, CREATE ON SCHEMA public TO grove_migration")
+                cursor.execute("CREATE EXTENSION postgis")
+                cursor.execute("CREATE EXTENSION vector")
+            finally:
+                cursor.execute("RESET ROLE")
+
+
+@contextmanager
+def temporary_migration_database(database_url: str) -> Iterator[str]:
+    """Create and always remove one strictly named migration-report database."""
+
+    database_name, temporary_url = _create_temporary_database(database_url)
+    try:
+        _initialize_temporary_database(temporary_url)
+        yield temporary_url
+    finally:
+        _drop_temporary_database(database_url, database_name)
+
+
+@contextmanager
+def _cancel_as_migration_error() -> Iterator[None]:
+    previous: dict[signal.Signals, Any] = {}
+
+    def cancel(signum: int, _frame: FrameType | None) -> None:
+        raise MigrationCancelled(f"migration report cancelled by signal {signum}")
+
+    for current_signal in (signal.SIGINT, signal.SIGTERM):
+        previous[current_signal] = signal.getsignal(current_signal)
+        signal.signal(current_signal, cancel)
+    try:
+        yield
+    finally:
+        for current_signal, handler in previous.items():
+            signal.signal(current_signal, handler)
 
 
 def _database_state_impl(database_url: str | None = None) -> tuple[str, list[str]]:
@@ -1708,7 +1815,13 @@ def _ws3_database_state_impl(database_url: str | None = None) -> dict[str, objec
                  GROUP BY d.datname
                 """
             )
-            database_acl_entries = {str(row[0]): _canonical_acl_entries(row[1]) for row in cursor.fetchall()}
+            database_acl_rows = cursor.fetchall()
+            if len(database_acl_rows) != 1:
+                raise MigrationReportError("authority database ACL identity is ambiguous")
+            # migration-report databases use a random physical name for
+            # concurrency and cleanup safety.  The canonical evidence keeps
+            # the fixed logical database identity and never leaks that name.
+            database_acl_entries = {"grove": _canonical_acl_entries(database_acl_rows[0][1])}
             authority_acl = {
                 "table": table_acl_entries,
                 "column": column_acl_entries,
@@ -2028,79 +2141,82 @@ def ws3_database_state(database_url: str | None = None) -> dict[str, object]:
         raise MigrationReportError(f"catalog database operation failed{state_suffix}") from exc
 
 
-def write_report(root: Path, output: Path) -> None:
-    for command in ROUND_TRIP:
-        run_migration(root, command)
-    head, business_tables = database_state()
+def write_report(root: Path, output: Path, *, database_url: str | None = None) -> None:
+    configured_url = load_settings().database_url_value() if database_url is None else database_url
     expected_head = migration_head(root)
-    if head != expected_head:
-        raise MigrationReportError(f"database head {head!r} does not match Alembic graph head {expected_head!r}")
-    # Keep the historical baseline unit fixture usable while enforcing an
-    # exact relation set for the WS-2 graph used by real evidence.
-    if expected_head == "ws2_tenant_commands" and set(business_tables) != EXPECTED_BUSINESS_RELATIONS:
-        raise MigrationReportError(
-            "non-infrastructure relation set does not match WS-2 contract: "
-            f"expected={sorted(EXPECTED_BUSINESS_RELATIONS)!r}, actual={business_tables!r}"
-        )
-    if (
-        expected_head in {"ws3_cancel_acceptance", "ws3_dead_letter_reconciliation", "ws3_execution_authority_closure"}
-        and set(business_tables) != WS3_BUSINESS_RELATIONS
-    ):
-        raise MigrationReportError(
-            "checkpoint relation set does not match WS-3 contract: "
-            f"expected={sorted(WS3_BUSINESS_RELATIONS)!r}, actual={business_tables!r}"
-        )
-    if expected_head in WS4_MIGRATION_HEADS and set(business_tables) != WS4_BUSINESS_RELATIONS:
-        raise MigrationReportError(
-            "observation relation set does not match WS-4 contract: "
-            f"expected={sorted(WS4_BUSINESS_RELATIONS)!r}, actual={business_tables!r}"
-        )
-    ws3_schema: dict[str, object] | None = None
-    schema_contract_version = "ws2-tenant-commands"
-    if (
-        expected_head
-        in {
-            "ws3_execution_driver",
-            "ws3_checkpoint_fenced",
-            "ws3_cancel_acceptance",
-            "ws3_dead_letter_reconciliation",
-            "ws3_execution_authority_closure",
-            "ws3_runtime_worker_delivery",
+    with temporary_migration_database(configured_url) as temporary_url:
+        for command in ROUND_TRIP:
+            run_migration(root, command, temporary_url)
+        head, business_tables = database_state(temporary_url)
+        if head != expected_head:
+            raise MigrationReportError(f"database head {head!r} does not match Alembic graph head {expected_head!r}")
+        # Keep the historical baseline unit fixture usable while enforcing an
+        # exact relation set for the WS-2 graph used by real evidence.
+        if expected_head == "ws2_tenant_commands" and set(business_tables) != EXPECTED_BUSINESS_RELATIONS:
+            raise MigrationReportError(
+                "non-infrastructure relation set does not match WS-2 contract: "
+                f"expected={sorted(EXPECTED_BUSINESS_RELATIONS)!r}, actual={business_tables!r}"
+            )
+        if (
+            expected_head
+            in {"ws3_cancel_acceptance", "ws3_dead_letter_reconciliation", "ws3_execution_authority_closure"}
+            and set(business_tables) != WS3_BUSINESS_RELATIONS
+        ):
+            raise MigrationReportError(
+                "checkpoint relation set does not match WS-3 contract: "
+                f"expected={sorted(WS3_BUSINESS_RELATIONS)!r}, actual={business_tables!r}"
+            )
+        if expected_head in WS4_MIGRATION_HEADS and set(business_tables) != WS4_BUSINESS_RELATIONS:
+            raise MigrationReportError(
+                "observation relation set does not match WS-4 contract: "
+                f"expected={sorted(WS4_BUSINESS_RELATIONS)!r}, actual={business_tables!r}"
+            )
+        ws3_schema: dict[str, object] | None = None
+        schema_contract_version = "ws2-tenant-commands"
+        if (
+            expected_head
+            in {
+                "ws3_execution_driver",
+                "ws3_checkpoint_fenced",
+                "ws3_cancel_acceptance",
+                "ws3_dead_letter_reconciliation",
+                "ws3_execution_authority_closure",
+                "ws3_runtime_worker_delivery",
+            }
+            or expected_head in WS4_MIGRATION_HEADS
+        ):
+            schema_contract_version = WS3_SCHEMA_CONTRACT_VERSION
+            ws3_schema = ws3_database_state(temporary_url)
+            if ws3_schema != WS3_SCHEMA_CONTRACT:
+                raise MigrationReportError("live WS-3 schema does not match the fixed schema contract")
+        catalog_authority: dict[str, object] | None = None
+        if expected_head == "ws3_execution_authority_closure":
+            catalog_authority = catalog_authority_state(temporary_url)
+        report: dict[str, object] = {
+            "head": head,
+            "migration_hash": migration_hash(root),
+            "business_tables": business_tables,
+            "infrastructure_tables": sorted(WS3_INFRASTRUCTURE_RELATIONS)
+            if expected_head
+            in {
+                "ws3_checkpoint_fenced",
+                "ws3_cancel_acceptance",
+                "ws3_dead_letter_reconciliation",
+                "ws3_execution_authority_closure",
+                "ws3_runtime_worker_delivery",
+            }
+            or expected_head in WS4_MIGRATION_HEADS
+            else [],
+            "round_trip": list(ROUND_TRIP),
+            "schema_contract_version": schema_contract_version,
+            "status": "completed",
         }
-        or expected_head in WS4_MIGRATION_HEADS
-    ):
-        schema_contract_version = WS3_SCHEMA_CONTRACT_VERSION
-        ws3_schema = ws3_database_state()
-        if ws3_schema != WS3_SCHEMA_CONTRACT:
-            raise MigrationReportError("live WS-3 schema does not match the fixed schema contract")
-    catalog_authority: dict[str, object] | None = None
-    if expected_head == "ws3_execution_authority_closure":
-        catalog_authority = catalog_authority_state()
-    report: dict[str, object] = {
-        "head": head,
-        "migration_hash": migration_hash(root),
-        "business_tables": business_tables,
-        "infrastructure_tables": sorted(WS3_INFRASTRUCTURE_RELATIONS)
-        if expected_head
-        in {
-            "ws3_checkpoint_fenced",
-            "ws3_cancel_acceptance",
-            "ws3_dead_letter_reconciliation",
-            "ws3_execution_authority_closure",
-            "ws3_runtime_worker_delivery",
-        }
-        or expected_head in WS4_MIGRATION_HEADS
-        else [],
-        "round_trip": list(ROUND_TRIP),
-        "schema_contract_version": schema_contract_version,
-        "status": "completed",
-    }
-    if ws3_schema is not None:
-        report["ws3_schema"] = ws3_schema
-    if catalog_authority is not None:
-        report["catalog_authority"] = catalog_authority
-    payload = (json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    write_content_addressed_artifact(output, payload)
+        if ws3_schema is not None:
+            report["ws3_schema"] = ws3_schema
+        if catalog_authority is not None:
+            report["catalog_authority"] = catalog_authority
+        payload = (json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        write_content_addressed_artifact(output, payload)
 
 
 def main() -> int:
@@ -2109,7 +2225,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("ci-evidence/migrations.json"))
     args = parser.parse_args()
     try:
-        write_report(args.root.resolve(), args.output)
+        with _cancel_as_migration_error():
+            write_report(args.root.resolve(), args.output)
     except (
         MigrationReportError,
         OSError,

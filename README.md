@@ -102,9 +102,12 @@ WS-0 是可重复构建、迁移和启动的工程基线，不是 Core/Product r
 Contract Spine 或任何业务 Profile。它使用 Python 3.12.12、uv、FastAPI、Pydantic
 v2、SQLAlchemy async、Alembic 和 PostgreSQL；Vue 前端留到 WS-4 契约稳定后。
 
-本地先准备 `pgvector-postgis:pg16` 镜像，然后运行：
+本地先准备 composite PostgreSQL 镜像，并在 Compose 启动前把它解析为不可变
+`sha256:` image ID：
 
 ```bash
+bash scripts/prepare_ci_postgres_image.sh
+export GROVE_POSTGRES_IMAGE_ID="$(docker image inspect pgvector-postgis:pg16 --format '{{.Id}}')"
 uv sync --frozen
 make verify
 make manifest-check
@@ -122,5 +125,11 @@ Compose 固定项目名 `grove-ws0-test`，四个角色共用一个应用镜像�
 CAS evidence 和严格 release gate。签名状态
 明确为 `not_configured`，DBOS capability 明确为 disabled。
 
-本地卷若出现 PostgreSQL collation 警告，不影响现有 WS-0 检查；正式 clean-room
-验收应使用全新的 `grove-ws0-test` volume，验收脚本不会删除既有数据。
+`migration_report.py` 只在严格命名的一次性数据库中执行
+`upgrade head → downgrade base → upgrade head`，integration 主库只做 roll-forward。
+含运行数据的数据库不得直接执行 Alembic downgrade；运维入口固定为
+`scripts/ws3_downgrade.py`，不兼容数据会在任何 DDL 前以
+`WS3_DOWNGRADE_INCOMPATIBLE_LIVE_DATA` 拒绝。
+
+本地可销毁测试卷若出现 PostgreSQL collation 版本漂移，应在确认目标后重建 fresh
+volume。不要只执行 `REFRESH COLLATION VERSION`；未重建相关索引时它会掩盖不一致。
