@@ -36,7 +36,8 @@ RUN --mount=type=bind,target=/context,ro \
 RUN uv sync --frozen --no-dev --no-editable --no-cache \
     && find /app/.venv -name uv_cache.json -type f -delete \
     && find /app/.venv -name RECORD -type f -exec sed -i '/uv_cache.json/d' {} + \
-    && chown -R grove:grove /app \
+    && chown -R root:root /app \
+    && chmod -R a-w /app \
     && find /app -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 USER grove

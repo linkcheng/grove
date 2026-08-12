@@ -16,6 +16,13 @@ def test_application_container_is_non_root() -> None:
     assert "USER grove" in dockerfile
 
 
+def test_application_and_cleanroom_verifier_code_are_not_writable_by_runtime_user() -> None:
+    dockerfile = Path("Dockerfile").read_text()
+    assert "chown -R root:root /app" in dockerfile
+    assert "chmod -R a-w /app" in dockerfile
+    assert "chown -R grove:grove /app" not in dockerfile
+
+
 def test_docker_build_context_excludes_non_runtime_files() -> None:
     patterns = {
         line.strip()

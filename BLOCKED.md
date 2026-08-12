@@ -51,24 +51,40 @@ WS-3 Durable Execution 与 WS-4 Observation Slice 均无未关闭的实现阻塞
   `docs/archive/BLOCKED_catalog_authority_history_202608.md`；它是 G0 漂移检测工具，不是
   N-25/WS-3 或 WS-4 release gate。
 
-## WS-5 Core Release Proof 检查点 1：release authority blocker 已解除（2026-08-12）
+## WS-5 Core Release Proof 检查点 1：release authority blocker 已 supersede（2026-08-12）
 
 - 原 blocker 不是过期记录：旧入口允许同一调用方整体替换 candidate、expected facts、policy、
   root、issuer 与 anchor，并在重算普通 hash 后完成整体重锚。
 - Authority owner 已由任务书明确为 Build/Release pipeline；旧记录中“authority owner 未明确”的
   表述不准确。实际缺口是 cleanroom 加载协议、不可由 candidate 覆盖的 root/policy pins、签名、
   key rotation 与 revocation 语义。
-- 当前公开入口只从受保护部署配置取得 root public-key SHA-256、精确 policy ref/version/SHA-256，
-  并从单一只读 authority mount 读取 root public key、canonical trust-policy bytes 与 root
-  signature；candidate、Manifest、facts 和 verifier 参数均不能覆盖这些值。
+- 后续复审证明本检查点仍错误地把 Python private loader、module seal 与进程内 authority cache 当作
+  安全边界；同解释器代码可整体替换它们，缓存 authority 还会延迟 issuer revocation。本段原
+  “blocker 已解除”结论作废，由下方检查点 2 取代。
 - Trust policy 由 Ed25519 root key 签署并固定完整 issuer key；active issuer 使用独立 domain
   separation 签署 exact canonical expected-facts bytes。策略支持 active/revoked 状态与
   vN → vN+1 重叠 → vN+2 吊销轮换，禁止 moving ref、latest 或旧 policy fallback。
 - 所有导出 JSON reader 统一执行大小、深度、节点数、duplicate-key 与 canonical bytes 检查；ref
   使用正向 grammar 拒绝空、dot、尾随和 moving-alias 变体；identity、expected-facts、trust-policy、
   authority-policy 四类文档均冻结完整 golden bytes/hash。
-- 当前验证：release authority 专项 `85 passed`；`make verify` 为 `884 passed`、`153 deselected`，
+- 当时验证：release authority 专项 `85 passed`；`make verify` 为 `884 passed`、`153 deselected`，
   coverage `89.13%`。固定 cleanroom pins 后，整体重锚、替换 root/issuer、自签 policy、facts
   篡改重算 hash、revoked/unlisted/wrong-key、cross-domain signature 均 fail closed。
-- 本检查点只解除 WS-5 release identity authority seam 的结构性 blocker，不形成 Core、Product、
-  staging 或 production release，也不标记 WS-5 `verified`；其余 WS-5/IAR/Gate 验收仍独立执行。
+- 上述旧测试结果不能覆盖同进程整体重锚，因此本检查点不再解除 WS-5 release identity authority
+  seam；它未形成 Core、Product、staging 或 production release，也未标记 WS-5 `verified`。
+
+## WS-5 Core Release Proof 检查点 2：进程级 authority seam（2026-08-12）
+
+- 生产 authority object、纯 bytes loader、module seal 和全局 cache 已删除；`app.releases` 只保留
+  canonical contracts。生产唯一入口改为无 plugin 的一次性 isolated cleanroom CLI；runtime image
+  中 verifier source/dependencies 为 root-owned 且对运行用户不可写。
+- Build/Release supervisor 传入预打开 authority directory FD、三个输入 FD 和四个独立 pins；verifier
+  不接受 mount path，因此不解析中间目录 symlink。authority 固定文件相对 dirfd 使用
+  `openat(O_NOFOLLOW)`，每次调用重新完整读取并验证当前 policy/signature/revocation。
+- ref 使用总长 512、segment 128 的有界正向 grammar；moving aliases 后追加 `+ - _ . / @ :` 的等价族
+  均拒绝。canonical reader 在退出 `except` 后抛稳定错误，完整 `cause/context` 链和 traceback 不含输入。
+- 当前验证：release authority 专项 `58 passed`；`make verify` 为 `858 passed`、`153 deselected`，
+  coverage `89.26%`；最终 runtime image 构建成功，运行用户不能写 verifier/source/site-packages，
+  isolated verifier 与普通应用入口均可从该镜像加载。
+- 本检查点仍不形成 Core、Product、staging 或 production release，也不标记 WS-5 `verified`；只有
+  独立复审与完整门禁均通过后才能把本进程级 seam 作为后续 WS-5 验收输入。

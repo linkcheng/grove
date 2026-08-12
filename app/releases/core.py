@@ -1,27 +1,19 @@
-"""WS-5 Core release identity and cleanroom authority verification.
+"""WS-5 canonical release contracts shared with the cleanroom verifier.
 
-The release candidate and expected-facts document are untrusted inputs.  The
-only trust entry is :func:`load_verified_release_authority`, which reads exact
-root/policy pins from protected cleanroom configuration and exact signed
-material from a read-only authority mount.
+This module intentionally contains no authority loader or verification object.
+Production verification runs only in the one-shot isolated cleanroom CLI so
+candidate/plugin code never shares the verifier's Python module state.
 """
 
 from __future__ import annotations
 
-import os
 import re
-import stat
 from base64 import urlsafe_b64decode, urlsafe_b64encode
-from dataclasses import dataclass
 from enum import StrEnum
 from hashlib import sha256
 from json import JSONDecodeError, loads
-from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal, Self, cast
-from weakref import WeakKeyDictionary
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import BaseModel, BeforeValidator, ConfigDict, ValidationError, model_validator
 
 from app.contracts.canonical import canonical_bytes as canonical_contract_bytes
@@ -39,15 +31,6 @@ FACTS_SIGNATURE_SCHEMA_VERSION: Literal["core-release-expected-facts-signature.v
 POLICY_SIGNATURE_DOMAIN = b"GROVE-WS5-AUTHORITY-POLICY\0"
 EXPECTED_FACTS_DOMAIN = b"GROVE-WS5-EXPECTED-FACTS\0"
 
-AUTHORITY_MOUNT_ENV = "GROVE_RELEASE_AUTHORITY_MOUNT"
-ROOT_PUBLIC_KEY_SHA256_ENV = "GROVE_RELEASE_ROOT_PUBLIC_KEY_SHA256"
-EXPECTED_POLICY_REF_ENV = "GROVE_RELEASE_EXPECTED_POLICY_REF"
-EXPECTED_POLICY_VERSION_ENV = "GROVE_RELEASE_EXPECTED_POLICY_VERSION"
-EXPECTED_POLICY_SHA256_ENV = "GROVE_RELEASE_EXPECTED_POLICY_SHA256"
-ROOT_PUBLIC_KEY_FILE = "root-public-key.bin"
-TRUST_POLICY_FILE = "trust-policy.json"
-POLICY_SIGNATURE_FILE = "policy-signature.json"
-
 MAX_IDENTITY_BYTES = 256 * 1024
 MAX_EXPECTED_FACTS_BYTES = 256 * 1024
 MAX_TRUST_POLICY_BYTES = 64 * 1024
@@ -55,6 +38,8 @@ MAX_AUTHORITY_POLICY_BYTES = 8 * 1024
 MAX_SIGNATURE_ENVELOPE_BYTES = 8 * 1024
 MAX_JSON_DEPTH = 32
 MAX_JSON_NODES = 4096
+MAX_REF_LENGTH = 512
+MAX_REF_SEGMENT_LENGTH = 128
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -67,7 +52,6 @@ _MOVING_ALIASES = frozenset(
     {"latest", "main", "master", "stable", "current", "head", "release", "dev", "develop", "trunk"}
 )
 _INVALID_CANONICAL_DOCUMENT = "invalid_canonical_release_document"
-_AUTHORITY_SEAL = object()
 
 
 class ReleaseIdentityErrorCode(StrEnum):
@@ -114,16 +98,22 @@ def _exact_sha256(value: object) -> str:
 
 def _exact_ref(value: object) -> str:
     value = _exact_text(value)
+    if len(value) > MAX_REF_LENGTH:
+        raise ValueError("value exceeds the reference length limit")
+    segments = re.split(r"[/@:]", value)
+    if any(not segment or len(segment) > MAX_REF_SEGMENT_LENGTH for segment in segments):
+        raise ValueError("value contains an empty or oversized reference segment")
     if _REF_RE.fullmatch(value) is None:
         raise ValueError("value must use the precise reference grammar")
-    segments = re.split(r"[/@:]", value)
     if any(segment in {".", ".."} or segment.startswith(".") or segment.endswith(".") for segment in segments):
         raise ValueError("value must not contain empty or dot reference segments")
     terminal = segments[-1].lower()
-    terminal_component = re.split(r"[._+\-]", terminal)[-1]
+    terminal_without_suffix = terminal.rstrip("._+-")
+    terminal_components = tuple(part for part in re.split(r"[._+\-]+", terminal_without_suffix) if part)
+    terminal_component = terminal_components[-1] if terminal_components else ""
     if (
         value.lower() in _MOVING_ALIASES
-        or terminal in _MOVING_ALIASES
+        or terminal_without_suffix in _MOVING_ALIASES
         or terminal_component in _MOVING_ALIASES - {"release"}
     ):
         raise ValueError("value must not end in a moving alias")
@@ -154,6 +144,22 @@ def _exact_b64url(value: object) -> str:
     if _B64URL_RE.fullmatch(value) is None or "=" in value:
         raise ValueError("value must be unpadded base64url")
     return value
+
+
+def _decode_base64url(value: str, *, expected_length: int) -> bytes:
+    if type(value) is not str or _B64URL_RE.fullmatch(value) is None or "=" in value:
+        raise ValueError("invalid base64url")
+    raw: bytes | None = None
+    try:
+        raw = urlsafe_b64decode(value + "=" * ((4 - len(value) % 4) % 4))
+    except (ValueError, TypeError):
+        pass
+    if raw is None:
+        raise ValueError("invalid base64url")
+    canonical = urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    if len(raw) != expected_length or canonical != value:
+        raise ValueError("invalid decoded length")
+    return raw
 
 
 def _exact_commit(value: object) -> str:
@@ -252,6 +258,7 @@ def _raise_unsafe_constant(_: str) -> None:
 def _decode_json_document(data: object, *, max_bytes: int) -> object:
     if type(data) is not bytes or not data or len(data) > max_bytes:
         raise ValueError(_INVALID_CANONICAL_DOCUMENT)
+    decoded: object | None = None
     try:
         decoded = loads(
             data.decode("utf-8"),
@@ -269,7 +276,10 @@ def _decode_json_document(data: object, *, max_bytes: int) -> object:
         ValueError,
         _UnsafeReleaseInput,
     ):
-        raise ValueError(_INVALID_CANONICAL_DOCUMENT) from None
+        pass
+    if decoded is None:
+        raise ValueError(_INVALID_CANONICAL_DOCUMENT)
+    return decoded
 
 
 class _ReleaseModel(BaseModel):
@@ -302,13 +312,18 @@ class _ReleaseModel(BaseModel):
     ) -> Self:
         del strict, extra, context, by_alias, by_name
         decoded = _decode_json_document(json_data, max_bytes=cls._max_json_bytes)
+        parsed: Self | None = None
+        canonical = False
         try:
             parsed = cls.model_validate(cls._prepare_json_payload(decoded))
             if _canonical_model_bytes(parsed) != json_data:
                 raise _UnsafeReleaseInput
-            return parsed
+            canonical = True
         except (ValidationError, TypeError, ValueError, _UnsafeReleaseInput):
-            raise ValueError(_INVALID_CANONICAL_DOCUMENT) from None
+            pass
+        if parsed is None or not canonical:
+            raise ValueError(_INVALID_CANONICAL_DOCUMENT)
+        return parsed
 
 
 class ContentAddressedBinding(_ReleaseModel):
@@ -565,6 +580,10 @@ def canonical_signature_envelope_bytes(envelope: ReleaseSignatureEnvelope) -> by
     return _canonical_exact_model(envelope, ReleaseSignatureEnvelope)
 
 
+def canonical_verified_release_identity_bytes(identity: VerifiedReleaseIdentity) -> bytes:
+    return _canonical_exact_model(identity, VerifiedReleaseIdentity)
+
+
 def core_release_identity_hash(candidate: CoreReleaseIdentity) -> str:
     return sha256(canonical_core_release_bytes(candidate)).hexdigest()
 
@@ -632,321 +651,8 @@ def _revalidate_exact_model(model: object, expected_type: type[_ReleaseModel]) -
     return validated
 
 
-def _validated_candidate(candidate: object) -> CoreReleaseIdentity:
-    validated = _try_revalidate_exact_model(candidate, CoreReleaseIdentity)
-    if validated is not None:
-        return cast(CoreReleaseIdentity, validated)
-    code = ReleaseIdentityErrorCode.INVALID_CANDIDATE
-    if type(candidate) is CoreReleaseIdentity:
-        values = object.__getattribute__(candidate, "__dict__")
-        if type(values) is dict:
-            if values.get("business_profile_ref") is not None or values.get("business_profile_hash") is not None:
-                code = ReleaseIdentityErrorCode.BUSINESS_PROFILE_NOT_NULL
-            target = values.get("reference_target")
-            if type(target) is ReferenceTargetBinding:
-                target_values = object.__getattribute__(target, "__dict__")
-                if type(target_values) is dict and target_values.get("target_kind") != "cleanroom_reference":
-                    code = ReleaseIdentityErrorCode.TARGET_NOT_CLEANROOM
-    raise ReleaseIdentityError(code)
-
-
-def _decode_base64url(value: str, *, expected_length: int) -> bytes:
-    if type(value) is not str or _B64URL_RE.fullmatch(value) is None or "=" in value:
-        raise ValueError("invalid base64url")
-    try:
-        raw = urlsafe_b64decode(value + "=" * ((4 - len(value) % 4) % 4))
-    except (ValueError, TypeError):
-        raise ValueError("invalid base64url") from None
-    canonical = urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
-    if len(raw) != expected_length or canonical != value:
-        raise ValueError("invalid decoded length")
-    return raw
-
-
-def _signature_identity(envelope: ReleaseSignatureEnvelope) -> tuple[str, str, str]:
-    return envelope.signer_ref, envelope.signer_version, envelope.key_id
-
-
-def _key_identity(key: SigningKeyIdentity) -> tuple[str, str, str]:
-    return key.ref, key.version, key.key_id
-
-
-class VerifiedReleaseAuthority:
-    """Sealed authority loaded from the cleanroom-owned trust chain."""
-
-    __slots__ = ("__weakref__",)
-
-    def __new__(cls, *, _seal: object) -> VerifiedReleaseAuthority:
-        if _seal is not _AUTHORITY_SEAL:
-            raise TypeError("VerifiedReleaseAuthority is created only by the cleanroom loader")
-        return super().__new__(cls)
-
-    def verify_core_release_identity(
-        self,
-        candidate: CoreReleaseIdentity,
-        expected_facts_bytes: bytes,
-        issuer_signature_bytes: bytes,
-    ) -> VerifiedReleaseIdentity:
-        """Verify only candidate-controlled material against this sealed authority."""
-
-        return _verify_core_release_identity(self, candidate, expected_facts_bytes, issuer_signature_bytes)
-
-
-@dataclass(frozen=True, slots=True)
-class _VerifiedAuthorityState:
-    authority_policy: AuthorityPolicy
-    policy: TrustPolicy
-    policy_bytes: bytes
-
-
-_VERIFIED_AUTHORITY_STATES: WeakKeyDictionary[VerifiedReleaseAuthority, _VerifiedAuthorityState] = WeakKeyDictionary()
-
-
-def _authority_state(authority: object) -> _VerifiedAuthorityState:
-    if type(authority) is not VerifiedReleaseAuthority:
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.POLICY_IDENTITY_MISMATCH)
-    try:
-        state = _VERIFIED_AUTHORITY_STATES.get(authority)
-        if (
-            type(state) is not _VerifiedAuthorityState
-            or type(state.authority_policy) is not AuthorityPolicy
-            or type(state.policy) is not TrustPolicy
-            or type(state.policy_bytes) is not bytes
-            or canonical_trust_policy_bytes(state.policy) != state.policy_bytes
-            or sha256(state.policy_bytes).hexdigest() != state.authority_policy.policy_sha256
-            or state.policy.policy_ref != state.authority_policy.policy_ref
-            or state.policy.policy_version != state.authority_policy.policy_version
-        ):
-            raise _UnsafeReleaseInput
-    except (AttributeError, ReleaseIdentityError, _UnsafeReleaseInput):
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.POLICY_IDENTITY_MISMATCH) from None
-    return state
-
-
-def _load_verified_release_authority_from_bytes(
-    *,
-    authority_policy_bytes: bytes,
-    root_public_key_bytes: bytes,
-    trust_policy_bytes: bytes,
-    policy_signature_bytes: bytes,
-) -> VerifiedReleaseAuthority:
-    """Private pure helper behind the cleanroom file loader."""
-
-    try:
-        authority_policy = AuthorityPolicy.model_validate_json(authority_policy_bytes)
-    except ValueError:
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.POLICY_IDENTITY_MISMATCH) from None
-    if type(root_public_key_bytes) is not bytes or len(root_public_key_bytes) != 32:
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.ROOT_PIN_MISMATCH)
-    if sha256(root_public_key_bytes).hexdigest() != authority_policy.root_public_key_sha256:
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.ROOT_PIN_MISMATCH)
-    try:
-        policy = TrustPolicy.model_validate_json(trust_policy_bytes)
-    except ValueError:
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.POLICY_IDENTITY_MISMATCH) from None
-    if (
-        sha256(trust_policy_bytes).hexdigest() != authority_policy.policy_sha256
-        or policy.policy_ref != authority_policy.policy_ref
-        or policy.policy_version != authority_policy.policy_version
-        or policy.root_key.public_key_sha256 != authority_policy.root_public_key_sha256
-    ):
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.POLICY_IDENTITY_MISMATCH)
-    try:
-        envelope = ReleaseSignatureEnvelope.model_validate_json(policy_signature_bytes)
-        if envelope.schema_version != POLICY_SIGNATURE_SCHEMA_VERSION:
-            raise _UnsafeReleaseInput
-        if _signature_identity(envelope) != _key_identity(policy.root_key):
-            raise _UnsafeReleaseInput
-        Ed25519PublicKey.from_public_bytes(root_public_key_bytes).verify(
-            _decode_base64url(envelope.signature, expected_length=64),
-            POLICY_SIGNATURE_DOMAIN + trust_policy_bytes,
-        )
-    except (ValueError, InvalidSignature, _UnsafeReleaseInput):
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.POLICY_SIGNATURE_INVALID) from None
-    authority = VerifiedReleaseAuthority(_seal=_AUTHORITY_SEAL)
-    _VERIFIED_AUTHORITY_STATES[authority] = _VerifiedAuthorityState(authority_policy, policy, trust_policy_bytes)
-    return authority
-
-
-def _read_mount_file(directory_fd: int, name: str, *, max_bytes: int) -> bytes:
-    file_fd: int | None = None
-    try:
-        file_fd = os.open(
-            name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=directory_fd,
-        )
-        file_stat = os.fstat(file_fd)
-        if (
-            not stat.S_ISREG(file_stat.st_mode)
-            or file_stat.st_mode & 0o222
-            or file_stat.st_size <= 0
-            or file_stat.st_size > max_bytes
-        ):
-            raise _UnsafeReleaseInput
-        chunks: list[bytes] = []
-        remaining = file_stat.st_size
-        while remaining:
-            chunk = os.read(file_fd, remaining)
-            if not chunk:
-                raise _UnsafeReleaseInput
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        if os.read(file_fd, 1):
-            raise _UnsafeReleaseInput
-        final_stat = os.fstat(file_fd)
-        if (
-            final_stat.st_dev != file_stat.st_dev
-            or final_stat.st_ino != file_stat.st_ino
-            or final_stat.st_size != file_stat.st_size
-            or final_stat.st_mtime_ns != file_stat.st_mtime_ns
-            or final_stat.st_ctime_ns != file_stat.st_ctime_ns
-        ):
-            raise _UnsafeReleaseInput
-        data = b"".join(chunks)
-        if len(data) != file_stat.st_size:
-            raise _UnsafeReleaseInput
-        return data
-    except (OSError, ValueError, _UnsafeReleaseInput):
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.EXTERNAL_FACTS_MISSING) from None
-    finally:
-        if file_fd is not None:
-            os.close(file_fd)
-
-
-def load_verified_release_authority() -> VerifiedReleaseAuthority:
-    """Load pinned config values and signed material from the cleanroom.
-
-    The verifier call has no root, policy, issuer-key or hash parameters.  The
-    cleanroom process owner injects all four pins directly as protected deploy
-    configuration and provides one read-only authority mount.  Replacing the
-    mount cannot replace the separately pinned root or exact policy identity.
-    """
-
-    mount_path_value = os.environ.get(AUTHORITY_MOUNT_ENV)
-    pin_values = {
-        "schema_version": AUTHORITY_POLICY_SCHEMA_VERSION,
-        "root_public_key_sha256": os.environ.get(ROOT_PUBLIC_KEY_SHA256_ENV),
-        "policy_ref": os.environ.get(EXPECTED_POLICY_REF_ENV),
-        "policy_version": os.environ.get(EXPECTED_POLICY_VERSION_ENV),
-        "policy_sha256": os.environ.get(EXPECTED_POLICY_SHA256_ENV),
-    }
-    if type(mount_path_value) is not str or any(type(value) is not str for value in pin_values.values()):
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.EXTERNAL_FACTS_MISSING)
-    try:
-        authority_policy = AuthorityPolicy.model_validate(pin_values)
-    except ValidationError:
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.POLICY_IDENTITY_MISMATCH) from None
-    mount_path = Path(mount_path_value)
-    mount_fd: int | None = None
-    try:
-        if not mount_path.is_absolute():
-            raise _UnsafeReleaseInput
-        mount_fd = os.open(mount_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY)
-        mount_stat = os.fstat(mount_fd)
-        if not stat.S_ISDIR(mount_stat.st_mode) or mount_stat.st_mode & 0o222:
-            raise _UnsafeReleaseInput
-    except (OSError, _UnsafeReleaseInput):
-        if mount_fd is not None:
-            os.close(mount_fd)
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.EXTERNAL_FACTS_MISSING) from None
-    if mount_fd is None:
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.EXTERNAL_FACTS_MISSING)
-    try:
-        return _load_verified_release_authority_from_bytes(
-            authority_policy_bytes=canonical_authority_policy_bytes(authority_policy),
-            root_public_key_bytes=_read_mount_file(mount_fd, ROOT_PUBLIC_KEY_FILE, max_bytes=32),
-            trust_policy_bytes=_read_mount_file(mount_fd, TRUST_POLICY_FILE, max_bytes=MAX_TRUST_POLICY_BYTES),
-            policy_signature_bytes=_read_mount_file(
-                mount_fd,
-                POLICY_SIGNATURE_FILE,
-                max_bytes=MAX_SIGNATURE_ENVELOPE_BYTES,
-            ),
-        )
-    finally:
-        os.close(mount_fd)
-
-
-def _verify_core_release_identity(
-    authority: VerifiedReleaseAuthority,
-    candidate: CoreReleaseIdentity,
-    expected_facts_bytes: bytes,
-    issuer_signature_bytes: bytes,
-) -> VerifiedReleaseIdentity:
-    state = _authority_state(authority)
-    validated_candidate = _validated_candidate(candidate)
-    try:
-        facts = CoreReleaseExpectedFacts.model_validate_json(expected_facts_bytes)
-    except ValueError:
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.INVALID_EXPECTED_FACTS) from None
-    policy = state.policy
-    authority_policy = state.authority_policy
-    if (
-        facts.trust_policy.ref != authority_policy.policy_ref
-        or facts.trust_policy.version != authority_policy.policy_version
-        or facts.trust_policy.content_hash != authority_policy.policy_sha256
-    ):
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.POLICY_IDENTITY_MISMATCH)
-    try:
-        envelope = ReleaseSignatureEnvelope.model_validate_json(issuer_signature_bytes)
-    except ValueError:
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.FACTS_SIGNATURE_INVALID) from None
-    if envelope.schema_version != FACTS_SIGNATURE_SCHEMA_VERSION:
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.FACTS_SIGNATURE_INVALID)
-    if _signature_identity(envelope) != _key_identity(facts.trusted_issuer):
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.ISSUER_INACTIVE)
-    issuer = next(
-        (
-            item
-            for item in policy.issuers
-            if _key_identity(item) == _signature_identity(envelope)
-            and item.public_key_sha256 == facts.trusted_issuer.public_key_sha256
-        ),
-        None,
-    )
-    if issuer is None:
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.ISSUER_INACTIVE)
-    if issuer.status == "revoked":
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.ISSUER_REVOKED)
-    try:
-        Ed25519PublicKey.from_public_bytes(_decode_base64url(issuer.public_key, expected_length=32)).verify(
-            _decode_base64url(envelope.signature, expected_length=64),
-            EXPECTED_FACTS_DOMAIN + expected_facts_bytes,
-        )
-    except (ValueError, InvalidSignature):
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.FACTS_SIGNATURE_INVALID) from None
-    expected_identity_hash = core_release_identity_hash(facts.expected_identity)
-    candidate_hash = core_release_identity_hash(validated_candidate)
-    if (
-        facts.expected_identity_hash != expected_identity_hash
-        or candidate_hash != expected_identity_hash
-        or validated_candidate != facts.expected_identity
-    ):
-        raise ReleaseIdentityError(ReleaseIdentityErrorCode.EXTERNAL_FACTS_MISMATCH)
-    return VerifiedReleaseIdentity(
-        schema_version=IDENTITY_BINDING_SCHEMA_VERSION,
-        release_ref=validated_candidate.release_ref,
-        release_version=validated_candidate.release_version,
-        identity_hash=candidate_hash,
-        business_profile_ref=None,
-        business_profile_hash=None,
-        expected_facts=ContentAddressedBinding(
-            ref=facts.expected_facts.ref,
-            version=facts.expected_facts.version,
-            content_hash=sha256(expected_facts_bytes).hexdigest(),
-        ),
-        trust_policy=facts.trust_policy,
-        trust_root=policy.root_key,
-        trusted_issuer=facts.trusted_issuer,
-    )
-
-
 __all__ = [
-    "AUTHORITY_MOUNT_ENV",
     "AUTHORITY_POLICY_SCHEMA_VERSION",
-    "EXPECTED_POLICY_REF_ENV",
-    "EXPECTED_POLICY_SHA256_ENV",
-    "EXPECTED_POLICY_VERSION_ENV",
     "EXPECTED_FACTS_DOMAIN",
     "EXPECTED_FACTS_SCHEMA_VERSION",
     "FACTS_SIGNATURE_SCHEMA_VERSION",
@@ -957,11 +663,12 @@ __all__ = [
     "MAX_IDENTITY_BYTES",
     "MAX_JSON_DEPTH",
     "MAX_JSON_NODES",
+    "MAX_REF_LENGTH",
+    "MAX_REF_SEGMENT_LENGTH",
     "MAX_SIGNATURE_ENVELOPE_BYTES",
     "MAX_TRUST_POLICY_BYTES",
     "POLICY_SIGNATURE_DOMAIN",
     "POLICY_SIGNATURE_SCHEMA_VERSION",
-    "ROOT_PUBLIC_KEY_SHA256_ENV",
     "TRUST_POLICY_SCHEMA_VERSION",
     "AuthorityPolicy",
     "ContentAddressedBinding",
@@ -979,13 +686,12 @@ __all__ = [
     "SigningKeyIdentity",
     "TargetEnvironmentBinding",
     "TrustPolicy",
-    "VerifiedReleaseAuthority",
     "VerifiedReleaseIdentity",
     "canonical_authority_policy_bytes",
     "canonical_core_release_bytes",
     "canonical_expected_facts_bytes",
     "canonical_signature_envelope_bytes",
     "canonical_trust_policy_bytes",
+    "canonical_verified_release_identity_bytes",
     "core_release_identity_hash",
-    "load_verified_release_authority",
 ]

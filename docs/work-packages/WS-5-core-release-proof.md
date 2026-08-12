@@ -205,6 +205,26 @@ fail closed。
   verifier。
 - 固定文件名只作便利别名；CAS bytes/hash 和验收记录中的精确 ref 才是证据身份。
 
+### Release authority 验证进程协议
+
+- 生产验签的唯一入口是一次性 `python -I -m app.releases.cleanroom` 子进程；candidate、provider、
+  model、fixture、plugin 和普通应用角色不得在该解释器内加载或执行。`app.releases` 只导出
+  canonical contract，不导出 authority object、纯 bytes loader 或进程内 verifier。
+- Build/Release supervisor 在受保护的 mount namespace 中预先打开 authority 目录，并通过继承的
+  directory FD 传给子进程。verifier 不接受 authority path，不解析 mount 的任一中间目录；三个固定
+  authority 文件只允许相对该 FD 使用 `openat(O_NOFOLLOW)` 打开并执行有界完整读取。
+- 四个 pin（root public-key SHA-256、精确 policy ref/version/SHA-256）由 supervisor 作为独立部署
+  配置传入；candidate、expected facts、Manifest 和被验文件不能覆盖。candidate、expected-facts 与
+  issuer-signature 同样通过预打开 regular-file FD 传入，不通过环境变量或 Python object handoff。
+- 每个子进程只验证一次：每次从 authority FD 重读 root、policy 和 root signature，验证当前 issuer
+  active/revoked 状态后输出一份 canonical `VerifiedReleaseIdentity` bytes 并退出。禁止跨调用缓存
+  authority 或已验证 issuer；policy 轮换/吊销后的下一次验证必须使用新 pins 和新 mount snapshot。
+- 子进程环境为空且必须同时满足 isolated、ignore-environment、no-user-site 与 safe-path；verifier
+  source、依赖和解释器来自 supervisor 固定的精确 runtime image，`/app` 为 root-owned 且对运行用户
+  不可写。stdout 只允许成功 canonical bytes，stderr 只允许稳定错误码。若任意非 verifier 代码已能在
+  cleanroom 子进程内执行或修改其 runtime artifact，则该进程的 TCB 已失守并必须 fail closed；Python
+  private、seal 或 module global 不构成安全边界。
+
 ## 故障、安全、容量与回滚
 
 - 所有命令、数据库 statement/lock、provider、exporter、容器、load/soak 和总流程均有
