@@ -307,16 +307,34 @@ def _run_runtime_worker(settings: Settings) -> int:
     )
     telemetry_runtime = TelemetryExportRuntime()
     telemetry_runtime.start()
-    try:
-        asyncio.run(
-            run_worker(
+
+    async def run_composed_worker() -> None:
+        if settings.inference_mode == "disabled":
+            await run_worker(
                 driver=driver,
                 tenant_id=settings.worker_tenant_id,
                 worker_id=settings.worker_id,
                 runtime_build_hash=settings.runtime_build_hash,
                 database_url=settings.database_url_value(),
             )
-        )
+            return
+        from app.worker.inference import production_inference_lifespan
+
+        async with production_inference_lifespan(
+            app_env=settings.app_env,
+            runtime_build_hash=settings.runtime_build_hash,
+        ) as inference_port:
+            await run_worker(
+                driver=driver,
+                tenant_id=settings.worker_tenant_id,
+                worker_id=settings.worker_id,
+                runtime_build_hash=settings.runtime_build_hash,
+                database_url=settings.database_url_value(),
+                inference_port=inference_port,
+            )
+
+    try:
+        asyncio.run(run_composed_worker())
     finally:
         telemetry_runtime.stop()
     return 0

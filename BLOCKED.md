@@ -1,6 +1,6 @@
 # BLOCKED
 
-最后更新：2026-08-12
+最后更新：2026-08-13
 
 ## 当前结论
 
@@ -88,3 +88,27 @@ WS-3 Durable Execution 与 WS-4 Observation Slice 均无未关闭的实现阻塞
   isolated verifier 与普通应用入口均可从该镜像加载。
 - 本检查点仍不形成 Core、Product、staging 或 production release，也不标记 WS-5 `verified`；只有
   独立复审与完整门禁均通过后才能把本进程级 seam 作为后续 WS-5 验收输入。
+
+## WS-5 Production Inference v2 检查点（2026-08-13）
+
+- 旧候选把 production trust、Provider 构造和运行调用暴露为调用方可组合的
+  factory/token/model-client 浅接口，无法证明唯一 Provider config、SDK retry、物理 HTTP
+  request、usage/pricing 与跨租户 context 边界；该候选只保留为历史 blocked evidence，未进入
+  `main`，不得作为 production/G2 证据。
+- WS-1 owner 已交付统一 safe canonical codec/registry、typed request storage revalidation、
+  request/context/artifact invariants 与 zero-user-code/zero-provider 旁路族测试；独立复审未发现未关闭
+  P1/P2。
+- WS-5 production port 只从 Runtime Worker composition root 构造：root 先调用 isolated cleanroom
+  验证签名 release identity，再按 candidate hash 重读 `ProviderBindingManifest`；实际 SDK、PydanticAI、
+  adapter、Runtime Build、endpoint、model、schema 与 policy 均与 Manifest 逐项绑定。Graph/Node 只可见
+  `TypedInferencePort.infer(request, *, result_type)`。
+- SDK retry 固定为零；provider retry 与 schema repair 共享同一个物理 transport attempt/deadline/token/
+  cost ledger。Worker-owned 一次性 G2 入口从已验证 Manifest 内部构造 canonical request；真实
+  OpenAI-compatible Provider slice 已通过签名 `prompted/json_object` profile，最终请求、structured
+  output、usage、pricing 与 transport 观察到的单次物理请求一致。fresh PostgreSQL volume 上的完整
+  Runtime Worker 崩溃恢复矩阵为 9 passed，并在验收后清理临时容器与 volume。
+- 该检查点只关闭 production inference 子范围。Evaluation/Publication、完整 cleanroom Gate matrix、
+  Runtime Worker + PostgreSQL/RLS/PostgresSaver + 外部 issuer 的完整 G2、actual runtime image identity、
+  `ImplementationAcceptanceRecord` 与负责人批准仍待后续完成，因此 WS-5 delivery 仅为 `in_progress`；
+  当前 Provider 与 PostgreSQL/Worker 证据仍是同一代码的两个集成切片，且测试内签发 fixture 不作为
+  外部 trust-root 或完整 G2 证据；本记录不形成 Core、Product、staging 或 production release 结论。

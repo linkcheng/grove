@@ -57,11 +57,12 @@ from enum import Enum, StrEnum
 from hashlib import sha256
 from json import dumps
 from math import isfinite
-from re import fullmatch, search
+from re import fullmatch
 from types import UnionType
 from typing import Annotated, Any, Generic, Literal, TypeVar, Union, cast, get_args, get_origin
 from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
+from pydantic_core import SchemaValidator
 from app.contracts import canonical
 from app.contracts.canonical import VersionedRef
 """,

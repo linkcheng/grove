@@ -24,15 +24,17 @@ _IMPORT_SYMBOL_ALLOWLISTS: dict[str, dict[str, frozenset[str]]] = {
     "app/contracts": {
         "__future__": frozenset({"annotations"}),
         "collections.abc": frozenset({"Mapping"}),
+        "dataclasses": frozenset({"dataclass"}),
         "datetime": frozenset({"UTC", "datetime"}),
         "enum": frozenset({"Enum", "StrEnum"}),
         "hashlib": frozenset({"sha256"}),
-        "json": frozenset({"dumps"}),
+        "json": frozenset({"JSONDecodeError", "dumps", "loads"}),
         "math": frozenset({"isfinite"}),
         "pydantic": frozenset(
             {"BaseModel", "ConfigDict", "Field", "TypeAdapter", "field_validator", "model_validator"}
         ),
-        "re": frozenset({"fullmatch", "search"}),
+        "pydantic_core": frozenset({"SchemaValidator"}),
+        "re": frozenset({"fullmatch"}),
         "types": frozenset({"UnionType"}),
         "typing": frozenset(
             {"Annotated", "Any", "Generic", "Literal", "TypeVar", "Union", "cast", "get_args", "get_origin"}
@@ -224,7 +226,7 @@ def _contains_forbidden_reference(node: ast.AST, aliases: set[str]) -> bool:
     return False
 
 
-def _record_assignment_aliases(tree: ast.AST, aliases: set[str]) -> None:
+def _record_assignment_aliases(tree: ast.AST, aliases: set[str], exempt_nodes: set[int]) -> None:
     """Propagate aliases for direct assignments without evaluating strings."""
 
     changed = True
@@ -232,6 +234,8 @@ def _record_assignment_aliases(tree: ast.AST, aliases: set[str]) -> None:
         changed = False
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign):
+                if id(node.value) in exempt_nodes:
+                    continue
                 targets = tuple(name for target in node.targets for name in _target_names(target))
                 if _contains_forbidden_reference(node.value, aliases):
                     for name in targets:
@@ -239,11 +243,64 @@ def _record_assignment_aliases(tree: ast.AST, aliases: set[str]) -> None:
                             aliases.add(name)
                             changed = True
             elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                if id(node.value) in exempt_nodes:
+                    continue
                 if _contains_forbidden_reference(node.value, aliases):
                     for name in _target_names(node.target):
                         if name not in aliases:
                             aliases.add(name)
                             changed = True
+
+
+def _safe_storage_reflection_nodes(path: Path, tree: ast.AST) -> set[int]:
+    """Allow only the exact trusted-type/raw-storage reads owned by Canonical.
+
+    This is narrower than allowing reflection names globally: the enclosing
+    function, assignment targets, receiver and literal attributes must all
+    match.  Any added reflection call remains a violation.
+    """
+
+    if path.name != "canonical.py":
+        return set()
+    expected_by_function = {
+        "_safe_model_storage_tree": {
+            "storage": "__dict__",
+            "extras": "__pydantic_extra__",
+            "fields_set": "__pydantic_fields_set__",
+        },
+        "_is_model_type": {"model_mro": "__mro__"},
+        "_assert_strict_model": {"config": "model_config", "fields": "model_fields"},
+    }
+    exempt: set[int] = set()
+    for function in (node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)):
+        expected = expected_by_function.get(function.name)
+        if expected is None:
+            continue
+        for statement in ast.walk(function):
+            if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+                continue
+            target = statement.targets[0]
+            call = statement.value
+            if not isinstance(target, ast.Name) or target.id not in expected or not isinstance(call, ast.Call):
+                continue
+            attribute = call.func
+            receiver = "object" if target.id in {"storage", "extras", "fields_set"} else "type"
+            value_name = "value" if receiver == "object" else ("value" if target.id == "model_mro" else "model")
+            if (
+                not isinstance(attribute, ast.Attribute)
+                or attribute.attr != "__getattribute__"
+                or not isinstance(attribute.value, ast.Name)
+                or attribute.value.id != receiver
+                or len(call.args) != 2
+                or call.keywords
+                or not isinstance(call.args[0], ast.Name)
+                or call.args[0].id != value_name
+                or not isinstance(call.args[1], ast.Constant)
+                or call.args[1].value != expected[target.id]
+            ):
+                continue
+            exempt.update(id(node) for node in ast.walk(call))
+    return exempt
 
 
 def _scan_file(root: Path, path: Path, *, is_contracts: bool) -> list[str]:
@@ -256,7 +313,8 @@ def _scan_file(root: Path, path: Path, *, is_contracts: bool) -> list[str]:
     # a function parameter (there is no safe way to prove what it contains).
     aliases = set(_REFLECTION_NAMES) | {"b", "builtins"}
     aliases.update(_import_aliases(tree))
-    _record_assignment_aliases(tree, aliases)
+    exempt_nodes = _safe_storage_reflection_nodes(path, tree)
+    _record_assignment_aliases(tree, aliases, exempt_nodes)
     violations: list[str] = []
 
     def add(node: ast.AST, reason: str) -> None:
@@ -264,6 +322,8 @@ def _scan_file(root: Path, path: Path, *, is_contracts: bool) -> list[str]:
         violations.append(f"{path.relative_to(root)}:{line}: {reason}")
 
     for node in ast.walk(tree):
+        if id(node) in exempt_nodes:
+            continue
         if isinstance(node, ast.Import):
             for alias in node.names:
                 imported = alias.name

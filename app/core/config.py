@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     worker_tenant_id: str = Field(default="default", min_length=1, max_length=128)
     worker_id: str = Field(default="grove-worker-1", min_length=1, max_length=256)
     runtime_build_hash: str = Field(default="", min_length=0, max_length=64)
+    inference_mode: Literal["disabled", "production"] = "disabled"
 
     @model_validator(mode="after")
     def validate_auth_mode(self) -> Settings:

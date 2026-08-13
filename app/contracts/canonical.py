@@ -9,23 +9,29 @@ helpers below.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum, StrEnum
 from hashlib import sha256
-from json import dumps
+from json import JSONDecodeError, dumps, loads
 from math import isfinite
-from re import fullmatch, search
+from re import fullmatch
 from types import UnionType
 from typing import Annotated, Any, Generic, Literal, TypeVar, Union, cast, get_args, get_origin
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
+from pydantic_core import SchemaValidator
 
 CANONICAL_SEPARATOR = (",", ":")
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
 REF_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,255}$"
 IDENTIFIER_PATTERN = r"^[a-zA-Z0-9][a-zA-Z0-9_.:@+\-]{0,127}$"
 CAPABILITY_PATTERN = r"^[a-z][a-z0-9_.\-]{0,63}$"
+MOVING_ALIASES = frozenset(
+    {"latest", "main", "master", "stable", "current", "head", "release", "dev", "develop", "trunk"}
+)
+_PYDANTIC_MODEL_METACLASS = type(BaseModel)
 # WS-1 has one Canonical Contract family.  ABI v2 is a separate, explicit
 # reader in ``app.skill_abi``; advertising it here would make a caller able
 # to parse a v1 payload through an unimplemented Canonical v2 family.
@@ -48,9 +54,18 @@ CanonicalBaseModel = CanonicalModel
 
 
 def _validate_ref(value: str, field_name: str = "reference") -> str:
-    lowered = value.lower()
-    if not fullmatch(REF_PATTERN, value) or search(r"(?:^|[@/:.\-])latest(?:$|[@/:.\-])", lowered):
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be an exact string")
+    if not fullmatch(REF_PATTERN, value):
         raise ValueError(f"{field_name} must be a precise non-latest reference")
+    segments = value.replace("@", "/").replace(":", "/").split("/")
+    terminal = next((segment for segment in reversed(segments) if segment), "").lower().rstrip("._+-")
+    components = tuple(
+        part for part in terminal.replace(".", "_").replace("+", "_").replace("-", "_").split("_") if part
+    )
+    terminal_component = components[-1] if components else ""
+    if value.lower() in MOVING_ALIASES or terminal in MOVING_ALIASES or terminal_component in MOVING_ALIASES:
+        raise ValueError(f"{field_name} must be a precise non-moving reference")
     return value
 
 
@@ -499,6 +514,18 @@ CanonicalDecision = Annotated[
 ]
 
 
+class StructuredInferenceInput(CanonicalModel):
+    """Build-owned Core conformance input schema for production inference."""
+
+    question: str
+
+
+class StructuredInferenceOutput(CanonicalModel):
+    """Build-owned Core conformance output schema for production inference."""
+
+    answer: str
+
+
 class CanonicalInferenceRequest(CanonicalModel, Generic[InferenceInputT]):
     meta: ContractMeta
     inference_request_id: UUID
@@ -538,6 +565,8 @@ class CanonicalInferenceRequest(CanonicalModel, Generic[InferenceInputT]):
     def validate_tenant(self) -> CanonicalInferenceRequest[InferenceInputT]:
         if self.meta.tenant_id == "":
             raise ValueError("tenant is required")
+        if any(item.tenant_id != self.meta.tenant_id for item in self.context_refs):
+            raise ValueError("context_refs must belong to the request tenant")
         _require_meta_family(
             self.meta,
             frozenset({"canonical.inference.request"}),
@@ -1052,7 +1081,10 @@ def _reject_untrusted_fields(value: Any) -> None:
 
 
 def _is_model_type(value: Any) -> bool:
-    return isinstance(value, type) and issubclass(value, BaseModel) and value is not BaseModel
+    if type(value) is not _PYDANTIC_MODEL_METACLASS or value is BaseModel:
+        return False
+    model_mro = type.__getattribute__(value, "__mro__")
+    return type(model_mro) is tuple and any(base is BaseModel for base in model_mro)
 
 
 def _assert_safe_annotation(
@@ -1096,7 +1128,7 @@ def _assert_safe_annotation(
         # be admitted merely because Pydantic can validate it.
         if annotation in {str, int, float, bool, UUID, datetime}:
             return
-        if isinstance(annotation, type) and issubclass(annotation, Enum):
+        if type(annotation) is type(Enum):
             raise ValueError("typed execution schemas cannot contain Enum fields")
         # A forward reference or unresolved type variable cannot be proven.
         raise ValueError(f"typed execution schema contains unresolved annotation: {annotation!r}")
@@ -1136,19 +1168,20 @@ def _assert_strict_model(
 ) -> None:
     if model is BaseModel:
         raise ValueError("bare BaseModel is not an execution schema")
-    config = model.model_config
+    config = type.__getattribute__(model, "model_config")
     if config.get("extra") != "forbid" or config.get("frozen") is not True:
         raise ValueError("typed execution schemas must set extra='forbid' and frozen=True")
     visited = seen if seen is not None else set()
     if model in visited:
         return
     visited.add(model)
-    for field in model.model_fields.values():
+    fields = type.__getattribute__(model, "model_fields")
+    for field in fields.values():
         _assert_safe_annotation(field.annotation, visited, allow_mapping=allow_mapping)
 
 
 def _schema_model(schema: Any) -> type[BaseModel]:
-    if isinstance(schema, TypeAdapter):
+    if type(schema) is TypeAdapter:
         raise TypeError("typed schema registry accepts model types, not TypeAdapter instances")
     if not _is_model_type(schema):
         raise TypeError("typed schema must be a concrete strict BaseModel type")
@@ -1214,11 +1247,38 @@ class _CanonicalAdapter:
         return parsed
 
 
+def _schema_ref_identity(reference: Any) -> tuple[str, str, str]:
+    """Return safe exact ref fields without dereferencing a duck object."""
+
+    if type(reference) is not VersionedRef:
+        raise TypeError("schema_ref must be the exact VersionedRef type")
+    ref = reference.ref
+    version = reference.version
+    content_hash = reference.content_hash
+    if type(ref) is not str or type(version) is not str or type(content_hash) is not str:
+        raise TypeError("schema_ref fields must use exact canonical scalar types")
+    _validate_ref(ref, "schema ref")
+    _validate_ref(version, "schema version")
+    _validate_hash(content_hash, "schema hash")
+    return ref, version, content_hash
+
+
+def _schema_role(role: Any, *, allow_both: bool) -> Literal["input", "output", "both"]:
+    """Validate a registry role before using it as a key or branch selector."""
+
+    allowed = {"input", "output", "both"} if allow_both else {"input", "output"}
+    if type(role) is not str or role not in allowed:
+        suffix = ", or both" if allow_both else " or output"
+        raise TypeError(f"schema role must be exactly input{suffix}")
+    return cast(Literal["input", "output", "both"], role)
+
+
 class TypedSchemaRegistry:
     """Exact VersionedRef → strict model bindings used by trusted readers."""
 
     def __init__(self) -> None:
         self._bindings: dict[tuple[str, str, str, str], type[BaseModel]] = {}
+        self._preflight_validators: dict[tuple[str, str, str, str], SchemaValidator] = {}
 
     def register(
         self,
@@ -1229,29 +1289,90 @@ class TypedSchemaRegistry:
     ) -> None:
         if type(self) is not TypedSchemaRegistry:
             raise TypeError("schema registry must use the exact TypedSchemaRegistry type")
+        ref, version, content_hash = _schema_ref_identity(reference)
+        checked_role = _schema_role(role, allow_both=True)
         model = _schema_model(schema)
-        keys = ("input", "output") if role == "both" else (role,)
+        try:
+            preflight_validator = SchemaValidator(_safe_preflight_core_schema(TypeAdapter(model).core_schema))
+        except (TypeError, ValueError):
+            raise ValueError("typed execution schema has an executable or unsupported Core constraint") from None
+        keys = ("input", "output") if checked_role == "both" else (checked_role,)
         for binding_role in keys:
-            key = (binding_role, reference.ref, reference.version, reference.content_hash)
+            key = (binding_role, ref, version, content_hash)
             if key in self._bindings:
-                raise ValueError(f"schema binding already registered: {reference.ref}@{reference.version}")
+                raise ValueError(f"schema binding already registered: {ref}@{version}")
             self._bindings[key] = model
+            self._preflight_validators[key] = preflight_validator
 
     def resolve_model(self, reference: VersionedRef, *, role: str) -> type[BaseModel]:
         if type(self) is not TypedSchemaRegistry:
             raise TypeError("schema registry must use the exact TypedSchemaRegistry type")
+        ref, version, content_hash = _schema_ref_identity(reference)
+        checked_role = _schema_role(role, allow_both=False)
         try:
-            return self._bindings[(role, reference.ref, reference.version, reference.content_hash)]
+            return self._bindings[(checked_role, ref, version, content_hash)]
         except KeyError as exc:
-            raise ValueError(f"no exact {role} schema binding for {reference.ref}@{reference.version}") from exc
+            raise ValueError(f"no exact {checked_role} schema binding for {ref}@{version}") from exc
 
     def resolve(self, reference: VersionedRef, *, role: str) -> _CanonicalAdapter:
         if type(self) is not TypedSchemaRegistry:
             raise TypeError("schema registry must use the exact TypedSchemaRegistry type")
         return _CanonicalAdapter(self.resolve_model(reference, role=role))
 
+    def _preflight_validate(self, reference: VersionedRef, *, role: str, value: Any) -> None:
+        """Run only native Core constraints; user Pydantic hooks are absent."""
+
+        ref, version, content_hash = _schema_ref_identity(reference)
+        checked_role = _schema_role(role, allow_both=False)
+        try:
+            validator = self._preflight_validators[(checked_role, ref, version, content_hash)]
+        except KeyError as exc:
+            raise ValueError(f"no exact {checked_role} schema binding for {ref}@{version}") from exc
+        validator.validate_python(value, strict=True)
+
 
 SchemaRegistry = TypedSchemaRegistry
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalReadLimits:
+    """Boundaries applied while decoding an untrusted canonical document.
+
+    The values are deliberately plain exact integers.  A caller cannot pass a
+    bool, an integer subclass, or a duck-typed limits object whose comparison
+    or arithmetic could execute user code at the raw-data boundary.
+    """
+
+    max_bytes: int = 1_048_576
+    max_depth: int = 32
+    max_nodes: int = 10_000
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("max_bytes", self.max_bytes),
+            ("max_depth", self.max_depth),
+            ("max_nodes", self.max_nodes),
+        ):
+            if type(value) is not int or value < 1:
+                raise TypeError(f"{name} must be a positive exact integer")
+
+
+DEFAULT_CANONICAL_READ_LIMITS = CanonicalReadLimits()
+
+
+class CanonicalCodecError(ValueError):
+    """Stable, input-independent failure at the raw canonical seam."""
+
+
+InferenceContextState = Literal["omitted", "null", "present"]
+
+
+@dataclass(frozen=True, slots=True)
+class DecodedCanonicalInferenceRequest(Generic[InferenceInputT]):
+    """A validated request plus the explicit three-state context presence."""
+
+    request: CanonicalInferenceRequest[InferenceInputT]
+    context_state: InferenceContextState
 
 
 def _resolve_schema_model(registry: Any, reference: VersionedRef, *, role: str) -> type[BaseModel]:
@@ -1294,6 +1415,575 @@ def _decision_adapter(input_type: Any | None, output_type: Any | None) -> TypeAd
 
 def _parameterize(generic: Any, model: type[BaseModel]) -> Any:
     return generic[model]
+
+
+def _safe_preflight_core_schema(schema: Any) -> Any:
+    """Clone Pydantic Core schema with every executable user hook removed.
+
+    Native Core constraints (length, pattern, numeric bounds, container shape,
+    unions, UUID and datetime parsing) remain.  Model nodes are reduced to
+    ``model-fields`` so custom ``__init__`` and ``model_post_init`` cannot run.
+    """
+
+    if callable(schema):
+        raise ValueError("callable Core schema values are not allowed at the canonical trust boundary")
+    if type(schema) is list:
+        return [_safe_preflight_core_schema(item) for item in schema]
+    if type(schema) is tuple:
+        return tuple(_safe_preflight_core_schema(item) for item in schema)
+    if type(schema) is not dict:
+        return schema
+
+    schema_type = schema.get("type")
+    if schema_type in {"function-before", "function-after", "function-wrap"}:
+        inner = schema.get("schema")
+        if type(inner) is not dict:
+            raise ValueError("typed execution schema hook has no native inner schema")
+        sanitized = _safe_preflight_core_schema(inner)
+        if type(sanitized) is dict and type(schema.get("ref")) is str:
+            sanitized["ref"] = schema["ref"]
+        return sanitized
+    if schema_type == "function-plain":
+        raise ValueError("plain Pydantic validators are not allowed at the canonical trust boundary")
+    if schema_type == "model":
+        if schema.get("custom_init") is True:
+            raise ValueError("custom model initializers are not allowed at the canonical trust boundary")
+        inner = schema.get("schema")
+        if type(inner) is not dict:
+            raise ValueError("typed execution model has no native field schema")
+        sanitized = _safe_preflight_core_schema(inner)
+        if type(sanitized) is dict and type(schema.get("ref")) is str:
+            sanitized["ref"] = schema["ref"]
+        return sanitized
+    if schema_type == "default" and schema.get("default_factory") is not None:
+        raise ValueError("default factories are not allowed at the canonical trust boundary")
+
+    if schema_type == "tagged-union" and callable(schema.get("discriminator")):
+        raise ValueError("callable discriminators are not allowed at the canonical trust boundary")
+
+    ignored_keys = {"cls", "function", "metadata", "post_init", "serialization"}
+    cloned = {key: _safe_preflight_core_schema(value) for key, value in schema.items() if key not in ignored_keys}
+    if schema_type == "model-fields":
+        cloned["computed_fields"] = []
+    return cloned
+
+
+def _read_limit_values(limits: Any) -> tuple[int, int, int]:
+    """Copy revalidated exact integers out of a potentially forged wrapper."""
+
+    if type(limits) is not CanonicalReadLimits:
+        raise TypeError("canonical read limits must use the exact CanonicalReadLimits type")
+    max_bytes = limits.max_bytes
+    max_depth = limits.max_depth
+    max_nodes = limits.max_nodes
+    for name, value in (("max_bytes", max_bytes), ("max_depth", max_depth), ("max_nodes", max_nodes)):
+        if type(value) is not int or value < 1:
+            raise TypeError(f"{name} must be a positive exact integer")
+    return max_bytes, max_depth, max_nodes
+
+
+def _validate_raw_json_tree(value: Any, *, max_depth: int, max_nodes: int) -> None:
+    """Validate only exact built-in JSON values, without invoking user code."""
+
+    nodes = 0
+
+    def visit(current: Any, depth: int) -> None:
+        nonlocal nodes
+        nodes += 1
+        if nodes > max_nodes:
+            raise CanonicalCodecError("canonical payload node limit exceeded")
+
+        current_type = type(current)
+        if current is None or current_type is bool or current_type is int:
+            return
+        if current_type is str:
+            try:
+                current.encode("utf-8", errors="strict")
+            except UnicodeEncodeError:
+                raise CanonicalCodecError("canonical JSON string is not valid UTF-8") from None
+            return
+        if current_type is float:
+            if not isfinite(current):
+                raise CanonicalCodecError("canonical JSON numbers must be finite")
+            return
+        if current_type is list:
+            if depth >= max_depth:
+                raise CanonicalCodecError("canonical payload depth limit exceeded")
+            for item in current:
+                visit(item, depth + 1)
+            return
+        if current_type is dict:
+            if depth >= max_depth:
+                raise CanonicalCodecError("canonical payload depth limit exceeded")
+            for key, item in current.items():
+                if type(key) is not str:
+                    raise CanonicalCodecError("canonical JSON object keys must be exact strings")
+                visit(item, depth + 1)
+            return
+        raise CanonicalCodecError("canonical payload contains an unsupported JSON value")
+
+    visit(value, 0)
+
+
+def _duplicate_key_object(pairs: list[tuple[Any, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if type(key) is not str:
+            # ``json.loads`` currently produces exact strings for object keys;
+            # keep this guard explicit so a future decoder cannot widen it.
+            raise CanonicalCodecError("canonical JSON object keys must be exact strings")
+        if key in result:
+            raise CanonicalCodecError("canonical JSON object contains duplicate keys")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise CanonicalCodecError("canonical JSON contains a non-finite number")
+
+
+def _checked_schema_ref(reference: Any) -> VersionedRef:
+    """Check exact ref identity before reading any of its fields."""
+
+    try:
+        _schema_ref_identity(reference)
+    except (TypeError, ValueError):
+        raise CanonicalCodecError("schema_ref is invalid") from None
+    return cast(VersionedRef, reference)
+
+
+def _checked_role(role: Any) -> Literal["input", "output"]:
+    return cast(Literal["input", "output"], _schema_role(role, allow_both=False))
+
+
+def _union_branches(value: Any, annotation: Any) -> tuple[Any, ...]:
+    """Prefer a branch matching the exact raw JSON scalar/container type."""
+
+    def score(branch: Any) -> int:
+        branch_origin = get_origin(branch)
+        if branch_origin is Annotated:
+            return score(get_args(branch)[0])
+        if branch_origin is Literal:
+            return 0 if any(type(item) is type(value) and item == value for item in get_args(branch)) else 2
+        exact_scalar = {str: str, bool: bool, int: int, float: float}.get(type(value))
+        if exact_scalar is not None and branch is exact_scalar:
+            return 0
+        if type(value) is list and branch_origin is list:
+            return 0
+        if type(value) is dict and branch_origin in (dict, Mapping):
+            return 0
+        return 1
+
+    return tuple(sorted(get_args(annotation), key=score))
+
+
+def _raw_schema_preflight(value: Any, annotation: Any, *, path: str = "$") -> None:
+    """Prove raw keys and leaf JSON types before Pydantic can run hooks."""
+
+    if annotation is Any or annotation is object:
+        raise CanonicalCodecError(f"unsupported schema annotation at {path}")
+    if annotation is None or annotation is type(None):
+        if value is not None:
+            raise CanonicalCodecError(f"invalid null at {path}")
+        return
+    if _is_model_type(annotation):
+        _assert_strict_model(annotation)
+        if type(value) is not dict:
+            raise CanonicalCodecError(f"expected object at {path}")
+        fields = annotation.model_fields
+        for key, field in fields.items():
+            if field.is_required() and key not in value:
+                raise CanonicalCodecError(f"schema required field missing at {path}")
+        for key in value:
+            if type(key) is not str or key not in fields:
+                raise CanonicalCodecError(f"schema extra field at {path}")
+        for key, item in value.items():
+            _raw_schema_preflight(item, fields[key].annotation, path=f"{path}.{key}")
+        return
+
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        _raw_schema_preflight(value, get_args(annotation)[0], path=path)
+        return
+    if origin is Literal:
+        for literal in get_args(annotation):
+            if type(literal) is type(value) and value == literal:
+                return
+        raise CanonicalCodecError(f"invalid literal at {path}")
+    if origin in (Union, UnionType):
+        for branch in _union_branches(value, annotation):
+            try:
+                _raw_schema_preflight(value, branch, path=path)
+            except CanonicalCodecError:
+                continue
+            return
+        raise CanonicalCodecError(f"invalid union value at {path}")
+    if origin in (dict, Mapping):
+        if type(value) is not dict:
+            raise CanonicalCodecError(f"expected object at {path}")
+        args = get_args(annotation)
+        if len(args) != 2 or args[0] is not str:
+            raise CanonicalCodecError(f"unsupported mapping annotation at {path}")
+        for key, item in value.items():
+            if type(key) is not str:
+                raise CanonicalCodecError(f"mapping key must be a string at {path}")
+            _raw_schema_preflight(item, args[1], path=f"{path}.{key}")
+        return
+    if origin in (list, tuple):
+        if type(value) is not list:
+            raise CanonicalCodecError(f"expected array at {path}")
+        args = get_args(annotation)
+        if not args:
+            raise CanonicalCodecError(f"untyped array at {path}")
+        item_annotations = tuple(argument for argument in args if argument is not Ellipsis)
+        if origin is tuple and len(item_annotations) > 1 and len(item_annotations) != len(value):
+            raise CanonicalCodecError(f"tuple length mismatch at {path}")
+        if origin is tuple and len(args) == 2 and args[1] is Ellipsis:
+            item_annotations = (args[0],)
+        for index, item in enumerate(value):
+            annotation_for_item = item_annotations[index] if len(item_annotations) > 1 else item_annotations[0]
+            _raw_schema_preflight(item, annotation_for_item, path=f"{path}[{index}]")
+        return
+    if annotation is UUID or annotation is datetime:
+        if type(value) is not str:
+            raise CanonicalCodecError(f"expected canonical string at {path}")
+        return
+    if annotation is str:
+        valid = type(value) is str
+    elif annotation is bool:
+        valid = type(value) is bool
+    elif annotation is int:
+        valid = type(value) is int
+    elif annotation is float:
+        valid = type(value) in (int, float) and not isinstance(value, bool) and isfinite(value)
+    else:
+        raise CanonicalCodecError(f"unsupported schema annotation at {path}")
+    if not valid:
+        raise CanonicalCodecError(f"invalid canonical scalar at {path}")
+
+
+def _coerce_raw_schema(value: Any, annotation: Any, *, path: str = "$") -> Any:
+    """Convert canonical JSON spellings to strict Pydantic runtime values."""
+
+    if annotation is None or annotation is type(None):
+        return None
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        return _coerce_raw_schema(value, get_args(annotation)[0], path=path)
+    if origin is Literal:
+        return value
+    if origin in (Union, UnionType):
+        for branch in _union_branches(value, annotation):
+            try:
+                _raw_schema_preflight(value, branch, path=path)
+                return _coerce_raw_schema(value, branch, path=path)
+            except CanonicalCodecError:
+                continue
+        raise CanonicalCodecError(f"invalid union value at {path}")
+    if _is_model_type(annotation):
+        return {
+            key: _coerce_raw_schema(item, annotation.model_fields[key].annotation, path=f"{path}.{key}")
+            for key, item in value.items()
+        }
+    if origin in (dict, Mapping):
+        item_annotation = get_args(annotation)[1]
+        return {key: _coerce_raw_schema(item, item_annotation, path=f"{path}.{key}") for key, item in value.items()}
+    if origin in (list, tuple):
+        args = get_args(annotation)
+        item_annotations = tuple(argument for argument in args if argument is not Ellipsis)
+        if origin is tuple and len(args) == 2 and args[1] is Ellipsis:
+            item_annotations = (args[0],)
+        converted = [
+            _coerce_raw_schema(
+                item,
+                item_annotations[index] if len(item_annotations) > 1 else item_annotations[0],
+                path=f"{path}[{index}]",
+            )
+            for index, item in enumerate(value)
+        ]
+        return tuple(converted) if origin is tuple else converted
+    if annotation is UUID:
+        try:
+            parsed_uuid = UUID(value)
+        except (ValueError, AttributeError, TypeError):
+            raise CanonicalCodecError(f"invalid UUID at {path}") from None
+        if value != str(parsed_uuid):
+            raise CanonicalCodecError(f"UUID is not in canonical form at {path}")
+        return parsed_uuid
+    if annotation is datetime:
+        try:
+            parsed_datetime = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (ValueError, AttributeError, TypeError):
+            raise CanonicalCodecError(f"invalid datetime at {path}") from None
+        if parsed_datetime.tzinfo is None or parsed_datetime.utcoffset() is None:
+            raise CanonicalCodecError(f"datetime must be timezone-aware at {path}")
+        return parsed_datetime.astimezone(UTC)
+    return value
+
+
+class SafeCanonicalCodec:
+    """The sole raw canonical reader for schema-bound contract values.
+
+    Raw values are proven to be exact built-in JSON containers/scalars before
+    the trusted registry resolves a model or Pydantic is allowed to validate
+    it.  This ordering makes malformed objects, model-copy extras and parser
+    bombs side-effect free at the schema/provider boundary.
+    """
+
+    def __init__(self, registry: TypedSchemaRegistry) -> None:
+        if type(registry) is not TypedSchemaRegistry:
+            raise TypeError("SafeCanonicalCodec requires the exact TypedSchemaRegistry type")
+        self._registry = registry
+
+    def _prepare_dict(
+        self,
+        raw: Any,
+        *,
+        limits: CanonicalReadLimits | None,
+    ) -> dict[str, Any]:
+        if type(raw) is not dict:
+            raise TypeError("canonical raw payload must be an exact dict")
+        selected_limits = DEFAULT_CANONICAL_READ_LIMITS if limits is None else limits
+        _, max_depth, max_nodes = _read_limit_values(selected_limits)
+        _validate_raw_json_tree(raw, max_depth=max_depth, max_nodes=max_nodes)
+        return cast(dict[str, Any], raw)
+
+    def _read_validated_dict(
+        self,
+        raw: dict[str, Any],
+        *,
+        schema_ref: VersionedRef,
+        role: Literal["input", "output"],
+    ) -> Any:
+        # Both the ref and role are checked only after the complete raw tree;
+        # registry resolution and schema generation therefore cannot observe a
+        # malformed object.
+        reference = _checked_schema_ref(schema_ref)
+        checked_role = _checked_role(role)
+        try:
+            model = self._registry.resolve_model(reference, role=checked_role)
+            _raw_schema_preflight(raw, model)
+            prepared = _coerce_raw_schema(raw, model)
+            self._registry._preflight_validate(reference, role=checked_role, value=prepared)
+            parsed = TypeAdapter(model).validate_python(prepared, strict=True)
+            canonical_bytes(parsed)
+            return parsed
+        except CanonicalCodecError:
+            raise
+        except Exception:
+            raise CanonicalCodecError("canonical schema validation failed") from None
+
+    def read_dict(
+        self,
+        raw: Any,
+        *,
+        schema_ref: VersionedRef,
+        role: Literal["input", "output"],
+        limits: CanonicalReadLimits | None = None,
+    ) -> Any:
+        prepared = self._prepare_dict(raw, limits=limits)
+        return self._read_validated_dict(prepared, schema_ref=schema_ref, role=role)
+
+    def read_bytes(
+        self,
+        payload: Any,
+        *,
+        expected_hash: str,
+        schema_ref: VersionedRef,
+        role: Literal["input", "output"],
+        limits: CanonicalReadLimits | None = None,
+    ) -> Any:
+        selected_limits = DEFAULT_CANONICAL_READ_LIMITS if limits is None else limits
+        max_bytes, max_depth, max_nodes = _read_limit_values(selected_limits)
+        if type(payload) is not bytes:
+            raise TypeError("canonical raw payload bytes must use the exact bytes type")
+        if len(payload) > max_bytes:
+            raise CanonicalCodecError("canonical payload size limit exceeded")
+        if type(expected_hash) is not str or not fullmatch(SHA256_PATTERN, expected_hash) or expected_hash == "0" * 64:
+            raise TypeError("expected_hash must be a lower-case sha256 digest")
+        if sha256(payload).hexdigest() != expected_hash:
+            raise CanonicalCodecError("canonical payload hash mismatch")
+        try:
+            text = payload.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            raise CanonicalCodecError("canonical payload is not valid UTF-8") from None
+        try:
+            raw = loads(
+                text,
+                object_pairs_hook=_duplicate_key_object,
+                parse_constant=_reject_json_constant,
+            )
+        except CanonicalCodecError:
+            raise
+        except (JSONDecodeError, RecursionError, ValueError, TypeError):
+            raise CanonicalCodecError("canonical payload is not valid JSON") from None
+        _validate_raw_json_tree(raw, max_depth=max_depth, max_nodes=max_nodes)
+        if type(raw) is not dict:
+            raise CanonicalCodecError("canonical JSON root must be an object")
+        prepared = cast(dict[str, Any], raw)
+        return self._read_validated_dict(prepared, schema_ref=schema_ref, role=role)
+
+
+def _check_raw_request_tenant(raw: dict[str, Any]) -> None:
+    """Reject obvious cross-tenant context refs before resolving input schema."""
+
+    meta = raw.get("meta")
+    context_refs = raw.get("context_refs")
+    if type(meta) is not dict or type(context_refs) is not list:
+        return
+    request_tenant = meta.get("tenant_id")
+    if type(request_tenant) is not str:
+        return
+    for context_ref in context_refs:
+        if type(context_ref) is not dict:
+            continue
+        context_tenant = context_ref.get("tenant_id")
+        if type(context_tenant) is str and context_tenant != request_tenant:
+            raise CanonicalCodecError("context_refs tenant mismatch")
+
+
+def read_canonical_inference_request(
+    raw: Any,
+    *,
+    input_schema_ref: VersionedRef,
+    registry: TypedSchemaRegistry,
+    limits: CanonicalReadLimits | None = None,
+) -> DecodedCanonicalInferenceRequest[BaseModel]:
+    """Decode a raw request while preserving context omitted/null/present."""
+
+    codec = SafeCanonicalCodec(registry)
+    prepared = codec._prepare_dict(raw, limits=limits)
+    _check_raw_request_tenant(prepared)
+    reference = _checked_schema_ref(input_schema_ref)
+    try:
+        input_model = registry.resolve_model(reference, role="input")
+        request_model = _parameterize(CanonicalInferenceRequest, input_model)
+        _raw_schema_preflight(prepared, request_model)
+        coerced = _coerce_raw_schema(prepared, request_model)
+        request_adapter = TypeAdapter(request_model)
+        SchemaValidator(_safe_preflight_core_schema(request_adapter.core_schema)).validate_python(coerced, strict=True)
+        request = request_adapter.validate_python(coerced, strict=True)
+        canonical_bytes(request)
+    except CanonicalCodecError:
+        raise
+    except Exception:
+        raise CanonicalCodecError("canonical inference request validation failed") from None
+    if "context" not in prepared:
+        context_state: InferenceContextState = "omitted"
+    elif prepared["context"] is None:
+        context_state = "null"
+    else:
+        context_state = "present"
+    return DecodedCanonicalInferenceRequest(request=request, context_state=context_state)
+
+
+def validate_canonical_inference_request(
+    request: Any,
+    *,
+    input_schema_ref: VersionedRef,
+    registry: TypedSchemaRegistry,
+    limits: CanonicalReadLimits | None = None,
+) -> DecodedCanonicalInferenceRequest[BaseModel]:
+    """Re-read an already constructed request through the raw trust seam.
+
+    Production inference callers receive a typed object, but ``model_copy``
+    and low-level object construction can bypass Pydantic validation.  The
+    object is therefore accepted only when its exact instance storage is a
+    closed canonical tree; it is then serialized and decoded by the same raw
+    reader used for external JSON.  No property, model serializer or Pydantic
+    hook is consulted before the storage shape is proven safe.
+    """
+
+    reference = _checked_schema_ref(input_schema_ref)
+    input_model = registry.resolve_model(reference, role="input")
+    request_model = _parameterize(CanonicalInferenceRequest, input_model)
+    if type(request) is not request_model:
+        raise TypeError("inference request must use the exact registered request type")
+    raw = _safe_model_storage_tree(request, request_model, path="$")
+    return read_canonical_inference_request(
+        raw,
+        input_schema_ref=reference,
+        registry=registry,
+        limits=limits,
+    )
+
+
+def _safe_model_storage_tree(value: Any, expected: Any, *, path: str) -> Any:
+    origin = get_origin(expected)
+    arguments = get_args(expected)
+    if _is_model_type(expected):
+        if type(value) is not expected:
+            raise TypeError(f"unexpected model type at {path}")
+        storage = object.__getattribute__(value, "__dict__")
+        extras = object.__getattribute__(value, "__pydantic_extra__")
+        fields_set = object.__getattribute__(value, "__pydantic_fields_set__")
+        fields = expected.model_fields
+        if type(storage) is not dict or type(fields_set) is not set:
+            raise TypeError(f"invalid model storage at {path}")
+        if extras is not None and (type(extras) is not dict or extras):
+            raise TypeError(f"invalid model extras at {path}")
+        if any(type(key) is not str for key in storage) or any(type(name) is not str for name in fields_set):
+            raise TypeError(f"invalid model storage keys at {path}")
+        if not fields_set.issubset(storage) or not set(storage).issubset(fields):
+            raise ValueError(f"model storage contains unvalidated fields at {path}")
+        return {
+            name: _safe_model_storage_tree(storage[name], fields[name].annotation, path=f"{path}.{name}")
+            for name in fields_set
+        }
+    if origin is Annotated:
+        return _safe_model_storage_tree(value, arguments[0], path=path)
+    if origin in (Union, UnionType):
+        for branch in _union_branches(value, expected):
+            try:
+                return _safe_model_storage_tree(value, branch, path=path)
+            except (TypeError, ValueError):
+                continue
+        raise TypeError(f"no exact union branch at {path}")
+    if origin in (tuple, list):
+        expected_type = tuple if origin is tuple else list
+        if type(value) is not expected_type:
+            raise TypeError(f"unexpected sequence type at {path}")
+        item_schema = arguments[0] if arguments else Any
+        if origin is tuple and len(arguments) > 1 and arguments[-1] is not Ellipsis:
+            if len(value) != len(arguments):
+                raise ValueError(f"tuple length mismatch at {path}")
+            return [
+                _safe_model_storage_tree(item, item_expected, path=f"{path}[{index}]")
+                for index, (item, item_expected) in enumerate(zip(value, arguments, strict=True))
+            ]
+        return [
+            _safe_model_storage_tree(item, item_schema, path=f"{path}[{index}]") for index, item in enumerate(value)
+        ]
+    if origin in (dict, Mapping):
+        if type(value) is not dict:
+            raise TypeError(f"unexpected mapping type at {path}")
+        key_schema, item_schema = arguments
+        if key_schema is not str or any(type(key) is not str for key in value):
+            raise TypeError(f"canonical mapping keys must be exact strings at {path}")
+        return {key: _safe_model_storage_tree(item, item_schema, path=f"{path}.{key}") for key, item in value.items()}
+    if expected is UUID:
+        if type(value) is not UUID:
+            raise TypeError(f"unexpected UUID type at {path}")
+        return str(value).lower()
+    if expected is datetime:
+        if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+            raise TypeError(f"unexpected datetime type at {path}")
+        utc_value = value.astimezone(UTC)
+        timespec = "microseconds" if utc_value.microsecond else "seconds"
+        return utc_value.isoformat(timespec=timespec).replace("+00:00", "Z")
+    if expected is type(None):
+        if value is not None:
+            raise TypeError(f"unexpected null type at {path}")
+        return None
+    if expected in (str, int, float, bool):
+        if type(value) is not expected:
+            raise TypeError(f"unexpected scalar type at {path}")
+        return value
+    if get_origin(expected) is Literal:
+        if type(value) not in (str, int, bool) or value not in arguments:
+            raise TypeError(f"unexpected literal at {path}")
+        return value
+    raise TypeError(f"unsupported inference request annotation at {path}")
 
 
 def _ensure_canonical_serializable(value: Any) -> Any:
@@ -1822,6 +2512,8 @@ __all__ = [
     "CanonicalFailure",
     "CanonicalInferenceRequest",
     "CanonicalInferenceResult",
+    "CanonicalCodecError",
+    "CanonicalReadLimits",
     "CanonicalMessage",
     "CanonicalModel",
     "CheckpointRef",
@@ -1830,6 +2522,8 @@ __all__ = [
     "derive_contract_meta",
     "ContractReaderRegistry",
     "CONTRACT_READER_REGISTRY",
+    "DecodedCanonicalInferenceRequest",
+    "DEFAULT_CANONICAL_READ_LIMITS",
     "DelegateProposal",
     "DelegateProposalPayload",
     "DomainViewAccepted",
@@ -1866,6 +2560,9 @@ __all__ = [
     "TraceRef",
     "TypedSchemaRegistry",
     "SchemaRegistry",
+    "SafeCanonicalCodec",
+    "StructuredInferenceInput",
+    "StructuredInferenceOutput",
     "SUPPORTED_CONTRACT_VERSIONS",
     "UIProjectionEvent",
     "UIProjectionPayload",
@@ -1881,6 +2578,7 @@ __all__ = [
     "parse_knowledge_proposal",
     "parse_inference_decision",
     "parse_ui_projection_payload",
+    "read_canonical_inference_request",
     "read_contract",
     "register_abi_unknown_error",
     "register_contract_reader",

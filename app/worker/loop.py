@@ -33,6 +33,7 @@ from app.execution.conformance_graph import (
     node_a,
     node_b,
 )
+from app.inference import TypedInferencePort
 from app.observation.facts import (
     build_lifecycle_emit_request,
     build_node_executed_emit_request,
@@ -64,6 +65,7 @@ class RuntimeWorker:
         worker_id: str,
         runtime_build_hash: str,
         database_url: str,
+        inference_port: TypedInferencePort | None = None,
         poll_interval: float = POLL_INTERVAL_SECONDS,
     ) -> None:
         self._driver = driver
@@ -71,6 +73,7 @@ class RuntimeWorker:
         self._worker_id = worker_id
         self._runtime_build_hash = runtime_build_hash
         self._database_url = database_url
+        self._inference_port = inference_port
         self._poll_interval = poll_interval
         self._shutdown = asyncio.Event()
 
@@ -299,6 +302,7 @@ async def run_worker(
     worker_id: str,
     runtime_build_hash: str,
     database_url: str,
+    inference_port: TypedInferencePort | None = None,
     poll_interval: float = POLL_INTERVAL_SECONDS,
 ) -> None:
     """Run a bounded worker loop until SIGTERM/SIGINT."""
@@ -308,6 +312,7 @@ async def run_worker(
         worker_id=worker_id,
         runtime_build_hash=runtime_build_hash,
         database_url=database_url,
+        inference_port=inference_port,
         poll_interval=poll_interval,
     )
     loop = asyncio.get_event_loop()

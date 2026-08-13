@@ -27,6 +27,11 @@ fail closed。
 原有功能所有权；验证发现上游功能缺口时应阻断并回到对应工作包修复，然后针对新 build
 重新验收。
 
+当前实施顺序固定为两个阶段：先由 WS-1 owner 补齐统一 safe canonical codec/registry
+seam，关闭 inference request/context/artifact 的上游契约缺口；随后由 WS-5 将 production
+adapter 构造和真实 provider G2 合并实现、验收。原 Evaluation/Publication 检查点只在新的
+inference seam 通过后继续。该顺序不删减 WS-5 production adapter 或 G2 范围。
+
 ## 范围
 
 ### In Scope
@@ -38,6 +43,18 @@ fail closed。
 - 实现最小 production `TypedInferencePort`/PydanticAI adapter；只允许 versioned
   structured-output inference，不允许 executable business Tool/toolset/MCP、Memory、
   durability、隐藏 Agent loop 或 provider object 进入 checkpoint。
+- production 模块只向 Graph/Node Adapter 暴露 `TypedInferencePort.infer(request, *,
+  result_type)` 深接口；不得公开接受 model client、任意 PydanticAI Model、verified token，
+  或允许同一调用方同时提供 candidate facts、expected facts、hash 与 trust root 的 factory。
+- `result_type` 只能使用 WS-1 contract owner 发布且编入 Runtime Build 的 canonical schema
+  类型；调用方可从 `app.contracts` 导入精确类型，但不得导入或修改 production schema catalog、
+  registry、Manifest 或 Provider 构造模块。
+- Runtime Worker composition root 只从外部签发、内容寻址的
+  `ProviderBindingManifest` 构造 production port。Manifest 至少固定 provider type/profile、
+  model identifier、endpoint/config fingerprint、SDK/PydanticAI/adapter/Runtime Build
+  version/hash、Model/Retry/Budget/Pricing policy、input/output schema ref/hash、
+  `sdk_max_retries = 0` 和不含 secret 的 credential slot ID；production 模块内部创建并拥有
+  唯一允许的 SDK client 与 PydanticAI model。
 - model/provider 不在 Core 任务书中硬编码；WS-5 执行时必须通过 versioned
   `ModelPolicy`、model identifier、provider adapter ref/hash 和 Runtime Build 精确
   绑定一个真实 provider。凭据只从 cleanroom secret boundary 注入，不进入代码、日志、
@@ -100,6 +117,10 @@ fail closed。
   topology、Capability Profile 或行为相关 policy 的任何变化都产生新的候选对象。
 - WS-5 可以实现发布专属 seam；发现属于 WS-0～WS-4 的功能缺口时，WS-5 状态转为
   blocked，直到对应 owner 修复并提供新的精确候选 build。
+- production inference 开工前，WS-1 safe canonical codec/registry 必须从原始 `dict`
+  递归验证 exact type、extra、canonical JSON type、size/hash、UTF-8/JSON、depth/node 和
+  schema；拒绝完整 moving-ref 等价类与 cross-tenant `context_refs`，保留 omitted、explicit
+  null、present 三态，并证明所有非法输入在 provider/callback 调用前失败。
 
 ## Exit Invariants
 
@@ -131,6 +152,10 @@ fail closed。
     evidence、telemetry 或验收记录；失败证据同样遵守脱敏和低基数规则。
 12. WS-0～WS-4 功能缺口由对应 owner 修复；WS-5 不通过特例、waiver 或 proof tooling
     掩盖功能错误。
+13. 每个真实 HTTP send 由唯一 transport ledger 在发送前 reserve；SDK retry 固定为零，
+    adapter-owned provider transient retry 与 schema repair 共享同一个 deadline、attempt、token
+    和 cost ledger。每个物理请求先计 base cost，响应后追加 token cost；content filter/refusal
+    是永久结果且不进入 schema retry；取消原样传播并清理 ContextVar/lock。
 
 ## 验收标准
 
@@ -144,7 +169,10 @@ fail closed。
   dependency、role/capability fail-fast 和旁路族测试全部绑定候选 build。
 - G2：真实 PostgreSQL/RLS/PostgresSaver 与执行时选定的真实 model/provider、
   production PydanticAI adapter 在 cleanroom 共同工作；mock 只用于 unit test，
-  conformance fixture 不进入 production Skill channel 或产生 G3 结论。
+  conformance fixture 不进入 production Skill channel 或产生 G3 结论。provider profile/settings、
+  endpoint fingerprint、最终请求字段、structured-output 行为、content filter/refusal、usage 与
+  pricing 必须与 Manifest 一致；retry/budget 验收以 transport 观察到的物理 HTTP 请求数为准，
+  不得以 `Model.request`、Agent run 或 SDK usage request 数替代。
 - G4：cross-tenant/public-ID enumeration、RLS/role、request/model/header injection、
   credential/secret disclosure、timing、tenant-switch reset 和 audit evidence 通过。
 - G5：POC-I、适用 POC-C、fault matrix、idempotency、stale-writer rejection、
