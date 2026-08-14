@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from hashlib import sha256
 
 import pytest
@@ -98,3 +99,7 @@ def test_manifest_loader_rejects_duplicate_and_noncanonical_json() -> None:
     duplicate = b'{"schema_version":"provider-binding-manifest.v1","schema_version":"provider-binding-manifest.v1"}\n'
     with pytest.raises(ValueError):
         load_provider_binding_manifest(duplicate, expected_hash=sha256(duplicate).hexdigest())
+
+    noncanonical = json.dumps(_manifest_data(), ensure_ascii=False, sort_keys=True).encode("utf-8")
+    with pytest.raises(ValueError, match="bytes mismatch"):
+        load_provider_binding_manifest(noncanonical, expected_hash=sha256(noncanonical).hexdigest())

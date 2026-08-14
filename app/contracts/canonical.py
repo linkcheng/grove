@@ -16,11 +16,12 @@ from hashlib import sha256
 from json import JSONDecodeError, dumps, loads
 from math import isfinite
 from re import fullmatch
-from types import UnionType
+from types import GetSetDescriptorType, MemberDescriptorType, UnionType
 from typing import Annotated, Any, Generic, Literal, TypeVar, Union, cast, get_args, get_origin
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
+from pydantic.fields import FieldInfo
 from pydantic_core import SchemaValidator
 
 CANONICAL_SEPARATOR = (",", ":")
@@ -1087,6 +1088,35 @@ def _is_model_type(value: Any) -> bool:
     return type(model_mro) is tuple and any(base is BaseModel for base in model_mro)
 
 
+def _read_base_model_storage(value: Any, runtime_type: Any) -> tuple[Any, Any, Any]:
+    base_storage = object.__getattribute__(BaseModel, "__dict__")
+    dict_descriptor = base_storage["__dict__"]
+    extras_descriptor = base_storage["__pydantic_extra__"]
+    fields_set_descriptor = base_storage["__pydantic_fields_set__"]
+    if (
+        type(dict_descriptor) is not GetSetDescriptorType
+        or type(extras_descriptor) is not MemberDescriptorType
+        or type(fields_set_descriptor) is not MemberDescriptorType
+    ):
+        raise TypeError("invalid BaseModel storage descriptors")
+    storage = dict_descriptor.__get__(value, runtime_type)
+    extras = extras_descriptor.__get__(value, runtime_type)
+    fields_set = fields_set_descriptor.__get__(value, runtime_type)
+    return storage, extras, fields_set
+
+
+def _read_model_field_catalog(runtime_type: Any) -> dict[str, FieldInfo]:
+    runtime_namespace = type.__getattribute__(runtime_type, "__dict__")
+    if "model_fields" in runtime_namespace:
+        raise TypeError("model field descriptor overrides are not allowed")
+    runtime_fields = runtime_namespace.get("__pydantic_fields__")
+    if type(runtime_fields) is not dict or any(
+        type(name) is not str or type(field) is not FieldInfo for name, field in runtime_fields.items()
+    ):
+        raise TypeError("invalid model field catalog")
+    return cast(dict[str, FieldInfo], runtime_fields)
+
+
 def _assert_safe_annotation(
     annotation: Any,
     seen: set[type[BaseModel]],
@@ -1525,6 +1555,23 @@ def _validate_raw_json_tree(value: Any, *, max_depth: int, max_nodes: int) -> No
     visit(value, 0)
 
 
+def _canonical_raw_bytes(raw: dict[str, Any], *, max_bytes: int) -> bytes:
+    """Encode an already-proven exact JSON tree without exposing failures."""
+
+    encoded: bytes | None = None
+    try:
+        candidate = canonical_bytes(raw)
+        if type(candidate) is bytes:
+            encoded = candidate
+    except (TypeError, ValueError, RecursionError, MemoryError):
+        pass
+    if encoded is None:
+        raise CanonicalCodecError("canonical payload encoding failed")
+    if len(encoded) > max_bytes:
+        raise CanonicalCodecError("canonical payload size limit exceeded")
+    return encoded
+
+
 def _duplicate_key_object(pairs: list[tuple[Any, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -1744,8 +1791,9 @@ class SafeCanonicalCodec:
         if type(raw) is not dict:
             raise TypeError("canonical raw payload must be an exact dict")
         selected_limits = DEFAULT_CANONICAL_READ_LIMITS if limits is None else limits
-        _, max_depth, max_nodes = _read_limit_values(selected_limits)
+        max_bytes, max_depth, max_nodes = _read_limit_values(selected_limits)
         _validate_raw_json_tree(raw, max_depth=max_depth, max_nodes=max_nodes)
+        _canonical_raw_bytes(raw, max_bytes=max_bytes)
         return cast(dict[str, Any], raw)
 
     def _read_validated_dict(
@@ -1821,6 +1869,9 @@ class SafeCanonicalCodec:
         if type(raw) is not dict:
             raise CanonicalCodecError("canonical JSON root must be an object")
         prepared = cast(dict[str, Any], raw)
+        encoded = _canonical_raw_bytes(prepared, max_bytes=max_bytes)
+        if payload != encoded:
+            raise CanonicalCodecError("canonical payload bytes mismatch")
         return self._read_validated_dict(prepared, schema_ref=schema_ref, role=role)
 
 
@@ -1894,12 +1945,24 @@ def validate_canonical_inference_request(
     hook is consulted before the storage shape is proven safe.
     """
 
+    selected_limits = DEFAULT_CANONICAL_READ_LIMITS if limits is None else limits
+    _, max_depth, max_nodes = _read_limit_values(selected_limits)
+    request_model = type(request)
+    raw = _safe_model_storage_tree(
+        request,
+        None,
+        path="$",
+        max_depth=max_depth,
+        max_nodes=max_nodes,
+    )
+    codec = SafeCanonicalCodec(registry)
+    codec._prepare_dict(raw, limits=limits)
     reference = _checked_schema_ref(input_schema_ref)
     input_model = registry.resolve_model(reference, role="input")
-    request_model = _parameterize(CanonicalInferenceRequest, input_model)
-    if type(request) is not request_model:
+    expected_request_model = _parameterize(CanonicalInferenceRequest, input_model)
+    if request_model is not expected_request_model:
         raise TypeError("inference request must use the exact registered request type")
-    raw = _safe_model_storage_tree(request, request_model, path="$")
+    _safe_model_storage_tree(request, expected_request_model, path="$")
     return read_canonical_inference_request(
         raw,
         input_schema_ref=reference,
@@ -1908,16 +1971,138 @@ def validate_canonical_inference_request(
     )
 
 
-def _safe_model_storage_tree(value: Any, expected: Any, *, path: str) -> Any:
+def _safe_model_storage_tree(
+    value: Any,
+    expected: Any,
+    *,
+    path: str,
+    max_depth: int | None = None,
+    max_nodes: int | None = None,
+) -> Any:
+    if (max_depth is None) is not (max_nodes is None):
+        raise TypeError("storage projection limits must be provided together")
+    remaining_nodes = [max_nodes] if max_nodes is not None else None
+    try:
+        return _safe_model_storage_value(
+            value,
+            expected,
+            path=path,
+            depth=0,
+            max_depth=max_depth,
+            remaining_nodes=remaining_nodes,
+        )
+    except (MemoryError, RecursionError):
+        raise CanonicalCodecError("canonical payload traversal failed") from None
+
+
+def _safe_model_storage_value(
+    value: Any,
+    expected: Any,
+    *,
+    path: str,
+    depth: int,
+    max_depth: int | None,
+    remaining_nodes: list[int] | None,
+) -> Any:
+    if remaining_nodes is not None:
+        remaining = remaining_nodes[0]
+        remaining -= 1
+        remaining_nodes[0] = remaining
+        if remaining < 0:
+            raise CanonicalCodecError("canonical payload node limit exceeded")
+    if expected is None:
+        runtime_type = type(value)
+        if _is_model_type(runtime_type):
+            if max_depth is not None and depth >= max_depth:
+                raise CanonicalCodecError("canonical payload depth limit exceeded")
+            try:
+                storage, extras, fields_set = _read_base_model_storage(value, runtime_type)
+            except (AttributeError, TypeError):
+                raise TypeError(f"invalid model storage at {path}") from None
+            if type(storage) is not dict or type(fields_set) is not set:
+                raise TypeError(f"invalid model storage at {path}")
+            if extras is not None and (type(extras) is not dict or extras):
+                raise TypeError(f"invalid model extras at {path}")
+            if any(type(key) is not str for key in storage) or any(type(name) is not str for name in fields_set):
+                raise TypeError(f"invalid model storage keys at {path}")
+            try:
+                runtime_fields = _read_model_field_catalog(runtime_type)
+            except TypeError:
+                raise TypeError(f"invalid model field catalog at {path}") from None
+            if not fields_set.issubset(storage) or not set(storage).issubset(runtime_fields):
+                raise ValueError(f"model storage contains unvalidated fields at {path}")
+            return {
+                name: _safe_model_storage_value(
+                    storage[name],
+                    None,
+                    path=f"{path}.{name}",
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    remaining_nodes=remaining_nodes,
+                )
+                for name in fields_set
+            }
+        if runtime_type is tuple:
+            if max_depth is not None and depth >= max_depth:
+                raise CanonicalCodecError("canonical payload depth limit exceeded")
+            return [
+                _safe_model_storage_value(
+                    item,
+                    None,
+                    path=f"{path}[{index}]",
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    remaining_nodes=remaining_nodes,
+                )
+                for index, item in enumerate(value)
+            ]
+        if runtime_type is list:
+            if max_depth is not None and depth >= max_depth:
+                raise CanonicalCodecError("canonical payload depth limit exceeded")
+            return [
+                _safe_model_storage_value(
+                    item,
+                    None,
+                    path=f"{path}[{index}]",
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    remaining_nodes=remaining_nodes,
+                )
+                for index, item in enumerate(value)
+            ]
+        if runtime_type is dict:
+            if max_depth is not None and depth >= max_depth:
+                raise CanonicalCodecError("canonical payload depth limit exceeded")
+            if any(type(key) is not str for key in value):
+                raise TypeError(f"canonical mapping keys must be exact strings at {path}")
+            return {
+                key: _safe_model_storage_value(
+                    item,
+                    None,
+                    path=f"{path}.{key}",
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    remaining_nodes=remaining_nodes,
+                )
+                for key, item in value.items()
+            }
+        if runtime_type is UUID:
+            return str(value).lower()
+        if runtime_type is datetime:
+            if type(value.tzinfo) is not type(UTC):
+                raise TypeError(f"unexpected datetime timezone at {path}")
+            timespec = "microseconds" if value.microsecond else "seconds"
+            return value.isoformat(timespec=timespec).replace("+00:00", "Z")
+        if runtime_type in (str, int, float, bool) or value is None:
+            return value
+        raise TypeError(f"unsupported inference request value at {path}")
     origin = get_origin(expected)
     arguments = get_args(expected)
     if _is_model_type(expected):
         if type(value) is not expected:
             raise TypeError(f"unexpected model type at {path}")
-        storage = object.__getattribute__(value, "__dict__")
-        extras = object.__getattribute__(value, "__pydantic_extra__")
-        fields_set = object.__getattribute__(value, "__pydantic_fields_set__")
-        fields = expected.model_fields
+        storage, extras, fields_set = _read_base_model_storage(value, expected)
+        fields = _read_model_field_catalog(expected)
         if type(storage) is not dict or type(fields_set) is not set:
             raise TypeError(f"invalid model storage at {path}")
         if extras is not None and (type(extras) is not dict or extras):
@@ -1927,15 +2112,36 @@ def _safe_model_storage_tree(value: Any, expected: Any, *, path: str) -> Any:
         if not fields_set.issubset(storage) or not set(storage).issubset(fields):
             raise ValueError(f"model storage contains unvalidated fields at {path}")
         return {
-            name: _safe_model_storage_tree(storage[name], fields[name].annotation, path=f"{path}.{name}")
+            name: _safe_model_storage_value(
+                storage[name],
+                fields[name].annotation,
+                path=f"{path}.{name}",
+                depth=depth + 1,
+                max_depth=max_depth,
+                remaining_nodes=remaining_nodes,
+            )
             for name in fields_set
         }
     if origin is Annotated:
-        return _safe_model_storage_tree(value, arguments[0], path=path)
+        return _safe_model_storage_value(
+            value,
+            arguments[0],
+            path=path,
+            depth=depth,
+            max_depth=max_depth,
+            remaining_nodes=remaining_nodes,
+        )
     if origin in (Union, UnionType):
         for branch in _union_branches(value, expected):
             try:
-                return _safe_model_storage_tree(value, branch, path=path)
+                return _safe_model_storage_value(
+                    value,
+                    branch,
+                    path=path,
+                    depth=depth,
+                    max_depth=max_depth,
+                    remaining_nodes=remaining_nodes,
+                )
             except (TypeError, ValueError):
                 continue
         raise TypeError(f"no exact union branch at {path}")
@@ -1948,11 +2154,26 @@ def _safe_model_storage_tree(value: Any, expected: Any, *, path: str) -> Any:
             if len(value) != len(arguments):
                 raise ValueError(f"tuple length mismatch at {path}")
             return [
-                _safe_model_storage_tree(item, item_expected, path=f"{path}[{index}]")
+                _safe_model_storage_value(
+                    item,
+                    item_expected,
+                    path=f"{path}[{index}]",
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    remaining_nodes=remaining_nodes,
+                )
                 for index, (item, item_expected) in enumerate(zip(value, arguments, strict=True))
             ]
         return [
-            _safe_model_storage_tree(item, item_schema, path=f"{path}[{index}]") for index, item in enumerate(value)
+            _safe_model_storage_value(
+                item,
+                item_schema,
+                path=f"{path}[{index}]",
+                depth=depth + 1,
+                max_depth=max_depth,
+                remaining_nodes=remaining_nodes,
+            )
+            for index, item in enumerate(value)
         ]
     if origin in (dict, Mapping):
         if type(value) is not dict:
@@ -1960,13 +2181,23 @@ def _safe_model_storage_tree(value: Any, expected: Any, *, path: str) -> Any:
         key_schema, item_schema = arguments
         if key_schema is not str or any(type(key) is not str for key in value):
             raise TypeError(f"canonical mapping keys must be exact strings at {path}")
-        return {key: _safe_model_storage_tree(item, item_schema, path=f"{path}.{key}") for key, item in value.items()}
+        return {
+            key: _safe_model_storage_value(
+                item,
+                item_schema,
+                path=f"{path}.{key}",
+                depth=depth + 1,
+                max_depth=max_depth,
+                remaining_nodes=remaining_nodes,
+            )
+            for key, item in value.items()
+        }
     if expected is UUID:
         if type(value) is not UUID:
             raise TypeError(f"unexpected UUID type at {path}")
         return str(value).lower()
     if expected is datetime:
-        if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+        if type(value) is not datetime or type(value.tzinfo) is not type(UTC):
             raise TypeError(f"unexpected datetime type at {path}")
         utc_value = value.astimezone(UTC)
         timespec = "microseconds" if utc_value.microsecond else "seconds"

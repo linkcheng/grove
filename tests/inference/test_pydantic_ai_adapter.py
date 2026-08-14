@@ -206,6 +206,25 @@ async def test_model_copy_extra_in_request_is_rejected_before_transport() -> Non
 
 
 @pytest.mark.asyncio
+async def test_oversized_typed_request_is_rejected_before_transport() -> None:
+    sends = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal sends
+        sends += 1
+        return httpx.Response(500)
+
+    port = _port(httpx.MockTransport(handler))
+    oversized = request().model_copy(update={"input": Input(question="x" * 1_048_576)})
+    with pytest.raises(Exception) as exc_info:
+        await port.infer(oversized, result_type=Output)
+    assert getattr(exc_info.value, "code", None) is InferenceErrorCode.POLICY_REJECTED
+    assert sends == 0
+    assert port.physical_sends == 0
+    await port.aclose()
+
+
+@pytest.mark.asyncio
 async def test_present_context_survives_typed_request_revalidation() -> None:
     async def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(

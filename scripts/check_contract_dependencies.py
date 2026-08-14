@@ -33,9 +33,10 @@ _IMPORT_SYMBOL_ALLOWLISTS: dict[str, dict[str, frozenset[str]]] = {
         "pydantic": frozenset(
             {"BaseModel", "ConfigDict", "Field", "TypeAdapter", "field_validator", "model_validator"}
         ),
+        "pydantic.fields": frozenset({"FieldInfo"}),
         "pydantic_core": frozenset({"SchemaValidator"}),
         "re": frozenset({"fullmatch"}),
-        "types": frozenset({"UnionType"}),
+        "types": frozenset({"GetSetDescriptorType", "MemberDescriptorType", "UnionType"}),
         "typing": frozenset(
             {"Annotated", "Any", "Generic", "Literal", "TypeVar", "Union", "cast", "get_args", "get_origin"}
         ),
@@ -252,6 +253,144 @@ def _record_assignment_aliases(tree: ast.AST, aliases: set[str], exempt_nodes: s
                             changed = True
 
 
+class _ScopeBindingCollector(ast.NodeVisitor):
+    """Collect names bound in one scope without descending into child scopes."""
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.names.add(node.id)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self.names.update(alias.asname or alias.name.split(".", 1)[0] for alias in node.names)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        self.names.update(alias.asname or alias.name for alias in node.names)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.names.add(node.name)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.names.add(node.name)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.names.add(node.name)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        del node
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.name is not None:
+            self.names.add(node.name)
+        if node.type is not None:
+            self.visit(node.type)
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_MatchAs(self, node: ast.MatchAs) -> None:
+        if node.name is not None:
+            self.names.add(node.name)
+        if node.pattern is not None:
+            self.visit(node.pattern)
+
+    def visit_MatchStar(self, node: ast.MatchStar) -> None:
+        if node.name is not None:
+            self.names.add(node.name)
+
+    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+        if node.rest is not None:
+            self.names.add(node.rest)
+        self.generic_visit(node)
+
+
+class _SameScopeNodeCollector(ast.NodeVisitor):
+    """Collect nodes in one scope without inspecting child scope bodies."""
+
+    def __init__(self) -> None:
+        self.nodes: list[ast.AST] = []
+
+    def visit(self, node: ast.AST) -> None:
+        self.nodes.append(node)
+        super().visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.nodes.append(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.nodes.append(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.nodes.append(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self.nodes.append(node)
+
+
+def _scope_bound_names(statements: list[ast.stmt]) -> set[str]:
+    collector = _ScopeBindingCollector()
+    for statement in statements:
+        collector.visit(statement)
+    return collector.names
+
+
+def _same_scope_nodes(statements: list[ast.stmt]) -> tuple[ast.AST, ...]:
+    collector = _SameScopeNodeCollector()
+    for statement in statements:
+        collector.visit(statement)
+    return tuple(collector.nodes)
+
+
+def _module_rebinds_reflection_names(tree: ast.Module) -> bool:
+    forbidden = {"object", "type", "BaseModel"}
+    for statement in tree.body:
+        if isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                bound_name = alias.asname or alias.name
+                if bound_name == "BaseModel" and (
+                    statement.module == "pydantic" and alias.name == "BaseModel" and alias.asname is None
+                ):
+                    continue
+                if bound_name in forbidden:
+                    return True
+            continue
+        if _scope_bound_names([statement]) & forbidden:
+            return True
+    return False
+
+
+def _matches_signature(
+    function: ast.FunctionDef,
+    *,
+    positional: tuple[str, ...],
+    positional_defaults: tuple[object, ...] = (),
+    keyword_only: tuple[str, ...] = (),
+    keyword_defaults: tuple[object, ...] = (),
+) -> bool:
+    actual_positional = tuple(argument.arg for argument in (*function.args.posonlyargs, *function.args.args))
+    actual_keyword_only = tuple(argument.arg for argument in function.args.kwonlyargs)
+
+    def exact_defaults(nodes: list[ast.expr | None], expected: tuple[object, ...]) -> bool:
+        if len(nodes) != len(expected):
+            return False
+        return all(
+            isinstance(node, ast.Constant) and type(node.value) is type(value) and node.value == value
+            for node, value in zip(nodes, expected, strict=True)
+        )
+
+    return (
+        not function.args.posonlyargs
+        and actual_positional == positional
+        and exact_defaults(list(function.args.defaults), positional_defaults)
+        and actual_keyword_only == keyword_only
+        and exact_defaults(list(function.args.kw_defaults), keyword_defaults)
+        and function.args.vararg is None
+        and function.args.kwarg is None
+        and not function.decorator_list
+    )
+
+
 def _safe_storage_reflection_nodes(path: Path, tree: ast.AST) -> set[int]:
     """Allow only the exact trusted-type/raw-storage reads owned by Canonical.
 
@@ -260,32 +399,126 @@ def _safe_storage_reflection_nodes(path: Path, tree: ast.AST) -> set[int]:
     match.  Any added reflection call remains a violation.
     """
 
-    if path.name != "canonical.py":
+    if tuple(path.parts[-3:]) != ("app", "contracts", "canonical.py") or not isinstance(tree, ast.Module):
         return set()
+    if _module_rebinds_reflection_names(tree):
+        return set()
+    descriptor_targets = {
+        "dict_descriptor": "__dict__",
+        "extras_descriptor": "__pydantic_extra__",
+        "fields_set_descriptor": "__pydantic_fields_set__",
+    }
+    storage_targets = {
+        "storage": "dict_descriptor",
+        "extras": "extras_descriptor",
+        "fields_set": "fields_set_descriptor",
+    }
     expected_by_function = {
-        "_safe_model_storage_tree": {
-            "storage": "__dict__",
-            "extras": "__pydantic_extra__",
-            "fields_set": "__pydantic_fields_set__",
+        "_read_model_field_catalog": {
+            "runtime_namespace": "__dict__",
         },
         "_is_model_type": {"model_mro": "__mro__"},
         "_assert_strict_model": {"config": "model_config", "fields": "model_fields"},
     }
     exempt: set[int] = set()
-    for function in (node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)):
+    functions = (node for node in tree.body if isinstance(node, ast.FunctionDef))
+    for function in functions:
+        local_bindings = _scope_bound_names(function.body)
+        if function.name == "_read_base_model_storage":
+            signature_is_exact = _matches_signature(
+                function, positional=("value", "runtime_type")
+            ) and not local_bindings.intersection({"object", "type", "BaseModel"})
+            assignments = [node for node in function.body if isinstance(node, ast.Assign)]
+            if signature_is_exact and len(assignments) == 7:
+                base_assignment = assignments[0]
+                if (
+                    len(base_assignment.targets) == 1
+                    and isinstance(base_assignment.targets[0], ast.Name)
+                    and base_assignment.targets[0].id == "base_storage"
+                    and isinstance(base_assignment.value, ast.Call)
+                    and isinstance(base_assignment.value.func, ast.Attribute)
+                    and base_assignment.value.func.attr == "__getattribute__"
+                    and isinstance(base_assignment.value.func.value, ast.Name)
+                    and base_assignment.value.func.value.id == "object"
+                    and len(base_assignment.value.args) == 2
+                    and isinstance(base_assignment.value.args[0], ast.Name)
+                    and base_assignment.value.args[0].id == "BaseModel"
+                    and isinstance(base_assignment.value.args[1], ast.Constant)
+                    and base_assignment.value.args[1].value == "__dict__"
+                    and not base_assignment.value.keywords
+                ):
+                    descriptor_assignments_valid = True
+                    for assignment in assignments[1:4]:
+                        target = assignment.targets[0] if len(assignment.targets) == 1 else None
+                        expected_key = descriptor_targets.get(target.id) if isinstance(target, ast.Name) else None
+                        subscript = assignment.value
+                        descriptor_assignments_valid = descriptor_assignments_valid and (
+                            expected_key is not None
+                            and isinstance(subscript, ast.Subscript)
+                            and isinstance(subscript.value, ast.Name)
+                            and subscript.value.id == "base_storage"
+                            and isinstance(subscript.slice, ast.Constant)
+                            and subscript.slice.value == expected_key
+                        )
+                    for assignment in assignments[4:]:
+                        target = assignment.targets[0] if len(assignment.targets) == 1 else None
+                        expected_descriptor = storage_targets.get(target.id) if isinstance(target, ast.Name) else None
+                        call = assignment.value
+                        descriptor_assignments_valid = descriptor_assignments_valid and (
+                            expected_descriptor is not None
+                            and isinstance(call, ast.Call)
+                            and isinstance(call.func, ast.Attribute)
+                            and call.func.attr == "__get__"
+                            and isinstance(call.func.value, ast.Name)
+                            and call.func.value.id == expected_descriptor
+                            and len(call.args) == 2
+                            and isinstance(call.args[0], ast.Name)
+                            and call.args[0].id == "value"
+                            and isinstance(call.args[1], ast.Name)
+                            and call.args[1].id == "runtime_type"
+                            and not call.keywords
+                        )
+                    if descriptor_assignments_valid:
+                        for assignment in assignments:
+                            exempt.update(id(node) for node in ast.walk(assignment.value))
         expected = expected_by_function.get(function.name)
         if expected is None:
             continue
-        for statement in ast.walk(function):
-            if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+        if function.name == "_read_model_field_catalog":
+            if not _matches_signature(function, positional=("runtime_type",)) or local_bindings.intersection(
+                {"object", "type", "BaseModel"}
+            ):
                 continue
-            target = statement.targets[0]
-            call = statement.value
+        elif function.name == "_is_model_type":
+            if not _matches_signature(function, positional=("value",)) or local_bindings.intersection(
+                {"object", "type", "BaseModel"}
+            ):
+                continue
+        elif function.name == "_assert_strict_model" and (
+            not _matches_signature(
+                function,
+                positional=("model", "seen"),
+                positional_defaults=(None,),
+                keyword_only=("allow_mapping",),
+                keyword_defaults=(True,),
+            )
+            or local_bindings.intersection({"object", "type", "BaseModel"})
+        ):
+            continue
+        for function_node in _same_scope_nodes(function.body):
+            if not isinstance(function_node, ast.Assign) or len(function_node.targets) != 1:
+                continue
+            target = function_node.targets[0]
+            call = function_node.value
             if not isinstance(target, ast.Name) or target.id not in expected or not isinstance(call, ast.Call):
                 continue
             attribute = call.func
             receiver = "object" if target.id in {"storage", "extras", "fields_set"} else "type"
-            value_name = "value" if receiver == "object" else ("value" if target.id == "model_mro" else "model")
+            value_name = (
+                "value"
+                if receiver == "object" or target.id == "model_mro"
+                else ("runtime_type" if target.id == "runtime_namespace" else "model")
+            )
             if (
                 not isinstance(attribute, ast.Attribute)
                 or attribute.attr != "__getattribute__"

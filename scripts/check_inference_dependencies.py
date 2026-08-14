@@ -7,6 +7,13 @@ import ast
 import sys
 from pathlib import Path
 
+from scripts.check_contract_dependencies import (
+    _matches_signature,
+    _module_rebinds_reflection_names,
+    _same_scope_nodes,
+    _scope_bound_names,
+)
+
 _PRIVATE_MODULES = frozenset(
     {
         "app.inference.ai_config",
@@ -86,6 +93,66 @@ def _relative_private_import(node: ast.ImportFrom) -> bool:
     return node.module == "inference" or node.module.startswith("inference.")
 
 
+def _safe_canonical_reflection_nodes(path: Path, tree: ast.AST) -> set[int]:
+    """Allow only Canonical's fixed type/storage reads."""
+
+    if tuple(path.parts[-3:]) != ("app", "contracts", "canonical.py") or not isinstance(tree, ast.Module):
+        return set()
+    if _module_rebinds_reflection_names(tree):
+        return set()
+    expected_assignments = {
+        ("_is_model_type", "model_mro"): ("type", "value", "__mro__"),
+        ("_read_base_model_storage", "base_storage"): ("object", "BaseModel", "__dict__"),
+        ("_read_model_field_catalog", "runtime_namespace"): ("type", "runtime_type", "__dict__"),
+        ("_assert_strict_model", "config"): ("type", "model", "model_config"),
+        ("_assert_strict_model", "fields"): ("type", "model", "model_fields"),
+    }
+    exempt: set[int] = set()
+    functions = (node for node in tree.body if isinstance(node, ast.FunctionDef))
+    for function in functions:
+        local_bindings = _scope_bound_names(function.body)
+        if local_bindings.intersection({"object", "type", "BaseModel"}):
+            continue
+        if function.name == "_is_model_type":
+            signature_is_exact = _matches_signature(function, positional=("value",))
+        elif function.name == "_read_base_model_storage":
+            signature_is_exact = _matches_signature(function, positional=("value", "runtime_type"))
+        elif function.name == "_read_model_field_catalog":
+            signature_is_exact = _matches_signature(function, positional=("runtime_type",))
+        elif function.name == "_assert_strict_model":
+            signature_is_exact = _matches_signature(
+                function,
+                positional=("model", "seen"),
+                positional_defaults=(None,),
+                keyword_only=("allow_mapping",),
+                keyword_defaults=(True,),
+            )
+        else:
+            continue
+        if not signature_is_exact:
+            continue
+        for node in _same_scope_nodes(function.body):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and (function.name, node.targets[0].id) in expected_assignments
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr == "__getattribute__"
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id == expected_assignments[(function.name, node.targets[0].id)][0]
+                and len(node.value.args) == 2
+                and isinstance(node.value.args[0], ast.Name)
+                and node.value.args[0].id == expected_assignments[(function.name, node.targets[0].id)][1]
+                and isinstance(node.value.args[1], ast.Constant)
+                and node.value.args[1].value == expected_assignments[(function.name, node.targets[0].id)][2]
+                and not node.value.keywords
+            ):
+                exempt.update(id(child) for child in ast.walk(node.value))
+    return exempt
+
+
 def _safe_existing_dynamic_nodes(path: Path, tree: ast.AST) -> set[int]:
     """Exempt only the existing non-import reflection reads outside capability consumers."""
 
@@ -103,23 +170,8 @@ def _safe_existing_dynamic_nodes(path: Path, tree: ast.AST) -> set[int]:
     }
     relative = path.as_posix()
     expected = next((value for suffix, value in allowed_calls.items() if relative.endswith(suffix)), set())
-    exempt: set[int] = set()
+    exempt = _safe_canonical_reflection_nodes(path, tree)
     for node in ast.walk(tree):
-        if (
-            path.as_posix().endswith("app/contracts/canonical.py")
-            and isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "__getattribute__"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "type"
-            and len(node.args) == 2
-            and isinstance(node.args[0], ast.Name)
-            and node.args[0].id in {"value", "model"}
-            and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value in {"__mro__", "model_config", "model_fields"}
-        ):
-            exempt.update(id(child) for child in ast.walk(node))
-            continue
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -129,10 +181,7 @@ def _safe_existing_dynamic_nodes(path: Path, tree: ast.AST) -> set[int]:
             and len(node.args) == 2
             and isinstance(node.args[1], ast.Constant)
             and node.args[1].value in {"__dict__", "__pydantic_extra__", "__pydantic_fields_set__"}
-            and (
-                path.as_posix().endswith("app/contracts/canonical.py")
-                or path.as_posix().endswith("app/releases/core.py")
-            )
+            and path.as_posix().endswith("app/releases/core.py")
         ):
             exempt.update(id(child) for child in ast.walk(node))
             continue

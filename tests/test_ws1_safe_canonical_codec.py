@@ -8,21 +8,23 @@ allowed to observe them.
 from __future__ import annotations
 
 import hashlib
-import json
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
+from traceback import format_exception
 from typing import Annotated, Any, ClassVar, cast
 from uuid import UUID
 
 import pytest
 from app.contracts.canonical import (
+    CanonicalCodecError,
     CanonicalReadLimits,
     SafeCanonicalCodec,
     TypedSchemaRegistry,
     VersionedRef,
+    canonical_bytes,
     read_canonical_inference_request,
     validate_canonical_inference_request,
 )
-from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, field_validator
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, field_serializer, field_validator
 from pydantic._internal._model_construction import ModelMetaclass
 
 
@@ -83,6 +85,30 @@ class UUIDOrStringInput(BaseModel):
 class DatetimeOrStringInput(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     value: datetime | str
+
+
+class NumericInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    value: float
+
+
+class CallbackInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    value: str
+
+    validator_calls: ClassVar[int] = 0
+    serializer_calls: ClassVar[int] = 0
+
+    @field_validator("value")
+    @classmethod
+    def count_validation(cls, value: str) -> str:
+        cls.validator_calls += 1
+        return value
+
+    @field_serializer("value")
+    def count_serialization(self, value: str) -> str:
+        type(self).serializer_calls += 1
+        return value
 
 
 class ConstrainedInput(BaseModel):
@@ -318,10 +344,10 @@ def test_registry_rejects_callable_discriminator_without_executing_it() -> None:
     assert calls == 0
 
 
-def test_read_bytes_order_hash_duplicate_utf8_depth_and_nodes() -> None:
+def test_read_bytes_accepts_only_the_unique_canonical_representation() -> None:
     Input.calls = 0
     codec = _codec()
-    raw = b'{"value":"ok","nested":[]}'
+    raw = canonical_bytes({"value": "ok", "nested": []})
     expected = hashlib.sha256(raw).hexdigest()
     assert codec.read_bytes(raw, expected_hash=expected, schema_ref=_ref(), role="input").value == "ok"
     assert Input.calls == 1
@@ -330,24 +356,94 @@ def test_read_bytes_order_hash_duplicate_utf8_depth_and_nodes() -> None:
         codec.read_bytes(raw, expected_hash="b" * 64, schema_ref=_ref(), role="input")
     assert Input.calls == 1
 
-    for bad in (
-        b'{"value":"x","value":"y","nested":[]}',
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        b'{"nested":[],"value":"ok"}',
+        b'{"nested":[],"value":"ok"}\n\n',
+        b' {"nested":[],"value":"ok"}\n',
+        b'{"nested":[],"value":"ok"} \n',
+        b'{"nested": [],"value":"ok"}\n',
+        b'{"value":"ok","nested":[]}\n',
+        b'{"nested": [], "value": "ok"}\n',
+        b'{"nested":[],"value":"\\u00e9"}\n',
+    ),
+)
+def test_noncanonical_equivalent_bytes_are_rejected_with_their_own_hash_before_schema(raw: bytes) -> None:
+    Input.calls = 0
+    codec = _codec()
+
+    with pytest.raises(CanonicalCodecError, match="bytes mismatch"):
+        codec.read_bytes(raw, expected_hash=hashlib.sha256(raw).hexdigest(), schema_ref=_ref(), role="input")
+    assert Input.calls == 0
+
+
+def test_noncanonical_number_spelling_is_rejected_before_schema() -> None:
+    raw = b'{"value":1e0}\n'
+    reference = _ref("schema.numeric@1")
+    codec = _codec(NumericInput, reference)
+
+    with pytest.raises(CanonicalCodecError, match="bytes mismatch"):
+        codec.read_bytes(raw, expected_hash=hashlib.sha256(raw).hexdigest(), schema_ref=reference, role="input")
+
+
+def test_noncanonical_bytes_with_canonical_hash_fail_at_hash_before_schema() -> None:
+    Input.calls = 0
+    codec = _codec()
+    canonical = canonical_bytes({"value": "ok", "nested": []})
+    noncanonical = canonical.removesuffix(b"\n")
+
+    with pytest.raises(CanonicalCodecError, match="hash"):
+        codec.read_bytes(
+            noncanonical,
+            expected_hash=hashlib.sha256(canonical).hexdigest(),
+            schema_ref=_ref(),
+            role="input",
+        )
+    assert Input.calls == 0
+
+
+@pytest.mark.parametrize(
+    "bad",
+    (
+        b'{"nested":[],"value":"x","value":"y"}\n',
+        b'{"nested":[],"value":NaN}\n',
+        b'{"nested":[],"value":Infinity}\n',
         b"\xff",
-        b"[1]",
-    ):
-        with pytest.raises(ValueError):
-            codec.read_bytes(bad, expected_hash=hashlib.sha256(bad).hexdigest(), schema_ref=_ref(), role="input")
-    assert Input.calls == 1
+    ),
+)
+def test_invalid_json_spellings_remain_rejected_before_schema(bad: bytes) -> None:
+    Input.calls = 0
+    codec = _codec()
 
     with pytest.raises(ValueError):
+        codec.read_bytes(bad, expected_hash=hashlib.sha256(bad).hexdigest(), schema_ref=_ref(), role="input")
+    assert Input.calls == 0
+
+
+def test_read_bytes_keeps_root_depth_node_and_raw_size_guards() -> None:
+    Input.calls = 0
+    codec = _codec()
+    root_array = b"[1]\n"
+    with pytest.raises(ValueError, match="root"):
         codec.read_bytes(
-            b'{"value":"x","nested":[]}',
-            expected_hash=hashlib.sha256(b'{"value":"x","nested":[]}').hexdigest(),
+            root_array,
+            expected_hash=hashlib.sha256(root_array).hexdigest(),
+            schema_ref=_ref(),
+            role="input",
+        )
+
+    raw = canonical_bytes({"value": "x", "nested": []})
+    with pytest.raises(ValueError):
+        codec.read_bytes(
+            raw,
+            expected_hash=hashlib.sha256(raw).hexdigest(),
             schema_ref=_ref(),
             role="input",
             limits=CanonicalReadLimits(max_bytes=4, max_depth=8, max_nodes=100),
         )
-    deep = json.dumps({"value": "x", "nested": []}).encode()
+    deep = canonical_bytes({"value": "x", "nested": []})
     with pytest.raises(ValueError):
         codec.read_bytes(
             deep,
@@ -356,7 +452,57 @@ def test_read_bytes_order_hash_duplicate_utf8_depth_and_nodes() -> None:
             role="input",
             limits=CanonicalReadLimits(max_bytes=1024, max_depth=1, max_nodes=100),
         )
-    assert Input.calls == 1
+    assert Input.calls == 0
+
+
+def test_read_dict_rejects_canonical_size_over_limit_before_schema() -> None:
+    Input.calls = 0
+    raw = {"value": "x", "nested": []}
+    max_bytes = len(canonical_bytes(raw)) - 1
+
+    with pytest.raises(CanonicalCodecError, match="size limit"):
+        _codec().read_dict(
+            raw,
+            schema_ref=_ref(),
+            role="input",
+            limits=CanonicalReadLimits(max_bytes=max_bytes, max_depth=8, max_nodes=100),
+        )
+    assert Input.calls == 0
+
+
+def test_noncanonical_bytes_never_invoke_pydantic_validator_or_serializer() -> None:
+    CallbackInput.validator_calls = 0
+    CallbackInput.serializer_calls = 0
+    reference = _ref("schema.callback@1")
+    codec = _codec(CallbackInput, reference)
+    raw = b'{"value": "secret-marker"}\n'
+
+    with pytest.raises(CanonicalCodecError, match="bytes mismatch"):
+        codec.read_bytes(raw, expected_hash=hashlib.sha256(raw).hexdigest(), schema_ref=reference, role="input")
+    assert CallbackInput.validator_calls == 0
+    assert CallbackInput.serializer_calls == 0
+
+
+def test_canonical_encoding_failure_has_no_input_or_underlying_exception_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    codec = _codec()
+    input_marker = "input-" + "secret-marker"
+    underlying_marker = "underlying-" + "secret-marker"
+
+    def fail_encoding(_: object, *, exclude_fields: tuple[str, ...] = ()) -> bytes:
+        del exclude_fields
+        raise ValueError(underlying_marker)
+
+    monkeypatch.setattr("app.contracts.canonical.canonical_bytes", fail_encoding)
+    with pytest.raises(CanonicalCodecError, match="encoding failed") as exc_info:
+        codec.read_dict({"value": input_marker, "nested": []}, schema_ref=_ref(), role="input")
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    rendered = "".join(format_exception(exc_info.value))
+    assert input_marker not in rendered
+    assert underlying_marker not in rendered
 
 
 @pytest.mark.parametrize(
@@ -444,6 +590,12 @@ def test_inference_request_reader_preserves_context_three_state_and_tenant() -> 
     assert omitted.request.context is None
     assert explicit_null.request.context is None
     assert present.request.context is not None
+    state_bytes = {
+        canonical_bytes(_request_raw()),
+        canonical_bytes(_request_raw(context=None)),
+        canonical_bytes(_request_raw(context={"context_ref": "context@v1", "summary": "summary"})),
+    }
+    assert len(state_bytes) == 3
 
     artifact = {
         "artifact_id": "00000000-0000-0000-0000-000000000004",
@@ -490,3 +642,256 @@ def test_typed_inference_request_revalidation_rejects_model_copy_extra_without_c
         )
 
     assert Input.calls == calls_after_valid_construction
+
+
+def test_typed_inference_request_size_fails_before_schema_resolution() -> None:
+    reference = _ref()
+    registry = TypedSchemaRegistry()
+    registry.register(reference, Input, role="input")
+    decoded = read_canonical_inference_request(_request_raw(), input_schema_ref=reference, registry=registry)
+    oversized = decoded.request.model_copy(
+        update={"input": Input(value="x" * 256, nested=[])},
+    )
+
+    class ResolveTrap(dict[tuple[str, str, str, str], type[BaseModel]]):
+        calls = 0
+
+        def __getitem__(self, key: tuple[str, str, str, str]) -> type[BaseModel]:
+            type(self).calls += 1
+            return super().__getitem__(key)
+
+    object.__setattr__(registry, "_bindings", ResolveTrap(registry._bindings))
+    with pytest.raises(CanonicalCodecError, match="size limit"):
+        validate_canonical_inference_request(
+            oversized,
+            input_schema_ref=reference,
+            registry=registry,
+            limits=CanonicalReadLimits(max_bytes=128, max_depth=32, max_nodes=10_000),
+        )
+    assert ResolveTrap.calls == 0
+
+
+def test_typed_inference_request_storage_projection_does_not_execute_subclass_property() -> None:
+    reference = _ref()
+    registry = TypedSchemaRegistry()
+    registry.register(reference, Input, role="input")
+    decoded = read_canonical_inference_request(_request_raw(), input_schema_ref=reference, registry=registry)
+    request_model = type(decoded.request)
+    calls = 0
+
+    class EvilRequest(request_model):  # type: ignore[misc, valid-type]
+        @property
+        def __pydantic_extra__(self) -> dict[str, Any] | None:
+            nonlocal calls
+            calls += 1
+            return None
+
+    forged = object.__new__(EvilRequest)
+    with pytest.raises(TypeError, match="invalid model storage"):
+        validate_canonical_inference_request(
+            forged,
+            input_schema_ref=reference,
+            registry=registry,
+        )
+    assert calls == 0
+
+
+def test_typed_inference_request_preserves_context_presence_states() -> None:
+    reference = _ref()
+    registry = TypedSchemaRegistry()
+    registry.register(reference, Input, role="input")
+    states = []
+    for raw in (
+        _request_raw(),
+        _request_raw(context=None),
+        _request_raw(context={"context_ref": "context@v1", "summary": "summary"}),
+    ):
+        decoded = read_canonical_inference_request(raw, input_schema_ref=reference, registry=registry)
+        revalidated = validate_canonical_inference_request(
+            decoded.request,
+            input_schema_ref=reference,
+            registry=registry,
+        )
+        states.append(revalidated.context_state)
+
+    assert states == ["omitted", "null", "present"]
+
+
+def test_typed_preflight_does_not_execute_field_catalog_descriptor() -> None:
+    reference = _ref()
+    registry = TypedSchemaRegistry()
+    registry.register(reference, Input, role="input")
+    decoded = read_canonical_inference_request(_request_raw(), input_schema_ref=reference, registry=registry)
+    calls = 0
+
+    class EvilDescriptor:
+        def __get__(self, instance: object, owner: object) -> dict[str, Any]:
+            del instance, owner
+            nonlocal calls
+            calls += 1
+            return {}
+
+    namespace = type.__getattribute__(Input, "__dict__")
+    original_fields = namespace["__pydantic_fields__"]
+    type.__setattr__(Input, "__pydantic_fields__", EvilDescriptor())
+    try:
+        with pytest.raises(TypeError, match="field catalog"):
+            validate_canonical_inference_request(
+                decoded.request,
+                input_schema_ref=reference,
+                registry=registry,
+            )
+    finally:
+        type.__setattr__(Input, "__pydantic_fields__", original_fields)
+    assert calls == 0
+
+
+def test_typed_preflight_does_not_execute_replaced_base_model_descriptor() -> None:
+    reference = _ref()
+    registry = TypedSchemaRegistry()
+    registry.register(reference, Input, role="input")
+    decoded = read_canonical_inference_request(_request_raw(), input_schema_ref=reference, registry=registry)
+    calls = 0
+
+    class EvilDescriptor:
+        def __get__(self, instance: object, owner: object) -> None:
+            del instance, owner
+            nonlocal calls
+            calls += 1
+
+    base_namespace = type.__getattribute__(BaseModel, "__dict__")
+    original_extra_descriptor = base_namespace["__pydantic_extra__"]
+    type.__setattr__(BaseModel, "__pydantic_extra__", EvilDescriptor())
+    try:
+        with pytest.raises(TypeError, match="invalid model storage"):
+            validate_canonical_inference_request(
+                decoded.request,
+                input_schema_ref=reference,
+                registry=registry,
+            )
+    finally:
+        type.__setattr__(BaseModel, "__pydantic_extra__", original_extra_descriptor)
+    assert calls == 0
+
+
+def test_typed_revalidation_does_not_execute_model_fields_descriptor() -> None:
+    reference = _ref()
+    registry = TypedSchemaRegistry()
+    registry.register(reference, Input, role="input")
+    decoded = read_canonical_inference_request(_request_raw(), input_schema_ref=reference, registry=registry)
+    calls = 0
+
+    class EvilDescriptor:
+        def __get__(self, instance: object, owner: object) -> dict[str, Any]:
+            del instance, owner
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("model-fields-marker")
+
+    type.__setattr__(Input, "model_fields", EvilDescriptor())
+    try:
+        with pytest.raises(TypeError, match="field catalog"):
+            validate_canonical_inference_request(
+                decoded.request,
+                input_schema_ref=reference,
+                registry=registry,
+            )
+    finally:
+        type.__delattr__(Input, "model_fields")
+    assert calls == 0
+
+
+def test_typed_preflight_bounds_cycles_before_schema_resolution() -> None:
+    reference = _ref()
+    registry = TypedSchemaRegistry()
+    registry.register(reference, Input, role="input")
+    decoded = read_canonical_inference_request(_request_raw(), input_schema_ref=reference, registry=registry)
+    cycle: list[Any] = []
+    cycle.append(cycle)
+    forged_input = decoded.request.input.model_copy(update={"nested": cycle})
+    forged_request = decoded.request.model_copy(update={"input": forged_input})
+
+    class ResolveTrap(dict[tuple[str, str, str, str], type[BaseModel]]):
+        calls = 0
+
+        def __getitem__(self, key: tuple[str, str, str, str]) -> type[BaseModel]:
+            type(self).calls += 1
+            return super().__getitem__(key)
+
+    object.__setattr__(registry, "_bindings", ResolveTrap(registry._bindings))
+    with pytest.raises(CanonicalCodecError, match="depth limit"):
+        validate_canonical_inference_request(
+            forged_request,
+            input_schema_ref=reference,
+            registry=registry,
+            limits=CanonicalReadLimits(max_bytes=1024, max_depth=4, max_nodes=100),
+        )
+    assert ResolveTrap.calls == 0
+
+
+def test_typed_preflight_rejects_custom_datetime_timezone_without_calling_it() -> None:
+    class EvilTimezone(tzinfo):
+        calls = 0
+
+        def utcoffset(self, value: datetime | None) -> timedelta:
+            del value
+            type(self).calls += 1
+            return timedelta(0)
+
+        def dst(self, value: datetime | None) -> timedelta:
+            del value
+            return timedelta(0)
+
+        def tzname(self, value: datetime | None) -> str:
+            del value
+            return "evil"
+
+    reference = _ref("schema.datetime@1")
+    registry = TypedSchemaRegistry()
+    registry.register(reference, DatetimeInput, role="input")
+    raw = _request_raw()
+    raw["input"] = {"at": "2026-08-14T00:00:00Z"}
+    decoded = read_canonical_inference_request(raw, input_schema_ref=reference, registry=registry)
+    validated = validate_canonical_inference_request(
+        decoded.request,
+        input_schema_ref=reference,
+        registry=registry,
+    )
+    assert cast(DatetimeInput, validated.request.input).at == datetime(2026, 8, 14, tzinfo=UTC)
+
+    forged_input = decoded.request.input.model_copy(
+        update={"at": datetime(2026, 8, 14, tzinfo=EvilTimezone())},
+    )
+    forged_request = decoded.request.model_copy(update={"input": forged_input})
+    with pytest.raises(TypeError, match="timezone"):
+        validate_canonical_inference_request(
+            forged_request,
+            input_schema_ref=reference,
+            registry=registry,
+        )
+    assert EvilTimezone.calls == 0
+
+
+def test_typed_revalidation_rejects_wrong_nested_model_before_validator() -> None:
+    class OtherNested(BaseModel):
+        model_config = ConfigDict(extra="forbid", frozen=True)
+        value: str
+
+    NestedInput.calls = 0
+    reference = _ref("schema.nested-model@1")
+    registry = TypedSchemaRegistry()
+    registry.register(reference, InputWithNested, role="input")
+    raw = _request_raw()
+    raw["input"] = {"value": {"value": "ok"}}
+    decoded = read_canonical_inference_request(raw, input_schema_ref=reference, registry=registry)
+    calls_after_construction = NestedInput.calls
+    forged_input = decoded.request.input.model_copy(update={"value": OtherNested(value="ok")})
+    forged_request = decoded.request.model_copy(update={"input": forged_input})
+
+    with pytest.raises(TypeError, match="unexpected model type"):
+        validate_canonical_inference_request(
+            forged_request,
+            input_schema_ref=reference,
+            registry=registry,
+        )
+    assert NestedInput.calls == calls_after_construction
