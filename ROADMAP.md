@@ -15,7 +15,8 @@
 | WS-4 | Observation Slice | accepted | implemented | WS-3 | 建立不反压运行时的 event/audit、可重建投影、SSE/Inspect 与最小可运维观测闭环 | [任务书](docs/work-packages/WS-4-observation-slice.md) |
 | WS-5 | Core Release Proof | accepted | verified | WS-4 | MVP 收窄版（2026-08-20）：冻结 MVP-ready Core build——production inference seam、本地签发工具与 clean source `release-check`；完整发布证明移至 WS-7 前置。收窄版退出条件 2026-08-20 满足，`verified` 由负责人 2026-08-26 批准（不形成 Core/Product release 结论，完整发布义务在 WS-7 前置） | [任务书](docs/work-packages/WS-5-core-release-proof.md) |
 | WS-6 | Selected Profile E2E | accepted | implemented | WS-5 | Asset Risk Reference（`business-profile.asset-risk@1`）端到端闭环达成：图内真实推理（M1）、gateway 认证、domain-view 全链、typed renderer、golden dataset + 容量 closing record（81）、G3 门控 E2E（Skill 自有指令 + glm-5.3-flash 基线）；human review 按负责人 2026-08-26 批准通过（模型输出稳定性记为已知限制）；M4=implemented，`verified` 待负责人显式批准 | [任务书](docs/work-packages/WS-6-selected-profile-e2e.md) |
-| WS-7 | Product MVP Release | draft | not_started | WS-6 | 对精确产品 build/profile/config 完成业务评估、发布和回滚批准 | — |
+| WS-7 | MVP Functional Completion | draft | not_started | WS-6 | 让 Asset Risk Profile 达到真实可用的 MVP 功能质量：输出稳定性根治、UI 功能补齐、部署可用性、负责人手工走查；不形成 production release 结论 | [任务书](docs/work-packages/WS-7-mvp-functional-completion.md) |
+| WS-8 | Production Release Proof | draft | not_started | WS-7 | 承接原 WS-7 的安全/性能/发布治理义务：G4 安全全矩阵、PITR 全矩阵、Role 故障/扩缩容矩阵、30 天等效容量、POC-H Evaluation/Publication、外部 issuer ceremony、Core/Product IAR、bounded rollout/rollback | — |
 
 ## Status Rules
 
@@ -28,11 +29,11 @@
 ## Dependency and Release Boundary
 
 ```text
-WS-0 → WS-1 → WS-2 → WS-3 → WS-4 → WS-5 → WS-6 → WS-7
+WS-0 → WS-1 → WS-2 → WS-3 → WS-4 → WS-5 → WS-6 → WS-7 → WS-8
 ```
 
 - Business Profile discovery 可以与 WS-2～WS-5 并行，但不得修改 Core contract 迎合单一领域。
-- WS-0～WS-4 只是工程增量；WS-5 和 WS-7 只有在精确验收记录批准后才能形成对应发布结论。
+- WS-0～WS-4 只是工程增量；WS-5 和 WS-8 只有在精确验收记录批准后才能形成对应发布结论。
 
 ## 2026-08-20 范围调整（负责人批准）
 
@@ -82,3 +83,17 @@ WS-0 → WS-1 → WS-2 → WS-3 → WS-4 → WS-5 → WS-6 → WS-7
   带缺口接受，随后补齐）；M4 达成，Delivery Status → `implemented`；`verified`
   待负责人显式批准。负责人同时指示：查证网关 `response_format=json_schema`
   支持（支持则更新 profile 重签链根治指令泄漏）、补齐 POC-M 两个缺口矩阵。
+
+### 2026-08-26 方向调整（负责人批准）：MVP 功能优先
+
+- 负责人指示：先不考虑安全与性能验证方面，优先实现 MVP 基础功能验证；
+  安全/性能/发布治理义务后置。
+- **WS-7 重定义**为"MVP Functional Completion"（原"Product MVP Release"，
+  Spec 仍为 draft，未发布编号不受影响）；原 WS-7 义务整体移至新增的
+  **WS-8 Production Release Proof**。发布结论边界随之从 WS-7 移到 WS-8。
+- 已实现的安全核心（RLS、claim/lease/fence、幂等提交、审计链）**不移除**：
+  它们是崩溃恢复与单写者的正确性机制（2026-08-20 范围调整已批准保持不变）。
+  负责人 2026-08-26 澄清："移除安全和性能代码"仅指**放宽过于严苛的生产级
+  指标/门槛**（覆盖率门槛、租约上限、全量门禁频率等），通用多租户、幂等、
+  审计、日志一律保留；验证矩阵随 WS-8。开发期流程降摩擦：常规迭代跑
+  `make verify`，节点跑 integration/release-check。
