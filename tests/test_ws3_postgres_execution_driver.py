@@ -137,6 +137,9 @@ def _claim_row(claim: ExecutionClaim) -> dict[str, object]:
         "runtime_build_hash": claim.runtime_build_hash,
         "execution_fence": claim.execution_fence,
         "lease_until": claim.lease_until,
+        "graph_ref": claim.graph_binding.graph_ref,
+        "graph_version": claim.graph_binding.graph_version,
+        "graph_state_schema_version": claim.graph_binding.graph_state_schema_version,
     }
 
 
@@ -227,6 +230,9 @@ async def test_claim_maps_database_outcomes_at_the_public_seam() -> None:
                     "runtime_build_hash": claim.runtime_build_hash,
                     "execution_fence": claim.execution_fence,
                     "lease_until": claim.lease_until,
+                    "graph_ref": claim.graph_binding.graph_ref,
+                    "graph_version": claim.graph_binding.graph_version,
+                    "graph_state_schema_version": claim.graph_binding.graph_state_schema_version,
                 }
             )
         )

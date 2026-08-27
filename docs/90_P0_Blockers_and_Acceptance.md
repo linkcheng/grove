@@ -780,6 +780,64 @@ adapter 与 sandbox image digest。禁止使用版本范围、浮动镜像 tag �
 实际 P50/P95/P99、错误率、连接池峰值、恢复时间和未满足项。任一关闭验收未
 覆盖时状态仍为 open。
 
+
+### 11.1 POC-E 关闭记录（2026-08-26，负责人批准）
+
+```text
+blocker_id            POC-E（MVP Knowledge Baseline，步骤 1～6）
+profile               business-profile.asset-risk@1（hash 65705bfc…5b30）
+owner                 WS-6 workstream C owner；reviewer：负责人
+test_suite            tests/test_ws6_knowledge.py（13）、tests/test_ws6_asset_read_tool.py、
+                      门控 tests/integration/test_ws6_g3_business_e2e.py
+fault_injection_point 快照篡改/删除/moving ref/跨租户与无 scope/预算超限/deadline/
+                      v2 发布后旧 run 固定 v1（seam 级）＋真实环境 G3 E2E
+observed_invariant    五种稳定 outcome；只有 ok 携带 items/citations；调用数 0；
+                      citation 四元组与 content hash 逐字节固定
+evidence_artifact     docs/work-packages/WS-6-poc-e-knowledge-baseline.md
+closed_at             2026-08-26（步骤 7～11 not_applicable：Long-Term Memory track 未启用）
+```
+
+### 11.2 POC-M 关闭记录（2026-08-26，负责人批准；同日补齐原带缺口接受的两个矩阵）
+
+```text
+blocker_id            POC-M（Asset Risk Reference Business Profile）
+profile               business-profile.asset-risk@1（hash 65705bfc…5b30）
+owner                 WS-6 workstream D/F owner；reviewer：负责人
+test_suite            tests/test_ws6_asset_read_tool.py（9）、tests/integration/
+                      test_ws6_asset_state_source.py（4，含并发快照隔离）、门控
+                      test_ws6_g3_business_e2e.py（glm-5.3-flash 基线 1 passed 39.57s）
+fault_injection_point 注入矩阵/预算/选择失败/RLS 跨租户/并发提交 mid-snapshot/
+                      401 fail-closed/SIGKILL（A5 方法论于推理图）
+observed_invariant    all-or-nothing；同形状 selection 失败无子集泄露；READ ONLY
+                      REPEATABLE READ 单快照；domain-view 只携带 safe provenance
+evidence_artifact     docs/work-packages/WS-6-poc-m-asset-risk.md、
+                      docs/work-packages/WS-6-g3-evidence-pack.md
+known_limitations     prompted JSON 模式输出稳定性/指令泄漏（human review 按负责人
+                      批准记为已知限制；网关 json_schema 已查证为伪支持——HTTP 200
+                      但不强制约束）。原带缺口接受的两个矩阵已于同日补齐关闭：
+                      1c attestation/comparator/limit key 篡改矩阵（typed 拒绝、
+                      调用数 0）；asset-risk kill 边界矩阵（3/3 passed，checkpoint
+                      后恢复数据库调用数 0，暴露并修复 takeover 整图重跑缺口）
+closed_at             2026-08-26
+```
+
+### 11.3 POC-M 容量 closing record（2026-08-26，负责人批准冻结）
+
+```text
+constraint            max_asset_refs closing ceiling
+candidates            rows=1024（合同上界）；bytes=102（32,768 预算 / P99 行序列化
+                      字节）；context=115（7,168 字符预算 / P99 每资产上下文项）；
+                      deadline=1024（1,024 行时 P99 读取时延 < 5,000ms）
+closing_ceiling       floor(min(candidates)=102 × 0.8) = 81
+production_value      16（≤81，处于证据安全侧）
+distribution          ci-evidence/ws6-poc-m-capacity.json（单资产 P50/P99 ms、行字节、
+                      上下文字符、逐规模压力 P50/P99）
+report_sha256         d0718030c1765f37ccf6ce7cf087dbbc9811e40d224ce062765f63f4073b34cd
+golden_dataset_hash   976809da9facee415c3fec84c98966bd3cda39094fc3c27ee566c2a6ec559156
+environment           本机 Docker PostgreSQL 16（grove_runtime 角色）；换环境须重跑
+closed_at             2026-08-26（负责人批准写入并冻结；Manifest 冻结随发布流程）
+```
+
 ## 12. 系统实现验收基准
 
 “实现完成”不是代码合并、单测通过、文档完成或人工 demo。它是对一个精确发布

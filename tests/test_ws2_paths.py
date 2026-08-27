@@ -289,7 +289,18 @@ async def test_execution_api_routes_delegate_to_service(monkeypatch: pytest.Monk
     monkeypatch.setattr(execution_service, "submit", lambda *_args: _async_value(handle))
     monkeypatch.setattr(execution_service, "query_run", lambda *_args: _async_value(query))
     monkeypatch.setattr(execution_service, "query_command", lambda *_args: _async_value(receipt))
-    assert (await execution_api.submit(_request(), context, _session())).data == handle
+
+    class _State:
+        settings = None
+
+    class _App:
+        state = _State()
+
+    class _Http:
+        app = _App()
+
+    http = cast(Request, _Http())
+    assert (await execution_api.submit(_request(), context, _session(), http)).data == handle
     assert (await execution_api.query_run(run_id, context, _session())).data == query
     assert (await execution_api.query_command(command_id, context, _session())).data == receipt
 
@@ -323,7 +334,7 @@ async def test_submit_service_persists_spec_payload_run_and_command(monkeypatch:
     monkeypatch.setattr(
         execution,
         "_build_fixture_spec",
-        lambda *_args: SimpleNamespace(
+        lambda *_args, **_kwargs: SimpleNamespace(
             skill_spec_hash="a" * 64,
             runtime_build=SimpleNamespace(ref="runtime-build:a", content_hash="b" * 64),
             model_dump=lambda **_: {"skill_spec_hash": "a" * 64},

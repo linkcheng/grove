@@ -27,14 +27,18 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.contracts.canonical import ProjectionSourceRef, canonical_hash
+from app.contracts.canonical import CanonicalModel, ProjectionSourceRef, canonical_hash
 from app.core.telemetry import default_recorder, record_operation
 from app.observation.facts import (
+    DOMAIN_VIEW_ACCEPTED_SCHEMA_REF,
     EXECUTION_AUDIT_SCHEMA_REF,
     NODE_EXECUTED_SCHEMA_REF,
     RUN_LIFECYCLE_SCHEMA_REF,
+    UI_DOMAIN_VIEW_SCHEMA_REF,
+    DomainViewAcceptedPayload,
     RunLifecyclePayload,
     build_ui_projection_meta,
+    domain_view_to_ui_accepted,
     lifecycle_to_run_status_changed,
     parse_runtime_payload,
 )
@@ -236,6 +240,19 @@ class ProjectionReconciler:
                 causation_id=causation_id,
                 trace_id=trace_id,
             )
+        elif schema_ref == DOMAIN_VIEW_ACCEPTED_SCHEMA_REF:
+            await self._project_domain_view(
+                session,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                event_id=event_id,
+                run_seq=run_seq,
+                payload=payload,
+                occurred_at=occurred_at,
+                correlation_id=correlation_id,
+                causation_id=causation_id,
+                trace_id=trace_id,
+            )
         elif schema_ref in _AUDIT_ONLY_SCHEMAS:
             pass
         else:
@@ -272,16 +289,74 @@ class ProjectionReconciler:
     ) -> None:
         parsed = parse_runtime_payload(RUN_LIFECYCLE_SCHEMA_REF, payload)
         assert isinstance(parsed, RunLifecyclePayload)
-        ui_payload = lifecycle_to_run_status_changed(parsed)
+        await self._append_ui_projection(
+            session,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            event_id=event_id,
+            run_seq=run_seq,
+            ui_schema_ref=UI_SCHEMA_REF,
+            ui_payload=lifecycle_to_run_status_changed(parsed),
+            source_hash=canonical_hash(parsed),
+            occurred_at=occurred_at,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            trace_id=trace_id,
+        )
+
+    async def _project_domain_view(
+        self,
+        session: AsyncSession,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        event_id: UUID,
+        run_seq: int,
+        payload: Any,
+        occurred_at: datetime,
+        correlation_id: str,
+        causation_id: UUID,
+        trace_id: str,
+    ) -> None:
+        parsed = parse_runtime_payload(DOMAIN_VIEW_ACCEPTED_SCHEMA_REF, payload)
+        assert isinstance(parsed, DomainViewAcceptedPayload)
+        await self._append_ui_projection(
+            session,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            event_id=event_id,
+            run_seq=run_seq,
+            ui_schema_ref=UI_DOMAIN_VIEW_SCHEMA_REF,
+            ui_payload=domain_view_to_ui_accepted(parsed),
+            source_hash=canonical_hash(parsed),
+            occurred_at=occurred_at,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            trace_id=trace_id,
+        )
+
+    async def _append_ui_projection(
+        self,
+        session: AsyncSession,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        event_id: UUID,
+        run_seq: int,
+        ui_schema_ref: str,
+        ui_payload: CanonicalModel,
+        source_hash: str,
+        occurred_at: datetime,
+        correlation_id: str,
+        causation_id: UUID,
+        trace_id: str,
+    ) -> None:
         meta = build_ui_projection_meta(
             tenant_id=tenant_id,
             correlation_id=correlation_id,
             causation_id=causation_id,
             trace_id=trace_id,
         )
-        # Bind the projection to its source fact by the canonical hash of the
-        # observed runtime payload (content-addressed, not a placeholder).
-        source_hash = canonical_hash(parsed)
         # Serialize same-target projections so projection_seq stays single-writer
         # per run: two concurrent reconcilers cannot both read the same MAX and
         # produce a colliding projection_seq.  The lock is transaction-scoped.
@@ -319,7 +394,7 @@ class ProjectionReconciler:
                 "corr": correlation_id,
                 "caus": causation_id,
                 "trace": trace_id,
-                "schema": UI_SCHEMA_REF,
+                "schema": ui_schema_ref,
                 "payload": json.dumps(ui_payload.model_dump(mode="json"), sort_keys=True),
                 "src": _source_refs_json(run_id, run_seq, source_hash),
                 "at": occurred_at,
@@ -388,6 +463,8 @@ class ProjectionReconciler:
 
     async def rebuild(self, tenant_id: str) -> int:
         """Rebuild the UI read model from authoritative runtime_event facts."""
+
+        _PROJECTABLE_SCHEMAS = (RUN_LIFECYCLE_SCHEMA_REF, DOMAIN_VIEW_ACCEPTED_SCHEMA_REF)
         async with self._session_factory() as session, session.begin():
             await _scope_tenant(session, tenant_id)
             await session.execute(text("DELETE FROM ui_projection_event WHERE tenant_id = :t"), {"t": tenant_id})
@@ -396,15 +473,16 @@ class ProjectionReconciler:
                 await session.execute(
                     text(
                         "SELECT re.event_id, re.run_id, re.run_seq, re.payload, re.occurred_at, "
-                        "re.correlation_id, re.causation_id, re.trace_id "
+                        "re.correlation_id, re.causation_id, re.trace_id, re.payload_schema_ref "
                         "FROM runtime_event re WHERE re.tenant_id = :t "
-                        "AND re.payload_schema_ref = :schema ORDER BY re.run_seq"
+                        "AND re.payload_schema_ref = ANY(:schemas) ORDER BY re.run_seq"
                     ),
-                    {"t": tenant_id, "schema": RUN_LIFECYCLE_SCHEMA_REF},
+                    {"t": tenant_id, "schemas": list(_PROJECTABLE_SCHEMAS)},
                 )
             ).fetchall()
             for row in rows:
-                await self._project_lifecycle(
+                project = self._project_lifecycle if row[8] == RUN_LIFECYCLE_SCHEMA_REF else self._project_domain_view
+                await project(
                     session,
                     tenant_id=tenant_id,
                     run_id=row[1],

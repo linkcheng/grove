@@ -24,3 +24,7 @@ ci-evidence/
 .workbuddy/
 .codex/*
 !.codex/work-packages.toml
+
+# frontend build artifacts (lockfile is committed; node_modules and dist are not)
+frontend/node_modules/
+frontend/dist/

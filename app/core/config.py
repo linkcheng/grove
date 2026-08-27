@@ -45,11 +45,15 @@ class Settings(BaseSettings):
     database_pool_size: int = Field(default=10, ge=1, le=50)
     database_max_overflow: int = Field(default=10, ge=0, le=50)
     database_pool_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
-    auth_mode: Literal["disabled", "fixture"] = "disabled"
+    auth_mode: Literal["disabled", "fixture", "gateway"] = "disabled"
+    gateway_auth_token: SecretStr | None = None
     worker_tenant_id: str = Field(default="default", min_length=1, max_length=128)
     worker_id: str = Field(default="grove-worker-1", min_length=1, max_length=256)
     runtime_build_hash: str = Field(default="", min_length=0, max_length=64)
     inference_mode: Literal["disabled", "production"] = "disabled"
+    # Which kernel the fixture submit path binds: the deterministic
+    # conformance graph (default) or the AssetRisk profile graph (WS-6 D).
+    fixture_graph_binding: Literal["conformance", "asset_risk"] = "conformance"
 
     @model_validator(mode="after")
     def validate_auth_mode(self) -> Settings:
@@ -62,6 +66,10 @@ class Settings(BaseSettings):
             "integration",
         }:
             raise ValueError("fixture authentication is only available in non-production environments")
+        if self.auth_mode == "gateway":
+            token = self.gateway_auth_token.get_secret_value() if self.gateway_auth_token is not None else ""
+            if not token or token != token.strip() or any(char.isspace() for char in token) or len(token) < 16:
+                raise ValueError("gateway authentication requires a configured GROVE_GATEWAY_AUTH_TOKEN")
         return self
 
     @field_validator("database_url")

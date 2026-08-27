@@ -1415,6 +1415,9 @@ async def test_heartbeat_is_strict_monotonic_compare_and_swap() -> None:
     try:
         claim = await driver.claim("worker", runtime_hash, tenant_id, 10)
         assert claim is not None
+        assert claim.graph_binding.graph_ref == "graph.fixture@1"
+        assert claim.graph_binding.graph_version == "1"
+        assert claim.graph_binding.graph_state_schema_version == "state.fixture@1"
         original_state = await _lease_state(migration_url, handle.run_id)
         with pytest.raises(StaleExecutionFence):
             await driver.heartbeat(claim, 0.1)
@@ -4408,6 +4411,11 @@ async def test_dead_letter_and_reconcile_lock_timeout_and_task_cancel_are_zero_w
     projection_engine = create_async_engine(projection_url)
     owner_engine = create_async_engine(migration_url)
     runtime_factory = async_sessionmaker(runtime_engine, expire_on_commit=False)
+    # The 250ms drivers exist to prove the blocked dead-letter/reconcile calls
+    # time out with zero writes; the unblocked setup claims share the session
+    # factory but use the default operation timeout so a loaded machine can
+    # never turn the setup itself into the timeout under test.
+    setup_driver = PostgresExecutionDriver(runtime_factory)
     dead_driver = PostgresExecutionDriver(runtime_factory, operation_timeout_seconds=0.25)
     reconcile_driver = PostgresExecutionDriver(
         runtime_factory,
@@ -4417,7 +4425,7 @@ async def test_dead_letter_and_reconcile_lock_timeout_and_task_cancel_are_zero_w
     lock = await owner_engine.connect()
     transaction = await lock.begin()
     try:
-        dead_claim = await dead_driver.claim("timeout-worker", dead_hash, tenant_dead, 30)
+        dead_claim = await setup_driver.claim("timeout-worker", dead_hash, tenant_dead, 30)
         assert dead_claim is not None and dead_claim.run_id == dead_handle.run_id
         await lock.execute(
             text("SELECT 1 FROM agent_run WHERE tenant_id = :tenant AND run_id = :run_id FOR UPDATE"),
@@ -4444,7 +4452,7 @@ async def test_dead_letter_and_reconcile_lock_timeout_and_task_cancel_are_zero_w
 
         tenant_reconcile = f"it-ws3-reconcile-timeout-{uuid.uuid4().hex[:12]}"
         reconcile_handle, reconcile_hash = await _submit_start(api_url, migration_url, tenant_reconcile)
-        reconcile_claim = await dead_driver.claim("reconcile-timeout-worker", reconcile_hash, tenant_reconcile, 30)
+        reconcile_claim = await setup_driver.claim("reconcile-timeout-worker", reconcile_hash, tenant_reconcile, 30)
         assert reconcile_claim is not None and reconcile_claim.run_id == reconcile_handle.run_id
         await _expire_claim(migration_url, reconcile_claim)
         await lock.execute(

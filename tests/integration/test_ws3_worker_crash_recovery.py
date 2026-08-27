@@ -68,7 +68,19 @@ async def _submit_run(
             ),
             {"t": tenant},
         )
-        spec_payload = {"runtime_build": {"ref": "test-build", "content_hash": runtime_build_hash}}
+        from app.execution.contracts import CONFORMANCE_GRAPH_BINDING
+
+        spec_payload = {
+            "runtime_build": {"ref": "test-build", "content_hash": runtime_build_hash},
+            "graph": {
+                "graph": {
+                    "ref": CONFORMANCE_GRAPH_BINDING.graph_ref,
+                    "version": CONFORMANCE_GRAPH_BINDING.graph_version,
+                    "content_hash": "9a3375ffd90b0fa31a9cceb515c8bacd07eb68e13bec6686bd318fdb1a63c857",
+                },
+                "graph_state_schema_version": CONFORMANCE_GRAPH_BINDING.graph_state_schema_version,
+            },
+        }
         import json
 
         await conn.execute(

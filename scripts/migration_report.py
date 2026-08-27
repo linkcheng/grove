@@ -51,6 +51,8 @@ from app.build.manifest import (
     WS3_SCHEMA_CONTRACT_VERSION,
     WS4_BUSINESS_RELATIONS,
     WS4_MIGRATION_HEADS,
+    WS6_MIGRATION_HEADS,
+    WS6_PROFILE_RELATIONS,
     migration_hash,
     migration_head,
     write_content_addressed_artifact,
@@ -2170,6 +2172,13 @@ def write_report(root: Path, output: Path, *, database_url: str | None = None) -
             raise MigrationReportError(
                 "observation relation set does not match WS-4 contract: "
                 f"expected={sorted(WS4_BUSINESS_RELATIONS)!r}, actual={business_tables!r}"
+            )
+        if expected_head in WS6_MIGRATION_HEADS and set(business_tables) != (
+            WS4_BUSINESS_RELATIONS | WS6_PROFILE_RELATIONS
+        ):
+            raise MigrationReportError(
+                "profile relation set does not match WS-6 contract: "
+                f"expected={sorted(WS4_BUSINESS_RELATIONS | WS6_PROFILE_RELATIONS)!r}, actual={business_tables!r}"
             )
         ws3_schema: dict[str, object] | None = None
         schema_contract_version = "ws2-tenant-commands"

@@ -244,6 +244,27 @@ class RunCommandReceipt(BaseModel):
         return None if value is None else value.astimezone(UTC)
 
 
+class ClaimGraphBinding(BaseModel):
+    """Kernel routing triple mirrored from the run's SkillExecutionSpec binding.
+
+    Empty strings mean the authority found no spec binding; the closed graph
+    registry dead-letters such commands instead of guessing a kernel.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    graph_ref: str = Field(max_length=256)
+    graph_version: str = Field(max_length=128)
+    graph_state_schema_version: str = Field(max_length=128)
+
+
+CONFORMANCE_GRAPH_BINDING = ClaimGraphBinding(
+    graph_ref="graph.fixture@1",
+    graph_version="1",
+    graph_state_schema_version="state.fixture@1",
+)
+
+
 class ExecutionClaim(BaseModel):
     """Immutable proof of one worker's current fenced lease."""
 
@@ -258,6 +279,10 @@ class ExecutionClaim(BaseModel):
     worker_id: str = Field(min_length=1, max_length=256)
     execution_fence: int = Field(ge=1)
     lease_until: datetime
+    # Kernel routing fact owned by the run's SkillExecutionSpec.  Claims minted
+    # by the in-memory deterministic driver default to the conformance binding;
+    # the PostgreSQL driver fills it from the authoritative spec.
+    graph_binding: ClaimGraphBinding = Field(default_factory=lambda: CONFORMANCE_GRAPH_BINDING)
 
     @field_validator("lease_until")
     @classmethod
@@ -309,6 +334,7 @@ _ModelT = TypeVar("_ModelT", bound=BaseModel)
 # ``model_copy(update=...)`` is not evidence of a freshly validated value.
 _STRICT_MODEL_TYPES: frozenset[type[BaseModel]] = frozenset(
     {
+        ClaimGraphBinding,
         StartRun,
         ResumeRun,
         CancelRun,

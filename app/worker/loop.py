@@ -1,9 +1,11 @@
 """Bounded runtime worker loop: claim -> invoke -> checkpoint -> finish_delivery.
 
 The worker is a non-HTTP internal role that consumes PostgreSQL claims.
-It uses a fixed pure deterministic conformance graph, writes checkpoints
-through FencedPostgresSaver, and atomically finalizes delivery via
-grove_finish_delivery.  No provider, tool, model, or external IO.
+It invokes the compiled pure deterministic conformance graph through the
+LangGraph kernel (``graph.ainvoke``; node functions are never called
+directly), writes checkpoints through FencedPostgresSaver, and atomically
+finalizes delivery via grove_finish_delivery.  No provider, tool, model,
+or external IO.
 """
 
 from __future__ import annotations
@@ -11,14 +13,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
-from typing import cast
+from typing import Any, cast
+from uuid import UUID
 
 import psycopg
 from langchain_core.runnables.config import RunnableConfig
 from langgraph.checkpoint.base import ChannelVersions, CheckpointMetadata, empty_checkpoint
 
+from app.asset_risk.contracts import ASSET_STATE_VIEW_SCHEMA_REF
+from app.asset_risk.kernel import AssetRiskKernel
 from app.contracts.canonical import canonical_hash
 from app.core.telemetry import record_operation
 from app.execution import (
@@ -29,12 +35,19 @@ from app.execution import (
 from app.execution.checkpoint import FencedPostgresSaver
 from app.execution.conformance_graph import (
     ConformanceState,
+    build_conformance_graph,
     compute_input_hash,
-    node_a,
-    node_b,
+)
+from app.execution.graph_registry import GraphResolutionError, resolve_graph_kernel
+from app.execution.inference_graph import (
+    InferenceRequestFactory,
+    InferenceState,
+    build_inference_graph,
+    compute_inference_input_hash,
 )
 from app.inference import TypedInferencePort
 from app.observation.facts import (
+    build_domain_view_emit_request,
     build_lifecycle_emit_request,
     build_node_executed_emit_request,
 )
@@ -66,7 +79,10 @@ class RuntimeWorker:
         runtime_build_hash: str,
         database_url: str,
         inference_port: TypedInferencePort | None = None,
+        inference_request_factory: InferenceRequestFactory | None = None,
+        asset_risk_kernel: AssetRiskKernel | None = None,
         poll_interval: float = POLL_INTERVAL_SECONDS,
+        invoke_budget_seconds: float = TOTAL_BUDGET_SECONDS,
     ) -> None:
         self._driver = driver
         self._tenant_id = tenant_id
@@ -74,8 +90,16 @@ class RuntimeWorker:
         self._runtime_build_hash = runtime_build_hash
         self._database_url = database_url
         self._inference_port = inference_port
+        self._inference_request_factory = inference_request_factory
+        self._asset_risk_kernel = asset_risk_kernel
         self._poll_interval = poll_interval
+        self._invoke_budget_seconds = invoke_budget_seconds
         self._shutdown = asyncio.Event()
+        # Compiled once: the graph is pure and deterministic, so the same
+        # compiled kernel serves every claim (per ADR-0001 LangGraph is the
+        # only execution kernel; node functions are never invoked directly).
+        self._graph = build_conformance_graph()
+        self._inference_graph: Any | None = None
 
     def request_shutdown(self) -> None:
         self._shutdown.set()
@@ -115,16 +139,36 @@ class RuntimeWorker:
 
     async def _process_claim(self, claim: ExecutionClaim) -> None:
         """Heartbeat if needed, invoke graph, write checkpoint, finish delivery."""
+        try:
+            kernel = resolve_graph_kernel(
+                claim.graph_binding,
+                inference_port=self._inference_port,
+                inference_request_factory=self._inference_request_factory,
+                asset_risk_kernel=self._asset_risk_kernel,
+            )
+        except GraphResolutionError as error:
+            logger.error(
+                "worker.graph_unresolved run=%s seq=%d reason=%s",
+                claim.run_id,
+                claim.command_seq,
+                error.reason,
+            )
+            await self._safe_dead_letter(claim, f"graph-{error.reason}")
+            return
         is_start = claim.command_seq == 0
         now = datetime.now(UTC)
         remaining = claim.lease_until - now
-        if remaining < timedelta(seconds=LEASE_MARGIN_SECONDS + INVOKE_BUDGET_SECONDS):
+        if remaining < timedelta(seconds=LEASE_MARGIN_SECONDS + self._invoke_budget_seconds):
             claim = await self._driver.heartbeat(claim, lease_seconds=LEASE_SECONDS)
 
         try:
             invoke_started = perf_counter()
-            async with asyncio.timeout(TOTAL_BUDGET_SECONDS):
-                if is_start:
+            async with asyncio.timeout(self._invoke_budget_seconds):
+                if kernel.kind == "inference":
+                    await self._invoke_inference(claim)
+                elif kernel.kind == "asset_risk":
+                    await self._invoke_asset_risk(claim)
+                elif is_start:
                     await self._invoke_start(claim)
                 else:
                     await self._invoke_continue(claim)
@@ -171,11 +215,16 @@ class RuntimeWorker:
         except Exception:
             logger.exception("worker.dead_letter_failed run=%s", claim.run_id)
 
+    async def _run_stage(self, state: ConformanceState) -> ConformanceState:
+        """Execute exactly one stage through the compiled deterministic kernel."""
+        result = await self._graph.ainvoke(dict(state))
+        return cast(ConformanceState, result)
+
     async def _invoke_start(self, claim: ExecutionClaim) -> None:
         """First stage: node_a -> yield, write checkpoint, finish delivery(yield)."""
         input_hash = compute_input_hash(CONFERENCE_INPUT)
         node_started = perf_counter()
-        yielded = node_a({"stage": "start", "input_hash": input_hash, "value": 0})
+        yielded = await self._run_stage({"stage": "start", "input_hash": input_hash, "value": 0})
         record_operation(
             "graph.node",
             duration_ms=float((perf_counter() - node_started) * 1000),
@@ -231,9 +280,9 @@ class RuntimeWorker:
     async def _invoke_continue(self, claim: ExecutionClaim) -> None:
         """Second stage: node_b -> terminal, write checkpoint, finish delivery(terminal)."""
         input_hash = compute_input_hash(CONFERENCE_INPUT)
-        yielded = node_a({"stage": "start", "input_hash": input_hash, "value": 0})
+        yielded = await self._run_stage({"stage": "start", "input_hash": input_hash, "value": 0})
         node_started = perf_counter()
-        terminal = node_b(yielded)
+        terminal = await self._run_stage(yielded)
         record_operation(
             "graph.node",
             duration_ms=float((perf_counter() - node_started) * 1000),
@@ -271,7 +320,161 @@ class RuntimeWorker:
             receipt.status,
         )
 
-    async def _write_checkpoint(self, claim: ExecutionClaim, state: ConformanceState) -> None:
+    async def _invoke_asset_risk(self, claim: ExecutionClaim) -> None:
+        """AssetRisk kernel: input source -> graph -> checkpoint -> terminal."""
+        if self._asset_risk_kernel is None:
+            raise RuntimeError("asset-risk kernel resolved without composition")
+        graph: Any = self._asset_risk_kernel.build_graph()
+        # Recovery (docs/31 §4 / POC-M 4): when a prior attempt already
+        # checkpointed the accepted view, resume from those channel values --
+        # the physical asset read and the portfolio enumeration both stay at
+        # zero database calls; only an un-checkpointed attempt may re-read.
+        resumed = await self._load_prior_asset_risk_state(claim)
+        if resumed is not None:
+            state = {**resumed, "tenant_id": claim.tenant_id, "run_id": str(claim.run_id)}
+        else:
+            asset_refs = await self._asset_risk_kernel.input_source.asset_refs(claim.tenant_id, claim.run_id)
+            state = {
+                "stage": "start",
+                "tenant_id": claim.tenant_id,
+                "run_id": str(claim.run_id),
+                "asset_refs": asset_refs,
+            }
+        node_started = perf_counter()
+        terminal = await graph.ainvoke(state)
+        record_operation(
+            "graph.node",
+            duration_ms=float((perf_counter() - node_started) * 1000),
+            role="runtime_worker",
+            operation="asset_risk_skill",
+            outcome="ok" if terminal.get("stage") == "terminal" else "failed",
+        )
+        if terminal.get("stage") != "terminal":
+            failure_class = str(terminal.get("failure_class", "skill_failed"))
+            await self._safe_dead_letter(claim, f"asset-risk.{failure_class}")
+            return
+        await self._write_checkpoint(claim, dict(terminal))
+        occurred = datetime.now(UTC)
+        report = terminal.get("report", {})
+        asset_view = terminal["asset_view"]
+        asset_provenance = terminal["asset_provenance"]
+        # The accepted, checkpointed typed read view becomes a runtime fact in
+        # the same terminal transaction; the projection turns it into the UI
+        # domain-view milestone.  Strict extraction: a terminal state without
+        # the accepted view is a contract violation and fails loudly here
+        # rather than silently skipping the milestone.
+        events = [
+            build_domain_view_emit_request(
+                run_id=claim.run_id,
+                command_seq=claim.command_seq,
+                tool_request_id=UUID(str(asset_view["tool_request_id"])),
+                view_schema_ref=ASSET_STATE_VIEW_SCHEMA_REF,
+                observed_at=datetime.fromisoformat(str(asset_view["observed_at"])),
+                source_ref=str(asset_provenance["source_ref"]),
+                result_hash=str(asset_provenance["result_content_hash"]),
+                item_count=len(asset_view["assets"]),
+                occurred_at=occurred,
+            ),
+            build_node_executed_emit_request(
+                run_id=claim.run_id,
+                command_seq=claim.command_seq,
+                node_id="asset_risk_skill",
+                stage="terminal",
+                input_hash=str(report.get("asset_view_hash", "")),
+                value=int(report.get("knowledge_items", 0)),
+                occurred_at=occurred,
+            ),
+            build_lifecycle_emit_request(
+                run_id=claim.run_id,
+                command_seq=claim.command_seq,
+                status="succeeded",
+                run_revision=claim.command_seq,
+                occurred_at=occurred,
+            ),
+        ]
+        receipt = await self._driver.finish_delivery(claim, outcome_kind="terminal", events=events)
+        logger.info(
+            "worker.asset_risk_terminal run=%s seq=%d status=%s",
+            claim.run_id,
+            claim.command_seq,
+            receipt.status,
+        )
+
+    async def _invoke_inference(self, claim: ExecutionClaim) -> None:
+        """Inference kernel: infer node -> terminal, checkpoint, finish delivery."""
+        if self._inference_graph is None:
+            if self._inference_port is None or self._inference_request_factory is None:
+                raise RuntimeError("inference kernel resolved without a production port")
+            self._inference_graph = build_inference_graph(self._inference_port, self._inference_request_factory)
+        input_hash = compute_inference_input_hash(claim.tenant_id, claim.run_id)
+        state: InferenceState = {
+            "stage": "start",
+            "tenant_id": claim.tenant_id,
+            "run_id": str(claim.run_id),
+            "input_hash": input_hash,
+        }
+        node_started = perf_counter()
+        terminal = cast(InferenceState, await self._inference_graph.ainvoke(dict(state)))
+        record_operation(
+            "graph.node",
+            duration_ms=float((perf_counter() - node_started) * 1000),
+            role="runtime_worker",
+            operation="infer",
+            outcome="ok",
+        )
+
+        await self._write_checkpoint(claim, dict(terminal))
+
+        occurred = datetime.now(UTC)
+        events = [
+            build_node_executed_emit_request(
+                run_id=claim.run_id,
+                command_seq=claim.command_seq,
+                node_id="infer",
+                stage="terminal",
+                input_hash=input_hash,
+                value=terminal["total_tokens"],
+                occurred_at=occurred,
+            ),
+            build_lifecycle_emit_request(
+                run_id=claim.run_id,
+                command_seq=claim.command_seq,
+                status="succeeded",
+                run_revision=claim.command_seq,
+                occurred_at=occurred,
+            ),
+        ]
+        receipt = await self._driver.finish_delivery(claim, outcome_kind="terminal", events=events)
+        logger.info(
+            "worker.inference_terminal run=%s seq=%d attempts=%d tokens=%d status=%s",
+            claim.run_id,
+            claim.command_seq,
+            terminal["provider_attempts"],
+            terminal["total_tokens"],
+            receipt.status,
+        )
+
+    async def _load_prior_asset_risk_state(self, claim: ExecutionClaim) -> dict[str, Any] | None:
+        """Read the prior attempt's checkpointed asset-risk state, if any.
+
+        Only a state that already carries the accepted asset view counts as
+        resumable; anything earlier (or absent) restarts the run from the
+        input source, which is the bounded physical re-read path.
+        """
+
+        conninfo = self._database_url.replace("postgresql+asyncpg://", "postgresql://")
+        async with await psycopg.AsyncConnection.connect(conninfo=conninfo) as connection:
+            config = RunnableConfig(configurable={"thread_id": str(claim.run_id), "checkpoint_ns": ""})
+            saver = FencedPostgresSaver(connection, claim)
+            found = await saver.aget_tuple(config)
+            if found is None:
+                return None
+            values = dict(found.checkpoint.get("channel_values", {})) if found.checkpoint else {}
+            if "asset_view" not in values:
+                return None
+            return values
+
+    async def _write_checkpoint(self, claim: ExecutionClaim, state: Mapping[str, object]) -> None:
         """Write one physical checkpoint through the production fenced saver."""
         conninfo = self._database_url.replace("postgresql+asyncpg://", "postgresql://")
         async with await psycopg.AsyncConnection.connect(conninfo=conninfo) as connection:
@@ -303,6 +506,8 @@ async def run_worker(
     runtime_build_hash: str,
     database_url: str,
     inference_port: TypedInferencePort | None = None,
+    inference_request_factory: InferenceRequestFactory | None = None,
+    asset_risk_kernel: AssetRiskKernel | None = None,
     poll_interval: float = POLL_INTERVAL_SECONDS,
 ) -> None:
     """Run a bounded worker loop until SIGTERM/SIGINT."""
@@ -313,6 +518,8 @@ async def run_worker(
         runtime_build_hash=runtime_build_hash,
         database_url=database_url,
         inference_port=inference_port,
+        inference_request_factory=inference_request_factory,
+        asset_risk_kernel=asset_risk_kernel,
         poll_interval=poll_interval,
     )
     loop = asyncio.get_event_loop()

@@ -314,7 +314,8 @@ async def test_real_http_postgres_submit_is_idempotent_and_concurrent() -> None:
                 await connection.execute(
                     text(
                         "TRUNCATE TABLE run_command, agent_run, command_payload, execution_spec, "
-                        "execution_principal, membership, workload_principal, tenant"
+                        "execution_principal, membership, workload_principal, "
+                        "asset_risk_asset_state, tenant"
                     )
                 )
         finally:

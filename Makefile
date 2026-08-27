@@ -4,7 +4,7 @@ EVIDENCE_DIR := ci-evidence
 COMPOSE_PROJECT := grove-ws0-test
 COMPOSE := docker compose -p $(COMPOSE_PROJECT) -f compose.yaml
 
-.PHONY: install verify manifest-check ws-3-check ws-4-check ws-4-capacity-smoke ws-4-capacity-check integration cleanroom-check ci release-check
+.PHONY: install verify frontend-check manifest-check ws-3-check ws-4-check ws-4-capacity-smoke ws-4-capacity-check integration cleanroom-check ci release-check
 
 install:
 	uv sync --frozen
@@ -111,9 +111,13 @@ cleanroom-check:
 	COMPOSE_PROJECT_NAME=grove-ws0-cleanroom-$$$$ CLEANROOM_REMOVE_VOLUMES=1 \
 		INTEGRATION_HOST_DB_PORT=0 INTEGRATION_HOST_API_PORT=0 bash scripts/integration.sh
 
+frontend-check:
+	cd frontend && npm ci --no-audit --no-fund && npm run check
+
 ci:
 	@printf 'development CI: this target does not certify WS-0 release completion\n'
 	$(MAKE) verify
+	$(MAKE) frontend-check
 	$(MAKE) manifest-check
 	$(MAKE) integration
 

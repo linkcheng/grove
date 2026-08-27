@@ -165,6 +165,11 @@ class PostgresExecutionDriver:
                         "worker_id": worker,
                         "execution_fence": row["execution_fence"],
                         "lease_until": row["lease_until"].astimezone(UTC),
+                        "graph_binding": {
+                            "graph_ref": row["graph_ref"],
+                            "graph_version": row["graph_version"],
+                            "graph_state_schema_version": row["graph_state_schema_version"],
+                        },
                     }
                 )
                 action: ExecutionAuditAction = "worker_takeover" if claim.execution_fence > 1 else "worker_claimed"

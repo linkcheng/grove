@@ -6,9 +6,10 @@ never invokes a Graph, provider, worker, or interaction command.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from time import perf_counter
-from typing import Any
+from typing import Any, Literal
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -94,6 +95,8 @@ def _build_fixture_spec(
     context: ActiveTenantContext,
     intent: ExecutionIntent,
     effective_scopes: tuple[str, ...],
+    *,
+    graph_binding: Literal["conformance", "asset_risk"] = "conformance",
 ) -> SkillExecutionSpec:
     """Resolve the published fixture into the existing WS-1 SkillExecutionSpec ABI."""
 
@@ -112,6 +115,14 @@ def _build_fixture_spec(
     source_agent_ref = refs["agent"] if intent.agent_ref is not None else None
     runtime_manifest_ref = refs["runtime_manifest"]
     graph_ref = refs["graph"]
+    selected_binding = bundle.graph_binding
+    subject_hashes: Mapping[str, str] = dict(release.evaluation_subject_hashes)
+    evidence_prefix = "evidence_index"
+    if graph_binding == "asset_risk":
+        graph_ref = refs["asset_risk_graph"]
+        selected_binding = bundle.asset_risk_graph_binding
+        subject_hashes = dict(bundle.asset_risk_evaluation_subject_hashes)
+        evidence_prefix = "evidence_index.asset_risk"
     contracts_ref = refs["contracts"]
     runtime_build_ref = refs["runtime_build"]
     budget_ref = refs["budget"]
@@ -157,7 +168,7 @@ def _build_fixture_spec(
             source_agent_ref=source_agent_ref,
             run_mode="live",
             skill=skill_ref,
-            graph={"graph": graph_ref, "graph_state_schema_version": bundle.graph_binding.graph_state_schema_version},
+            graph={"graph": graph_ref, "graph_state_schema_version": selected_binding.graph_state_schema_version},
             contracts={"contracts": contracts_ref, "converter_bundle": None},
             runtime_manifest=runtime_manifest_ref,
             runtime_build=runtime_build_ref,
@@ -182,8 +193,8 @@ def _build_fixture_spec(
             resolved_at=_FIXTURE_RESOLVED_AT,
         )
 
-    expected_subject_hash = bundle.evaluation_subject_hashes.get(preset_name)
-    evidence_ref = refs.get(f"evidence_index.{preset_name}")
+    expected_subject_hash = subject_hashes.get(preset_name)
+    evidence_ref = refs.get(f"{evidence_prefix}.{preset_name}")
     if expected_subject_hash is None or evidence_ref is None:
         raise EvaluationGateFailedError()
     spec = build(evidence_ref)
@@ -244,7 +255,13 @@ async def _authorize(session: AsyncSession, context: ActiveTenantContext, operat
     return effective
 
 
-async def submit(session: AsyncSession, context: ActiveTenantContext, request: SubmitExecution) -> RunHandle:
+async def submit(
+    session: AsyncSession,
+    context: ActiveTenantContext,
+    request: SubmitExecution,
+    *,
+    fixture_graph_binding: Literal["conformance", "asset_risk"] = "conformance",
+) -> RunHandle:
     """Authorize afresh, resolve an immutable WS-1 spec, and persist submit."""
 
     effective_scopes = await _authorize(session, context, "execution.submit")
@@ -273,7 +290,7 @@ async def submit(session: AsyncSession, context: ActiveTenantContext, request: S
 
     # Only a new submission may resolve the current release and write new
     # immutable artifacts. Retries never manufacture orphan specs/payloads.
-    spec = _build_fixture_spec(context, request.intent, effective_scopes)
+    spec = _build_fixture_spec(context, request.intent, effective_scopes, graph_binding=fixture_graph_binding)
     if request.expected_skill_spec_hash is not None and request.expected_skill_spec_hash != spec.skill_spec_hash:
         raise PlanChangedError()
     spec_ref = f"execution-spec:{spec.skill_spec_hash}"

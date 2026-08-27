@@ -13,16 +13,17 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal, TypeVar
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
 from app.contracts.canonical import (
     SHA256_PATTERN,
     CanonicalModel,
     ContractMeta,
+    DomainViewAccepted,
     RunStatusChanged,
 )
 
@@ -49,6 +50,7 @@ TERMINAL_RUN_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
 RUN_LIFECYCLE_SCHEMA_REF = "grove.runtime.run-lifecycle.v1"
 NODE_EXECUTED_SCHEMA_REF = "grove.runtime.node-executed.v1"
 EXECUTION_AUDIT_SCHEMA_REF = "grove.runtime.execution-audit.v1"
+DOMAIN_VIEW_ACCEPTED_SCHEMA_REF = "grove.runtime.domain-view-accepted.v1"
 
 RUNTIME_WORKER_SOURCE: Literal["grove.runtime_worker"] = "grove.runtime_worker"
 API_COMMAND_SOURCE: Literal["grove.api.command"] = "grove.api.command"
@@ -72,7 +74,12 @@ type ExecutionAuditAction = Literal[
 ]
 
 KNOWN_RUNTIME_PAYLOAD_SCHEMAS: frozenset[str] = frozenset(
-    {RUN_LIFECYCLE_SCHEMA_REF, NODE_EXECUTED_SCHEMA_REF, EXECUTION_AUDIT_SCHEMA_REF}
+    {
+        RUN_LIFECYCLE_SCHEMA_REF,
+        NODE_EXECUTED_SCHEMA_REF,
+        EXECUTION_AUDIT_SCHEMA_REF,
+        DOMAIN_VIEW_ACCEPTED_SCHEMA_REF,
+    }
 )
 
 
@@ -114,12 +121,40 @@ class ExecutionAuditPayload(CanonicalModel):
     result_code: str = Field(min_length=1, max_length=64)
 
 
+class DomainViewAcceptedPayload(CanonicalModel):
+    """A typed domain read view accepted and checkpointed for one run.
+
+    The worker emits this fact when a Profile-owned typed read tool's
+    all-or-nothing view has been accepted; the projection maps it to the UI
+    ``domain_view_accepted`` milestone consumed by the Profile renderer
+    (docs/06 §7.2, docs/31 §6).  It carries only the safe projection surface --
+    never SQL, table names or the raw tool payload.
+    """
+
+    kind: Literal["domain_view_accepted"]
+    run_id: UUID
+    tool_request_id: UUID
+    view_schema_ref: str = Field(min_length=1, max_length=256)
+    observed_at: datetime
+    source_ref: str = Field(min_length=1, max_length=256)
+    result_hash: str = Field(pattern=SHA256_PATTERN)
+    item_count: int | None = Field(default=None, ge=0, le=1_000_000)
+
+    @field_validator("observed_at")
+    @classmethod
+    def observed_is_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("observed_at must be timezone-aware")
+        return value.astimezone(UTC)
+
+
 # Registry of the only schema refs the projection may materialise.  An unknown
 # ref never reaches a Python payload model; the projection dead-letters it.
 RUNTIME_PAYLOAD_REGISTRY: Mapping[str, type[CanonicalModel]] = {
     RUN_LIFECYCLE_SCHEMA_REF: RunLifecyclePayload,
     NODE_EXECUTED_SCHEMA_REF: NodeExecutedPayload,
     EXECUTION_AUDIT_SCHEMA_REF: ExecutionAuditPayload,
+    DOMAIN_VIEW_ACCEPTED_SCHEMA_REF: DomainViewAcceptedPayload,
 }
 
 
@@ -294,6 +329,41 @@ def build_node_executed_emit_request(
     )
 
 
+def build_domain_view_emit_request(
+    *,
+    run_id: UUID,
+    command_seq: int,
+    tool_request_id: UUID,
+    view_schema_ref: str,
+    observed_at: datetime,
+    source_ref: str,
+    result_hash: str,
+    item_count: int | None,
+    occurred_at: datetime,
+    event_type: str = "domain.view.accepted",
+) -> EmitEventRequest:
+    """Build the domain-view acceptance fact for one committed typed read."""
+
+    payload = DomainViewAcceptedPayload(
+        kind="domain_view_accepted",
+        run_id=run_id,
+        tool_request_id=tool_request_id,
+        view_schema_ref=view_schema_ref,
+        observed_at=observed_at,
+        source_ref=source_ref,
+        result_hash=result_hash,
+        item_count=item_count,
+    )
+    return EmitEventRequest(
+        event_type=event_type,
+        source=RUNTIME_WORKER_SOURCE,
+        source_event_id=derive_source_event_id(run_id, command_seq, event_type, 0),
+        payload_schema_ref=DOMAIN_VIEW_ACCEPTED_SCHEMA_REF,
+        payload=payload,
+        occurred_at=occurred_at,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pure projection mapping: runtime lifecycle fact -> typed UI projection.
 # ---------------------------------------------------------------------------
@@ -333,6 +403,21 @@ def lifecycle_to_run_status_changed(payload: RunLifecyclePayload) -> RunStatusCh
         run_id=payload.run_id,
         status=payload.status,
         run_revision=payload.run_revision,
+    )
+
+
+def domain_view_to_ui_accepted(payload: DomainViewAcceptedPayload) -> DomainViewAccepted:
+    """Map a runtime domain-view fact to the typed UI projection payload."""
+
+    return DomainViewAccepted(
+        kind="domain_view_accepted",
+        run_id=payload.run_id,
+        tool_request_id=payload.tool_request_id,
+        view_schema_ref=payload.view_schema_ref,
+        observed_at=payload.observed_at,
+        source_ref=payload.source_ref,
+        result_hash=payload.result_hash,
+        item_count=payload.item_count,
     )
 
 
@@ -470,12 +555,16 @@ __all__ = [
     "UI_MESSAGE_DELTA_SCHEMA_REF",
     "UI_MESSAGE_STARTED_SCHEMA_REF",
     "UnknownRuntimeSchemaError",
+    "DOMAIN_VIEW_ACCEPTED_SCHEMA_REF",
+    "DomainViewAcceptedPayload",
     "PublicRunStatus",
+    "build_domain_view_emit_request",
     "build_lifecycle_emit_request",
     "build_node_executed_emit_request",
     "build_execution_audit_emit_request",
     "build_ui_projection_meta",
     "derive_source_event_id",
+    "domain_view_to_ui_accepted",
     "lifecycle_to_run_status_changed",
     "parse_runtime_payload",
     "ui_payload_adapter",

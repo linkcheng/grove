@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -199,9 +200,12 @@ async def test_production_lifespan_yields_sealed_port_without_sending(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_signed_provider_binding(tmp_path, monkeypatch, app_env="test")
-    async with production_inference_lifespan(app_env="test", runtime_build_hash="e" * 64) as port:
+    async with production_inference_lifespan(app_env="test", runtime_build_hash="e" * 64) as (port, request_factory):
         assert type(port) is PydanticAIInferencePort
         assert port.physical_sends == 0
+        request = request_factory("tenant-a", uuid4())
+        assert request.model_policy.model_ref == "model@2026"
+        assert request.meta.tenant_id == "tenant-a"
 
 
 def test_read_preopened_regular_fd_rejects_non_regular_descriptors() -> None:

@@ -12,7 +12,7 @@ from hashlib import sha256
 from importlib.metadata import distribution, version
 from pathlib import Path
 from typing import Final, Literal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -24,6 +24,11 @@ from app.contracts.canonical import (
     StructuredInferenceInput,
     StructuredInferenceOutput,
     canonical_hash,
+)
+from app.execution.inference_graph import (
+    INFERENCE_INSTRUCTION,
+    INFERENCE_QUESTION,
+    InferenceRequestFactory,
 )
 from app.inference.ai_config import AIGatewayConfig, load_ai_gateway_config
 from app.inference.contracts import ProviderBindingManifest, load_provider_binding_manifest
@@ -71,15 +76,21 @@ async def production_inference_lifespan(
     *,
     app_env: str,
     runtime_build_hash: str,
-) -> AsyncIterator[TypedInferencePort]:
-    """Verify signed release bytes and own the single production SDK client."""
+) -> AsyncIterator[tuple[TypedInferencePort, InferenceRequestFactory]]:
+    """Verify signed release bytes and own the single production SDK client.
+
+    Yields the sealed port together with a request factory bound to the
+    verified ProviderBindingManifest: the manifest carries the policies
+    canonical inference requests must be built from, so the worker composition
+    can construct legal requests without the manifest escaping this module.
+    """
 
     async with _production_inference_lifespan_impl(
         app_env=app_env,
         runtime_build_hash=runtime_build_hash,
         transport=None,
-    ) as (port, _manifest):
-        yield port
+    ) as (port, manifest):
+        yield port, make_inference_request_factory(manifest)
 
 
 @asynccontextmanager
@@ -184,25 +195,30 @@ async def run_provider_g2_smoke(
         )
 
 
-def _build_provider_g2_request(
+def build_manifest_inference_request(
     manifest: ProviderBindingManifest,
+    *,
+    tenant_id: str,
+    run_id: UUID,
+    node_id: str,
+    correlation_id: str,
 ) -> CanonicalInferenceRequest[StructuredInferenceInput]:
-    """Build the one fixed conformance request behind the Worker seam."""
+    """Build the canonical conformance request bound to the manifest policies."""
 
     return CanonicalInferenceRequest[StructuredInferenceInput](
         meta=ContractMeta(
             contract_name="canonical.inference.request",
             contract_version="v1",
             message_id=uuid4(),
-            tenant_id="g2",
-            correlation_id="g2-provider",
+            tenant_id=tenant_id,
+            correlation_id=correlation_id,
         ),
         inference_request_id=uuid4(),
-        run_id=uuid4(),
-        node_id="g2-provider",
+        run_id=run_id,
+        node_id=node_id,
         node_attempt=0,
-        input=StructuredInferenceInput(question="Return the exact sentinel required by the response schema."),
-        instructions=(CanonicalMessage(role="user", content="Return G2_OK as the answer."),),
+        input=StructuredInferenceInput(question=INFERENCE_QUESTION),
+        instructions=(CanonicalMessage(role="user", content=INFERENCE_INSTRUCTION),),
         model_policy=manifest.model_policy,
         result_schema_ref=manifest.output_schema_ref.ref,
         prompt_policy_ref=manifest.prompt_policy_ref.ref,
@@ -211,6 +227,37 @@ def _build_provider_g2_request(
         inference_retry_policy_ref=manifest.retry_policy_ref.ref,
         budget=manifest.budget_policy,
         budget_policy_ref=manifest.budget_policy_ref.ref,
+    )
+
+
+def make_inference_request_factory(
+    manifest: ProviderBindingManifest,
+) -> InferenceRequestFactory:
+    """Bind one verified manifest into the inference node's request factory."""
+
+    def factory(tenant_id: str, run_id: UUID) -> CanonicalInferenceRequest[StructuredInferenceInput]:
+        return build_manifest_inference_request(
+            manifest,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            node_id="infer",
+            correlation_id="infer-node",
+        )
+
+    return factory
+
+
+def _build_provider_g2_request(
+    manifest: ProviderBindingManifest,
+) -> CanonicalInferenceRequest[StructuredInferenceInput]:
+    """Build the one fixed conformance request behind the Worker seam."""
+
+    return build_manifest_inference_request(
+        manifest,
+        tenant_id="g2",
+        run_id=uuid4(),
+        node_id="g2-provider",
+        correlation_id="g2-provider",
     )
 
 

@@ -207,3 +207,42 @@ WS-3 Durable Execution 与 WS-4 Observation Slice 均无未关闭的实现阻塞
   manifest reverse validation、真实 PostgreSQL integration 152 passed、
   `--require-release` manifest 验证 valid）。WS-5 delivery 进入负责人验收流程；
   按 ROADMAP 规则，`verified` 状态需负责人显式批准。
+
+## 2026-08-20 WS-6 阶段记录：gateway 认证与构建网络阻塞
+
+- WS-6 A 线推进：6.A.1（`0106226`）、6.A.2（`6dbe0a1`）、6.A.3 路由数据通路（`ea373d2`，
+  migration 0013 + schema contract v9）均经 verify + 真实 PostgreSQL integration 双门禁
+  （152 passed）关闭；`ea373d2` 之后 integration 曾完整重跑通过（int_r1）。
+- 6.B.1/6.B.2 gateway 认证模式完成（`a4f0f40`）：`make verify` 1037 passed / coverage 89.41%。
+  **该 commit 的 integration 重跑当前被环境阻塞**：Docker 镜像构建内 uv 下载在
+  清华源×4、阿里源×1、默认 PyPI×1（均 CI_BUILD_NETWORK=host，UV_HTTP_TIMEOUT=120，
+  含 uv cache mount）共 6 次尝试中持续中断（sqlalchemy/zstandard 等大 wheel 下载
+  unexpected eof/timeout）；宿主机代理处于劣化窗口。改动仅触及请求认证分发
+  （compose 以 fixture 模式运行，gateway 分支为增量路径，不涉及 DB/schema/graph），
+  前一 commit 的完整 integration 覆盖周边路径。网络恢复后重跑一次
+  `CI_BUILD_NETWORK=host CI_BUILD_UV_INDEX=<镜像源> make integration` 即可关闭本条；
+  在此之前不声称本 commit 的 integration 结论。
+- 6.E.1 RunInteractionModel 契约冻结完成（`e788a7c`，verify 1051 passed / coverage 89.51%）：
+  纯新增参考模块 + golden 测试，零触碰现有运行路径；其 integration 重跑与上述网络阻塞合并记录。
+- 附带沉淀：compose volume 在 run 之间保留——migration 内容变更而 revision id 不变时
+  必须先 `docker compose -p grove-ws0-test down -v` 清理，否则 alembic 跳过执行、
+  旧函数体残留（本次 0013 迭代中实际踩中并修复）。
+
+## 2026-08-26 网络阻塞解除与 integration 全绿（B.3 闭环）
+
+- 宿主网络恢复后完整重跑 `CI_BUILD_NETWORK=host make integration`：镜像构建越过此前
+  中断的 wheel 下载阶段（双镜像 runtime tree digest 一致），全套件首次结果
+  155 collected 内 153 passed / 2 failed / 8 skipped。两个失败均已根因定位并修复
+  （`676f3a6`），随后第二次完整重跑 **155 passed / 8 skipped、exit 0**，容器与 volume
+  清理完成、无残留。
+- 失败 1（确定性夹具缺陷）：migration 0014 新增 `asset_risk_asset_state`（FK→tenant），
+  `test_ws2_submit_api` 的 between-cases TRUNCATE 清单未同步，cleanup 阶段报
+  "cannot truncate a table referenced in a foreign key constraint"。属 D 线迁移后的
+  测试夹具滞后，非产品回归；已把新表加入 truncate 清单。
+- 失败 2（环境负载时序 flake）：zero-write 锁超时矩阵测试中，无锁竞争的 setup claim
+  复用了专为"阻塞调用超时零写入"断言存在的 250ms operation-timeout driver，负载下
+  setup 自身超过 250ms 抛 TimeoutError。setup claim 改用同 session factory 的默认
+  超时 driver；阻塞断言仍用 250ms driver，语义不变。
+- 本记录关闭 2026-08-20 的构建网络阻塞条目与 6.B.3 的 integration 补跑义务；WS-6 B 线
+  （gateway 认证 + 真实 principal 全量联测）至此完整落地。不形成 G3、Core/Product
+  release 结论。

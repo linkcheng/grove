@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import hmac
 import re
 from dataclasses import dataclass
 from enum import StrEnum
@@ -109,6 +110,40 @@ def _context_from_development_headers(request: Request) -> ActiveTenantContext |
     return ActiveTenantContext(tenant_id=tenant_id, principal=Principal(principal_id, kind))
 
 
+def _context_from_gateway_headers(request: Request, expected_token: str) -> ActiveTenantContext | None:
+    """Parse gateway-injected identity headers behind a shared-secret proof.
+
+    The trust anchor is the deployment-owned secret shared with the
+    authenticated gateway; without it these are ordinary client-controlled
+    headers and must never construct an identity.
+    """
+
+    presented = request.headers.get("x-grove-gateway-auth")
+    if presented is None:
+        return None
+    if not hmac.compare_digest(presented, expected_token):
+        raise AuthenticationError("gateway credential is invalid")
+    if request.headers.get("x-grove-auth") or request.headers.get("authorization"):
+        raise AuthenticationError("gateway credentials must not be combined with other credentials")
+    tenant_id = request.headers.get("x-grove-tenant-id")
+    principal_id = request.headers.get("x-grove-principal-id")
+    if tenant_id is None or principal_id is None:
+        raise AuthenticationError("gateway tenant and principal headers are required")
+    kind_value = request.headers.get("x-grove-principal-kind", PrincipalKind.HUMAN.value)
+    try:
+        kind = PrincipalKind(kind_value)
+    except ValueError as exc:
+        raise AuthenticationError("principal kind is invalid") from exc
+    # No roles/scopes can arrive through a client-controlled header.
+    if request.headers.get("x-grove-principal-roles") or request.headers.get("x-grove-principal-scopes"):
+        raise AuthenticationError("authorization claims must come from the tenant database")
+    return ActiveTenantContext(
+        tenant_id=tenant_id,
+        principal=Principal(principal_id, kind),
+        auth_strength="gateway",
+    )
+
+
 def authenticate_request(request: Request) -> ActiveTenantContext:
     """Authenticate one explicit fixture context and bind it to this request."""
 
@@ -136,6 +171,20 @@ async def require_active_tenant_context(request: Request) -> ActiveTenantContext
 
     settings = getattr(request.app.state, "settings", None)
     auth_mode = getattr(settings, "auth_mode", "disabled")
+    if auth_mode == "gateway":
+        token = getattr(settings, "gateway_auth_token", None)
+        expected = token.get_secret_value() if token is not None else ""
+        if not expected:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="authentication unavailable")
+        try:
+            context = _context_from_gateway_headers(request, expected)
+        except AuthenticationError as exc:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required") from exc
+        if context is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required")
+        active_tenant_context.set(context)
+        request.state.active_tenant_context = context
+        return context
     if auth_mode != "fixture":
         # An unconfigured adapter must never accept a client identity.  A
         # request without credentials remains a normal 401 for compatibility;

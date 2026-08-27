@@ -14,19 +14,22 @@ Semantics (WS-4 acceptance):
     seq and marks it ``partial``; events past the gap are never applied, so a
     missing transition can never produce an unjustified terminal status;
   * an unrecognised payload schema is counted and never crashes the reducer;
-  * a tenant switch clears previously accumulated message/interaction state so a
-    stale cross-tenant view cannot leak into the new tenant.
+  * ``domain_view_accepted`` milestones accumulate for the Profile-owned
+    typed renderer (6.E.3), deduplicated on ``tool_request_id + result_hash``;
+  * a tenant switch clears previously accumulated message/interaction/domain
+    view state so a stale cross-tenant view cannot leak into the new tenant.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.contracts.canonical import UIProjectionEvent
+from app.contracts.canonical import SHA256_PATTERN, UIProjectionEvent
 from app.observation.facts import (
     KNOWN_UI_PROJECTION_SCHEMA_REFS,
     TERMINAL_RUN_STATUSES,
@@ -60,6 +63,24 @@ class InteractionView(BaseModel):
     revision: int = Field(ge=0)
 
 
+class DomainViewMilestone(BaseModel):
+    """Accumulated ``domain_view_accepted`` milestone (docs/06 §7.2).
+
+    Duplicates collapse on ``tool_request_id + result_hash``; the payload the
+    renderer may see is bounded to the safe projection surface and never
+    includes tool request/response bodies.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tool_request_id: UUID
+    view_schema_ref: str = Field(min_length=1, max_length=256)
+    observed_at: datetime
+    source_ref: str = Field(min_length=1, max_length=256)
+    result_hash: str = Field(pattern=SHA256_PATTERN)
+    item_count: int | None = Field(default=None, ge=0, le=1_000_000)
+
+
 class RunViewState(BaseModel):
     """The canonical, replay-stable output of the headless reducer."""
 
@@ -71,6 +92,7 @@ class RunViewState(BaseModel):
     run_revision: int = Field(default=0, ge=0)
     messages: tuple[MessageView, ...] = ()
     interactions: tuple[InteractionView, ...] = ()
+    domain_views: tuple[DomainViewMilestone, ...] = ()
     completeness: ObservationCompleteness = "complete"
     last_projection_seq: int = Field(default=0, ge=0)
     unknown_schema_count: int = Field(default=0, ge=0)
@@ -116,6 +138,7 @@ def reduce_run_view(events: Sequence[UIProjectionEvent[Any]]) -> RunViewState:
     run_revision = 0
     messages: dict[UUID, dict[str, Any]] = {}
     interactions: dict[UUID, InteractionView] = {}
+    domain_views: dict[tuple[UUID, str], DomainViewMilestone] = {}
     unknown_schema_count = 0
     applied = 0
     gap_detected = False
@@ -138,6 +161,7 @@ def reduce_run_view(events: Sequence[UIProjectionEvent[Any]]) -> RunViewState:
             # expectation at the new stream's first projection_seq.
             messages = {}
             interactions = {}
+            domain_views = {}
             status = None
             run_revision = 0
             tenant_id = event_tenant
@@ -176,9 +200,11 @@ def reduce_run_view(events: Sequence[UIProjectionEvent[Any]]) -> RunViewState:
             _interaction_upserted(interactions, payload)
         elif kind == "interaction_resolved":
             _interaction_resolved(interactions, payload)
-        # ``domain_view_accepted`` and ``child_status_changed`` are recognised
-        # schemas but carry no run-view accumulation in this slice; they remain
-        # visible through the projection stream without altering run state.
+        elif kind == "domain_view_accepted":
+            _domain_view_accepted(domain_views, payload)
+        # ``child_status_changed`` is a recognised schema but carries no
+        # run-view accumulation in this slice; it remains visible through the
+        # projection stream without altering run state.
         applied += 1
 
     final_status = status
@@ -194,7 +220,8 @@ def reduce_run_view(events: Sequence[UIProjectionEvent[Any]]) -> RunViewState:
     message_views = tuple(
         MessageView(**data) for data in sorted(messages.values(), key=lambda item: str(item["message_id"]))
     )
-    interaction_views = tuple(sorted(interactions.values(), key=lambda item: str(item.interaction_id)))
+    interaction_views = tuple(sorted(interactions.values(), key=lambda item: item.interaction_id))
+    domain_view_views = tuple(sorted(domain_views.values(), key=lambda item: (item.tool_request_id, item.result_hash)))
 
     return RunViewState(
         tenant_id=tenant_id,
@@ -203,6 +230,7 @@ def reduce_run_view(events: Sequence[UIProjectionEvent[Any]]) -> RunViewState:
         run_revision=run_revision,
         messages=message_views,
         interactions=interaction_views,
+        domain_views=domain_view_views,
         completeness=completeness,
         last_projection_seq=last_projection_seq,
         unknown_schema_count=unknown_schema_count,
@@ -268,7 +296,20 @@ def _interaction_resolved(interactions: dict[UUID, InteractionView], payload: An
         )
 
 
+def _domain_view_accepted(domain_views: dict[tuple[UUID, str], DomainViewMilestone], payload: Any) -> None:
+    milestone = DomainViewMilestone(
+        tool_request_id=payload.tool_request_id,
+        view_schema_ref=payload.view_schema_ref,
+        observed_at=payload.observed_at,
+        source_ref=payload.source_ref,
+        result_hash=payload.result_hash,
+        item_count=payload.item_count,
+    )
+    domain_views[(milestone.tool_request_id, milestone.result_hash)] = milestone
+
+
 __all__ = [
+    "DomainViewMilestone",
     "InteractionView",
     "KNOWN_UI_PROJECTION_SCHEMA_REFS",
     "MessageView",

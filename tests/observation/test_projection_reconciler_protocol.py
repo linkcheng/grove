@@ -194,10 +194,55 @@ async def test_run_loop_survives_iteration_errors_until_shutdown() -> None:
     assert len(calls) >= 1
 
 
-def test_rebuild_reprojects_every_lifecycle_fact() -> None:
+def test_rebuild_reprojects_every_projectable_fact() -> None:
+    from app.observation.facts import DOMAIN_VIEW_ACCEPTED_SCHEMA_REF
+
+    def _domain_view_payload() -> dict[str, Any]:
+        return {
+            "kind": "domain_view_accepted",
+            "run_id": str(RUN_ID),
+            "tool_request_id": str(uuid4()),
+            "view_schema_ref": "AssetStateView@1",
+            "observed_at": OCCURRED_AT.isoformat(),
+            "source_ref": "asset.state.postgres",
+            "result_hash": "d" * 64,
+            "item_count": 2,
+        }
+
     rebuild_rows = [
-        (uuid4(), RUN_ID, 1, _lifecycle_payload(), OCCURRED_AT, "corr-1", CAUSATION_ID, "trace-1"),
-        (uuid4(), RUN_ID, 2, _lifecycle_payload(), OCCURRED_AT, "corr-1", CAUSATION_ID, "trace-1"),
+        (
+            uuid4(),
+            RUN_ID,
+            1,
+            _lifecycle_payload(),
+            OCCURRED_AT,
+            "corr-1",
+            CAUSATION_ID,
+            "trace-1",
+            RUN_LIFECYCLE_SCHEMA_REF,
+        ),
+        (
+            uuid4(),
+            RUN_ID,
+            2,
+            _lifecycle_payload(),
+            OCCURRED_AT,
+            "corr-1",
+            CAUSATION_ID,
+            "trace-1",
+            RUN_LIFECYCLE_SCHEMA_REF,
+        ),
+        (
+            uuid4(),
+            RUN_ID,
+            3,
+            _domain_view_payload(),
+            OCCURRED_AT,
+            "corr-1",
+            CAUSATION_ID,
+            "trace-1",
+            DOMAIN_VIEW_ACCEPTED_SCHEMA_REF,
+        ),
     ]
 
     def script(sql: str, _: dict[str, Any]) -> FakeResult | None:
@@ -209,10 +254,14 @@ def test_rebuild_reprojects_every_lifecycle_fact() -> None:
 
     session = FakeSession(script)
     rebuilt = asyncio.run(_reconciler(session).rebuild("tenant-a"))
-    assert rebuilt == 2
+    assert rebuilt == 3
     assert len(_statements(session, "DELETE FROM ui_projection_event")) == 1
     assert len(_statements(session, "DELETE FROM projection_watermark")) == 1
-    assert len(_statements(session, "INSERT INTO ui_projection_event")) == 2
+    inserts = [(sql, params) for sql, params in session.executed if "INSERT INTO ui_projection_event" in sql]
+    assert len(inserts) == 3
+    # The domain-view fact projects to its own UI schema ref.
+    domain_view_inserts = [params for _, params in inserts if params["schema"].startswith("grove.ui.domain-view")]
+    assert len(domain_view_inserts) == 1
 
 
 def test_health_reports_backlog_and_unknown_schema_counts() -> None:

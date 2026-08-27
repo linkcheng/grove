@@ -56,7 +56,7 @@ WS2_BUSINESS_RELATIONS = frozenset(
 WS3_CHECKPOINT_RELATIONS = frozenset({"checkpoints", "checkpoint_blobs", "checkpoint_writes"})
 WS3_INFRASTRUCTURE_RELATIONS = frozenset({"checkpoint_migrations"})
 WS3_BUSINESS_RELATIONS = WS2_BUSINESS_RELATIONS | WS3_CHECKPOINT_RELATIONS
-WS3_SCHEMA_CONTRACT_VERSION = "ws3-execution-authority-v8"
+WS3_SCHEMA_CONTRACT_VERSION = "ws3-execution-authority-v9"
 
 # WS-4 adds the observation slice (runtime event/outbox, rebuildable UI
 # projection read model, projection watermark, dead-letter).  These are
@@ -72,12 +72,15 @@ WS4_OBSERVATION_RELATIONS = frozenset(
     }
 )
 WS4_BUSINESS_RELATIONS = WS3_BUSINESS_RELATIONS | WS4_OBSERVATION_RELATIONS
+WS6_PROFILE_RELATIONS = frozenset({"asset_risk_asset_state"})
+WS6_MIGRATION_HEADS = frozenset({"ws6_asset_risk_state", "ws6_domain_view_runtime_event"})
 WS4_MIGRATION_HEADS = frozenset(
     {
         "ws4_observation_slice",
         "ws4_recon_helpers",
         "ws4_authority_audit_emitters",
         "ws3_consumed_provenance_compat",
+        "ws6_claim_graph_binding",
     }
 )
 
@@ -137,6 +140,7 @@ WS3_AUTHORITY_INDEX_SPECS: dict[str, tuple[str, bool, tuple[str, ...]]] = {
 WS3_AUTHORITY_OBJECT_TABLE_NAMES = (
     "agent_run",
     "alembic_version",
+    "asset_risk_asset_state",
     "checkpoint_blobs",
     "checkpoint_migrations",
     "checkpoint_writes",
@@ -274,6 +278,17 @@ WS3_AUTHORITY_EXCLUDED_RELATION_NAMES = (
     "execution_principal",
 )
 WS3_AUTHORITY_COLUMNS: dict[str, tuple[str, ...]] = {
+    "asset_risk_asset_state": (
+        "tenant_id",
+        "asset_ref",
+        "asset_class",
+        "exposure_amount",
+        "currency",
+        "status",
+        "source_revision",
+        "observed_at",
+        "created_at",
+    ),
     "tenant": ("tenant_id", "status", "created_at"),
     "membership": ("tenant_id", "principal_id", "principal_kind", "user_ref", "roles", "active", "created_at"),
     "workload_principal": (
@@ -694,7 +709,7 @@ WS3_SCHEMA_CONTRACT: dict[str, Any] = {
             "owner": "grove_migration",
             "security_definer": True,
             "settings": ["search_path=pg_catalog, public"],
-            "definition_sha256": "bfb082256ba3424c200a5d4b0adc95ea79634c164cb7879aba22a140f1bbfff4",
+            "definition_sha256": "ca835fe6064873712e036727a0785b11ddae6ac7f5e72862774fa0d9ca31b15f",
         },
         (
             "public.grove_accept_cancel_run("
@@ -1751,6 +1766,12 @@ def _identity_relation_entry(relation: str) -> dict[str, Any]:
 for _identity_relation in ("tenant", "membership", "workload_principal", "execution_principal"):
     WS3_AUTHORITY_RELATION_REGISTRY[f"public.{_identity_relation}"] = _identity_relation_entry(_identity_relation)
 
+# WS-6 profile-owned live-state relation: read-only through the tenant-scoped
+# adapter, same RLS + FORCE isolation family as every business relation.
+_profile_asset_state = _identity_relation_entry("asset_risk_asset_state")
+_profile_asset_state["state_owner"] = "asset_risk_profile"
+WS3_AUTHORITY_RELATION_REGISTRY["public.asset_risk_asset_state"] = _profile_asset_state
+
 WS3_AUTHORITY_RELATION_REGISTRY["public.checkpoint_migrations"] = {
     "schema": "public",
     "name": "checkpoint_migrations",
@@ -1955,6 +1976,11 @@ def _full_relation_grants(relation: str) -> dict[str, dict[str, Any]]:
         table_grants["grove_runtime"].update({"SELECT": True, "INSERT": True, "UPDATE": True})
         for privilege in ("SELECT", "INSERT", "UPDATE"):
             column_grants["grove_runtime"][privilege] = list(columns)
+    elif relation == "asset_risk_asset_state":
+        # Profile live state: the runtime role reads it only through the
+        # tenant-scoped adapter seam (RLS + FORCE governs every row).
+        table_grants["grove_runtime"]["SELECT"] = True
+        column_grants["grove_runtime"]["SELECT"] = list(columns)
     elif relation == "agent_run":
         for role in WS3_AUTHORITY_ONLINE_ROLES[:-1]:
             table_grants[role]["SELECT"] = True
@@ -2825,6 +2851,8 @@ def _verify_migration_report(path: Path, manifest: RuntimeBuildManifest) -> None
         }
         else WS4_BUSINESS_RELATIONS
         if report_head in WS4_MIGRATION_HEADS
+        else WS4_BUSINESS_RELATIONS | WS6_PROFILE_RELATIONS
+        if report_head in WS6_MIGRATION_HEADS
         else frozenset()
     )
     if set(relations) != expected_relations:

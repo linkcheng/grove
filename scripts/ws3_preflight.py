@@ -34,6 +34,9 @@ def check(root: Path, database_url: str) -> None:
         "ws4_recon_helpers",
         "ws4_authority_audit_emitters",
         "ws3_consumed_provenance_compat",
+        "ws6_claim_graph_binding",
+        "ws6_asset_risk_state",
+        "ws6_domain_view_runtime_event",
     }
     if expected_head not in _WS3_PREFLIGHT_HEADS:
         raise WS3PreflightError(

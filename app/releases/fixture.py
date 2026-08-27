@@ -167,6 +167,8 @@ class FixtureRelease(BaseModel):
     budget: dict[str, Any]
     runtime_manifest: dict[str, Any]
     graph: dict[str, Any]
+    asset_risk_graph: dict[str, Any]
+    asset_risk_evaluation_subject_hashes: dict[str, str]
     contracts: dict[str, Any]
     runtime_build: dict[str, Any]
     authorization_policy: dict[str, Any]
@@ -189,6 +191,9 @@ class FixtureReleaseBundle:
     graph: FixtureGraphArtifact
     graph_ref: VersionedRef
     graph_binding: GraphBinding
+    asset_risk_graph: FixtureGraphArtifact
+    asset_risk_graph_ref: VersionedRef
+    asset_risk_graph_binding: GraphBinding
     contracts: FixtureContractArtifact
     contracts_ref: VersionedRef
     contracts_binding: ContractBinding
@@ -199,6 +204,8 @@ class FixtureReleaseBundle:
     permission_presets: Mapping[str, FixturePermissionPreset]
     evaluation_subject_hashes: Mapping[str, str]
     evidence_indexes: Mapping[str, FixtureEvidenceIndex]
+    asset_risk_evaluation_subject_hashes: Mapping[str, str]
+    asset_risk_evidence_indexes: Mapping[str, FixtureEvidenceIndex]
     evaluation_evidence: Mapping[str, EvaluationEvidenceRef]
     artifact_bytes: Mapping[str, bytes]
 
@@ -295,6 +302,80 @@ def _draft_runtime_build() -> RuntimeBuildManifest:
     return manifest
 
 
+def _publish_variant_evidence(
+    *,
+    variant: str,
+    preset: str,
+    preset_ref: VersionedRef,
+    subject_hash: str,
+    publish: Any,
+    index_map: dict[str, VersionedRef],
+    bundle_map: dict[str, VersionedRef],
+    attestation_map: dict[str, VersionedRef],
+) -> None:
+    run_id = uuid5(NAMESPACE_URL, f"grove:fixture:evaluation-run:{variant}:{preset_ref.ref}:{subject_hash}")
+    attestation_model = FixtureEvidenceAttestation(
+        kind="evaluation_attestation",
+        preset_ref=preset_ref.ref,
+        suite_ref=FIXTURE_EVALUATION_SUITE_REF,
+        evaluation_run_id=run_id,
+        evaluation_subject_hash=subject_hash,
+        decision="passed",
+        issuer=FIXTURE_EVALUATION_ISSUER,
+    )
+    attestation_payload = _model_bytes(attestation_model)
+    attestation_artifact_ref = publish(f"evidence.attestation.{variant}.{preset}@1", attestation_payload)
+    attestation_ref = ArtifactRef(
+        artifact_id=uuid5(NAMESPACE_URL, f"grove:fixture:attestation:{variant}:{preset}"),
+        tenant_id=FIXTURE_EVIDENCE_TENANT,
+        version="1",
+        content_hash=attestation_artifact_ref.content_hash,
+        media_type="application/vnd.grove.evaluation-attestation+json",
+        schema_ref="evidence.attestation@1",
+        sensitivity="internal",
+        retention_policy_ref="retention.fixture@1",
+    )
+    bundle_model = FixtureEvidenceBundle(
+        kind="evaluation_bundle",
+        preset_ref=preset_ref.ref,
+        suite_ref=FIXTURE_EVALUATION_SUITE_REF,
+        evaluation_run_id=run_id,
+        evaluation_subject_hash=subject_hash,
+        decision="passed",
+        issuer=FIXTURE_EVALUATION_ISSUER,
+        attestation_ref=attestation_ref,
+        attestation_artifact_ref=attestation_artifact_ref,
+    )
+    bundle_payload = _model_bytes(bundle_model)
+    bundle_ref = publish(f"evidence.bundle.{variant}.{preset}@1", bundle_payload)
+    evaluation = EvaluationEvidenceRef(
+        evaluation_run_id=run_id,
+        tenant_id=FIXTURE_EVIDENCE_TENANT,
+        evaluation_subject_hash=subject_hash,
+        suite_ref=FIXTURE_EVALUATION_SUITE_REF,
+        decision="passed",
+        evidence_bundle_hash=bundle_ref.content_hash,
+        issuer=FIXTURE_EVALUATION_ISSUER,
+        attestation_ref=attestation_ref,
+    )
+    index_model = FixtureEvidenceIndex(
+        preset_ref=preset_ref.ref,
+        suite_ref=FIXTURE_EVALUATION_SUITE_REF,
+        evaluation_run_id=run_id,
+        evaluation_subject_hash=subject_hash,
+        decision="passed",
+        issuer=FIXTURE_EVALUATION_ISSUER,
+        bundle_ref=bundle_ref,
+        attestation_artifact_ref=attestation_artifact_ref,
+        evaluation=evaluation,
+    )
+    index_payload = _model_bytes(index_model)
+    index_ref = publish(f"evidence.index.{variant}.{preset}@1", index_payload)
+    index_map[preset] = index_ref
+    bundle_map[preset] = bundle_ref
+    attestation_map[preset] = attestation_artifact_ref
+
+
 def _build_artifacts() -> tuple[dict[str, bytes], dict[str, VersionedRef], dict[str, Any]]:
     artifacts: dict[str, bytes] = {}
     refs: dict[str, VersionedRef] = {}
@@ -321,6 +402,24 @@ def _build_artifacts() -> tuple[dict[str, bytes], dict[str, VersionedRef], dict[
     graph_ref = publish(graph_model.ref, _model_bytes(graph_model))
     graph_binding = GraphBinding(graph=graph_ref, graph_state_schema_version=graph_model.state_schema_version)
     graph_binding_ref = publish("graph-binding.fixture@1", _model_bytes(graph_binding))
+    asset_risk_graph_model = FixtureGraphArtifact(
+        ref="graph.asset-risk@1",
+        version="1",
+        state_schema_version="state.asset-risk@1",
+        nodes=(
+            "validate_input",
+            "retrieve_policy_knowledge",
+            "read_asset_state",
+            "inference",
+            "typed_report",
+        ),
+    )
+    asset_risk_graph_ref = publish(asset_risk_graph_model.ref, _model_bytes(asset_risk_graph_model))
+    asset_risk_graph_binding = GraphBinding(
+        graph=asset_risk_graph_ref,
+        graph_state_schema_version=asset_risk_graph_model.state_schema_version,
+    )
+    asset_risk_graph_binding_ref = publish("graph-binding.asset-risk@1", _model_bytes(asset_risk_graph_binding))
     contracts_model = FixtureContractArtifact(ref="contracts.fixture@1", version="1", command_schema_version="start.v1")
     contracts_ref = publish(contracts_model.ref, _model_bytes(contracts_model))
     contracts_binding = ContractBinding(contracts=contracts_ref, converter_bundle=None)
@@ -375,79 +474,60 @@ def _build_artifacts() -> tuple[dict[str, bytes], dict[str, VersionedRef], dict[
         for preset in preset_refs
     }
 
+    asset_risk_evaluation_subject_hashes = {
+        preset: _fixture_subject_hash(
+            skill_ref=skill_ref,
+            graph_binding=asset_risk_graph_binding,
+            contracts_binding=contracts_binding,
+            runtime_manifest_ref=runtime_manifest_ref,
+            runtime_build_ref=runtime_build_ref,
+            authorization_policy_ref=policy_ref,
+            permission_preset_ref=preset_refs[preset],
+            permission_envelope_hash=permission_envelope_hash,
+            budget_ref=budget_ref,
+        )
+        for preset in preset_refs
+    }
     evidence_indexes: dict[str, VersionedRef] = {}
     evidence_bundles: dict[str, VersionedRef] = {}
     evidence_attestations: dict[str, VersionedRef] = {}
-    for preset, preset_ref in preset_refs.items():
-        subject_hash = evaluation_subject_hashes[preset]
-        run_id = uuid5(NAMESPACE_URL, f"grove:fixture:evaluation-run:{preset_ref.ref}:{subject_hash}")
-        attestation_model = FixtureEvidenceAttestation(
-            kind="evaluation_attestation",
-            preset_ref=preset_ref.ref,
-            suite_ref=FIXTURE_EVALUATION_SUITE_REF,
-            evaluation_run_id=run_id,
-            evaluation_subject_hash=subject_hash,
-            decision="passed",
-            issuer=FIXTURE_EVALUATION_ISSUER,
-        )
-        attestation_payload = _model_bytes(attestation_model)
-        attestation_artifact_ref = publish(f"evidence.attestation.{preset}@1", attestation_payload)
-        attestation_ref = ArtifactRef(
-            artifact_id=uuid5(NAMESPACE_URL, f"grove:fixture:attestation:{preset}"),
-            tenant_id=FIXTURE_EVIDENCE_TENANT,
-            version="1",
-            content_hash=attestation_artifact_ref.content_hash,
-            media_type="application/vnd.grove.evaluation-attestation+json",
-            schema_ref="evidence.attestation@1",
-            sensitivity="internal",
-            retention_policy_ref="retention.fixture@1",
-        )
-        bundle_model = FixtureEvidenceBundle(
-            kind="evaluation_bundle",
-            preset_ref=preset_ref.ref,
-            suite_ref=FIXTURE_EVALUATION_SUITE_REF,
-            evaluation_run_id=run_id,
-            evaluation_subject_hash=subject_hash,
-            decision="passed",
-            issuer=FIXTURE_EVALUATION_ISSUER,
-            attestation_ref=attestation_ref,
-            attestation_artifact_ref=attestation_artifact_ref,
-        )
-        bundle_payload = _model_bytes(bundle_model)
-        bundle_ref = publish(f"evidence.bundle.{preset}@1", bundle_payload)
-        evaluation = EvaluationEvidenceRef(
-            evaluation_run_id=run_id,
-            tenant_id=FIXTURE_EVIDENCE_TENANT,
-            evaluation_subject_hash=subject_hash,
-            suite_ref=FIXTURE_EVALUATION_SUITE_REF,
-            decision="passed",
-            evidence_bundle_hash=bundle_ref.content_hash,
-            issuer=FIXTURE_EVALUATION_ISSUER,
-            attestation_ref=attestation_ref,
-        )
-        index_model = FixtureEvidenceIndex(
-            preset_ref=preset_ref.ref,
-            suite_ref=FIXTURE_EVALUATION_SUITE_REF,
-            evaluation_run_id=run_id,
-            evaluation_subject_hash=subject_hash,
-            decision="passed",
-            issuer=FIXTURE_EVALUATION_ISSUER,
-            bundle_ref=bundle_ref,
-            attestation_artifact_ref=attestation_artifact_ref,
-            evaluation=evaluation,
-        )
-        index_payload = _model_bytes(index_model)
-        index_ref = publish(f"evidence.index.{preset}@1", index_payload)
-        evidence_indexes[preset] = index_ref
-        evidence_bundles[preset] = bundle_ref
-        evidence_attestations[preset] = attestation_artifact_ref
-
+    asset_risk_evidence_indexes: dict[str, VersionedRef] = {}
+    asset_risk_evidence_bundles: dict[str, VersionedRef] = {}
+    asset_risk_evidence_attestations: dict[str, VersionedRef] = {}
+    for variant, variant_subject_hashes, variant_index_map, variant_bundle_map, variant_attestation_map in (
+        (
+            "fixture",
+            evaluation_subject_hashes,
+            evidence_indexes,
+            evidence_bundles,
+            evidence_attestations,
+        ),
+        (
+            "asset_risk",
+            asset_risk_evaluation_subject_hashes,
+            asset_risk_evidence_indexes,
+            asset_risk_evidence_bundles,
+            asset_risk_evidence_attestations,
+        ),
+    ):
+        for preset, preset_ref in preset_refs.items():
+            _publish_variant_evidence(
+                variant=variant,
+                preset=preset,
+                preset_ref=preset_ref,
+                subject_hash=variant_subject_hashes[preset],
+                publish=publish,
+                index_map=variant_index_map,
+                bundle_map=variant_bundle_map,
+                attestation_map=variant_attestation_map,
+            )
     metadata = {
         "input_schema": input_schema,
         "output_schema": output_model.model_dump(mode="json"),
         "budget": FIXTURE_CONSTRAINTS_PAYLOAD,
         "runtime_manifest": runtime_manifest.model_dump(mode="json"),
         "graph": graph_model.model_dump(mode="json"),
+        "asset_risk_graph": asset_risk_graph_model.model_dump(mode="json"),
         "contracts": contracts_model.model_dump(mode="json"),
         "runtime_build": runtime_build.model_dump(mode="json"),
         "authorization_policy": policy_model.model_dump(mode="json"),
@@ -472,8 +552,23 @@ def _build_artifacts() -> tuple[dict[str, bytes], dict[str, VersionedRef], dict[
                 f"evidence_attestation.{preset}": ref.model_dump(mode="json")
                 for preset, ref in evidence_attestations.items()
             },
+            "asset_risk_graph": asset_risk_graph_ref.model_dump(mode="json"),
+            "asset_risk_graph_binding": asset_risk_graph_binding_ref.model_dump(mode="json"),
+            **{
+                f"evidence_index.asset_risk.{preset}": ref.model_dump(mode="json")
+                for preset, ref in asset_risk_evidence_indexes.items()
+            },
+            **{
+                f"evidence_bundle.asset_risk.{preset}": ref.model_dump(mode="json")
+                for preset, ref in asset_risk_evidence_bundles.items()
+            },
+            **{
+                f"evidence_attestation.asset_risk.{preset}": ref.model_dump(mode="json")
+                for preset, ref in asset_risk_evidence_attestations.items()
+            },
         },
     }
+    metadata["asset_risk_evaluation_subject_hashes"] = dict(asset_risk_evaluation_subject_hashes)
     return artifacts, refs, metadata
 
 
@@ -542,6 +637,20 @@ def _load_bundle(
         *(f"evidence_index.{preset}" for preset in ("interactive", "read_only", "workspace_edit", "unattended")),
         *(f"evidence_bundle.{preset}" for preset in ("interactive", "read_only", "workspace_edit", "unattended")),
         *(f"evidence_attestation.{preset}" for preset in ("interactive", "read_only", "workspace_edit", "unattended")),
+        "asset_risk_graph",
+        "asset_risk_graph_binding",
+        *(
+            f"evidence_index.asset_risk.{preset}"
+            for preset in ("interactive", "read_only", "workspace_edit", "unattended")
+        ),
+        *(
+            f"evidence_bundle.asset_risk.{preset}"
+            for preset in ("interactive", "read_only", "workspace_edit", "unattended")
+        ),
+        *(
+            f"evidence_attestation.asset_risk.{preset}"
+            for preset in ("interactive", "read_only", "workspace_edit", "unattended")
+        ),
     }
     if set(refs) != required:
         raise FixtureReleaseError("published release artifact closure is incomplete")
@@ -557,6 +666,8 @@ def _load_bundle(
         agent = FixtureAgentArtifact.model_validate(json.loads(loaded["agent"]))
         graph = FixtureGraphArtifact.model_validate(json.loads(loaded["graph"]))
         graph_binding = GraphBinding.model_validate(json.loads(loaded["graph_binding"]))
+        asset_risk_graph = FixtureGraphArtifact.model_validate(json.loads(loaded["asset_risk_graph"]))
+        asset_risk_graph_binding = GraphBinding.model_validate(json.loads(loaded["asset_risk_graph_binding"]))
         contracts = FixtureContractArtifact.model_validate(json.loads(loaded["contracts"]))
         contracts_binding = ContractBinding.model_validate(json.loads(loaded["contracts_binding"]))
         runtime_manifest = SkillRuntimeManifest.model_validate(json.loads(loaded["runtime_manifest"]))
@@ -575,6 +686,10 @@ def _load_bundle(
             for preset in ("interactive", "read_only", "workspace_edit", "unattended")
         }
         evaluation_evidence = {preset: index.evaluation for preset, index in evidence_indexes.items()}
+        asset_risk_evidence_indexes = {
+            preset: FixtureEvidenceIndex.model_validate(json.loads(loaded[f"evidence_index.asset_risk.{preset}"]))
+            for preset in ("interactive", "read_only", "workspace_edit", "unattended")
+        }
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         raise FixtureReleaseError("typed fixture artifact validation failed") from exc
     if skill.ref != release.skill_ref or agent.ref != release.agent_ref or agent.skill_ref != skill.ref:
@@ -685,6 +800,9 @@ def _load_bundle(
         graph=graph,
         graph_ref=typed_refs["graph"],
         graph_binding=graph_binding,
+        asset_risk_graph=asset_risk_graph,
+        asset_risk_graph_ref=typed_refs["asset_risk_graph"],
+        asset_risk_graph_binding=asset_risk_graph_binding,
         contracts=contracts,
         contracts_ref=typed_refs["contracts"],
         contracts_binding=contracts_binding,
@@ -695,6 +813,8 @@ def _load_bundle(
         permission_presets=permission_presets,
         evaluation_subject_hashes=expected_subject_hashes,
         evidence_indexes=evidence_indexes,
+        asset_risk_evaluation_subject_hashes=release.asset_risk_evaluation_subject_hashes,
+        asset_risk_evidence_indexes=asset_risk_evidence_indexes,
         evaluation_evidence=evaluation_evidence,
         artifact_bytes=artifact_bytes,
     )
@@ -761,12 +881,21 @@ def load_fixture_evidence(
     artifact_registry = FIXTURE_ARTIFACT_REGISTRY if artifact_registry is None else artifact_registry
     bundle = load_fixture_release_bundle(release_ref, artifact_registry=artifact_registry)
     preset_name = expected_preset_ref.removeprefix("permission.").removesuffix("@1")
-    expected_subject = bundle.evaluation_subject_hashes.get(preset_name)
-    evidence = bundle.evidence_indexes.get(preset_name)
+    if expected_ref.ref.startswith("evidence.index.asset_risk."):
+        expected_subject = bundle.asset_risk_evaluation_subject_hashes.get(preset_name)
+        evidence = bundle.asset_risk_evidence_indexes.get(preset_name)
+    else:
+        expected_subject = bundle.evaluation_subject_hashes.get(preset_name)
+        evidence = bundle.evidence_indexes.get(preset_name)
     registry_payload = artifact_registry.get(expected_ref.ref)
     if evidence is None or expected_subject != expected_subject_hash or registry_payload is None:
         raise FixtureReleaseError("fixture evidence subject is not pre-published")
-    if expected_ref != bundle.release.artifact_refs.get(f"evidence_index.{preset_name}"):
+    index_key = (
+        f"evidence_index.asset_risk.{preset_name}"
+        if expected_ref.ref.startswith("evidence.index.asset_risk.")
+        else f"evidence_index.{preset_name}"
+    )
+    if expected_ref != bundle.release.artifact_refs.get(index_key):
         raise FixtureReleaseError("fixture evidence reference is not the published index")
     if payload != registry_payload:
         raise FixtureReleaseError("fixture evidence registry bytes mismatch")

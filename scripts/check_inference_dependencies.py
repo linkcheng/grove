@@ -157,9 +157,13 @@ def _safe_existing_dynamic_nodes(path: Path, tree: ast.AST) -> set[int]:
     """Exempt only the existing non-import reflection reads outside capability consumers."""
 
     allowed_calls: dict[str, set[tuple[str, tuple[object, ...]]]] = {
+        "app/api/v1/execution.py": {
+            ("getattr", ("fixture_graph_binding", "conformance")),
+        },
         "app/auth/context.py": {
             ("getattr", ("settings", None)),
             ("getattr", ("auth_mode", "disabled")),
+            ("getattr", ("gateway_auth_token", None)),
         },
         "app/execution/contracts.py": {
             ("vars", ()),

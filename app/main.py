@@ -323,7 +323,20 @@ def _run_runtime_worker(settings: Settings) -> int:
         async with production_inference_lifespan(
             app_env=settings.app_env,
             runtime_build_hash=settings.runtime_build_hash,
-        ) as inference_port:
+        ) as (inference_port, inference_request_factory):
+            from sqlalchemy.ext.asyncio import async_sessionmaker
+            from sqlalchemy.ext.asyncio import create_async_engine as _cae
+
+            from app.asset_risk.composition import compose_asset_risk_kernel
+
+            _engine = _cae(settings.database_url_value())
+            _sessions = async_sessionmaker(_engine, expire_on_commit=False)
+            asset_risk_kernel = compose_asset_risk_kernel(
+                inference_port=inference_port,
+                inference_request_factory=inference_request_factory,
+                runtime_session_factory=_sessions,
+                worker_tenant_id=settings.worker_tenant_id,
+            )
             await run_worker(
                 driver=driver,
                 tenant_id=settings.worker_tenant_id,
@@ -331,7 +344,10 @@ def _run_runtime_worker(settings: Settings) -> int:
                 runtime_build_hash=settings.runtime_build_hash,
                 database_url=settings.database_url_value(),
                 inference_port=inference_port,
+                inference_request_factory=inference_request_factory,
+                asset_risk_kernel=asset_risk_kernel,
             )
+            await _engine.dispose()
 
     try:
         asyncio.run(run_composed_worker())

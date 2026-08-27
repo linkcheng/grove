@@ -37,7 +37,11 @@ ReadSession = Annotated[AsyncSession, Depends(_read_session)]
 
 @router.post("/executions/submit", response_model=ApiResponse[RunHandle])
 @router.post("/execution/submit", response_model=ApiResponse[RunHandle], include_in_schema=False)
-async def submit(request: SubmitExecution, context: Context, session: WriteSession) -> ApiResponse[RunHandle]:
+async def submit(
+    request: SubmitExecution, context: Context, session: WriteSession, http: Request
+) -> ApiResponse[RunHandle]:
+    if getattr(http.app.state.settings, "fixture_graph_binding", "conformance") == "asset_risk":
+        return ok(await execution.submit(session, context, request, fixture_graph_binding="asset_risk"))
     return ok(await execution.submit(session, context, request))
 
 
