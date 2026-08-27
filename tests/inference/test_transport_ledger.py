@@ -133,3 +133,94 @@ async def test_token_exhaustion_prevents_the_next_physical_send() -> None:
         finally:
             current_invocation_budget.reset(token)
     assert sends == budget.physical_sends == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_payload", [{}, {"usage": None}])
+async def test_missing_provider_usage_fails_closed(provider_payload: object) -> None:
+    sends = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sends
+        sends += 1
+        return httpx.Response(200, json=provider_payload)
+
+    budget = InvocationBudget(
+        max_attempts=1,
+        max_tokens=100,
+        deadline_ms=1000,
+        max_cost_micros=100,
+        base_cost_micros=1,
+        input_micros_per_million=1,
+        output_micros_per_million=1,
+    )
+    transport = LedgerTransport(httpx.MockTransport(handler))
+    async with httpx.AsyncClient(transport=transport, base_url="https://gateway.example") as client:
+        token = current_invocation_budget.set(budget)
+        try:
+            with pytest.raises(InferenceError):
+                await client.get("/missing-usage")
+        finally:
+            current_invocation_budget.reset(token)
+    assert sends == budget.physical_sends == 1
+
+
+@pytest.mark.asyncio
+async def test_local_preparation_time_does_not_consume_provider_deadline() -> None:
+    sends = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sends
+        sends += 1
+        return httpx.Response(200, json={"usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+    budget = InvocationBudget(
+        max_attempts=1,
+        max_tokens=100,
+        deadline_ms=50,
+        max_cost_micros=100,
+        base_cost_micros=1,
+        input_micros_per_million=1,
+        output_micros_per_million=1,
+    )
+    await asyncio.sleep(0.12)
+    transport = LedgerTransport(httpx.MockTransport(handler))
+    async with httpx.AsyncClient(transport=transport, base_url="https://gateway.example") as client:
+        token = current_invocation_budget.set(budget)
+        try:
+            response = await client.get("/after-local-prep")
+        finally:
+            current_invocation_budget.reset(token)
+    assert response.status_code == 200
+    assert sends == budget.physical_sends == 1
+
+
+@pytest.mark.asyncio
+async def test_deadline_starts_at_first_send_and_expires_afterwards() -> None:
+    sends = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sends
+        sends += 1
+        await asyncio.sleep(0.06)
+        return httpx.Response(200, json={"usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+    budget = InvocationBudget(
+        max_attempts=2,
+        max_tokens=100,
+        deadline_ms=50,
+        max_cost_micros=100,
+        base_cost_micros=1,
+        input_micros_per_million=1,
+        output_micros_per_million=1,
+    )
+    transport = LedgerTransport(httpx.MockTransport(handler))
+    async with httpx.AsyncClient(transport=transport, base_url="https://gateway.example") as client:
+        token = current_invocation_budget.set(budget)
+        try:
+            await client.get("/first-send")
+            with pytest.raises(InferenceError):
+                await client.get("/second-send-after-deadline")
+        finally:
+            current_invocation_budget.reset(token)
+    assert sends == 1

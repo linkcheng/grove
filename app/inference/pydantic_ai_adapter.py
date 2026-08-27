@@ -17,6 +17,14 @@ from pydantic_ai.exceptions import (
     UnexpectedModelBehavior,
     UsageLimitExceeded,
 )
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    SystemPromptPart,
+    TextPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
@@ -140,11 +148,10 @@ class PydanticAIInferencePort:
         self._last_budget = budget
         token = current_invocation_budget.set(budget)
         try:
-            run_result = await self._run_with_provider_retries(request, result_type, budget)
+            run_result, run_calls = await self._run_with_provider_retries(request, result_type, budget)
             result = run_result.output
             if type(result) is not result_type:
                 raise InferenceError(InferenceErrorCode.INVALID_RESULT)
-            usage = run_result.usage
             envelope_type: Any = CanonicalInferenceResult.__class_getitem__(result_type)
             return cast(
                 CanonicalInferenceResult[ResultT],
@@ -163,7 +170,7 @@ class PydanticAIInferencePort:
                         cost_micros=budget.total_cost_micros,
                     ),
                     provider_attempts=budget.physical_sends,
-                    schema_retries=max(0, usage.requests - 1),
+                    schema_retries=max(0, budget.physical_sends - run_calls),
                 ),
             )
         except asyncio.CancelledError:
@@ -207,8 +214,8 @@ class PydanticAIInferencePort:
         request: CanonicalInferenceRequest[InputT],
         result_type: type[ResultT],
         budget: InvocationBudget,
-    ) -> Any:
-        prompt = self._prompt(request)
+    ) -> tuple[Any, int]:
+        history, prompt = self._provider_messages(request)
         profile = self._manifest.provider_profile
         output_type = (
             NativeOutput(result_type, strict=True)
@@ -229,10 +236,16 @@ class PydanticAIInferencePort:
             request_limit=1 + request.retry_policy.max_schema_retries,
             total_tokens_limit=request.budget.max_tokens,
         )
+        run_calls = 0
         for provider_attempt in range(request.retry_policy.max_provider_retries + 1):
+            run_calls += 1
             try:
-                async with asyncio.timeout(budget.remaining_seconds):
-                    return await agent.run(prompt, usage_limits=limits)
+                # Deadline authority is the ledger: reserve_send rejects expired
+                # invocations before every physical send, and model_settings bounds
+                # each send with the remaining httpx timeout. A wall-clock window
+                # around agent.run would bill local validation/schema work to the
+                # provider deadline.
+                return await agent.run(prompt, message_history=history, usage_limits=limits), run_calls
             except asyncio.CancelledError:
                 raise
             except ContentFilterError as exc:
@@ -262,11 +275,30 @@ class PydanticAIInferencePort:
                 raise InferenceError(InferenceErrorCode.INVALID_RESULT) from None
         raise InferenceError(InferenceErrorCode.PROVIDER_TRANSIENT)
 
-    @staticmethod
-    def _prompt(request: CanonicalInferenceRequest[InputT]) -> str:
-        parts = [item.content for item in request.instructions]
-        parts.append(TypeAdapter(type(request.input)).dump_json(request.input).decode("utf-8"))
-        return "\n".join(parts)
+    def _provider_messages(
+        self,
+        request: CanonicalInferenceRequest[InputT],
+    ) -> tuple[list[ModelMessage], str]:
+        """Map canonical instructions/context to provider messages without flattening roles."""
+
+        history: list[ModelMessage] = []
+        for item in request.instructions:
+            content = item.content
+            if item.content_schema_ref is not None:
+                content = f"{content}\ngrove.content_schema_ref={item.content_schema_ref}"
+            if item.role == "system":
+                history.append(ModelRequest(parts=[SystemPromptPart(content=content)]))
+            elif item.role == "assistant":
+                history.append(ModelResponse(parts=[TextPart(content=content)]))
+            else:
+                history.append(ModelRequest(parts=[UserPromptPart(content=content)]))
+        parts = [TypeAdapter(type(request.input)).dump_json(request.input).decode("utf-8")]
+        parts.append(f"grove.input_schema_ref={self._manifest.input_schema_ref.ref}")
+        if request.context is not None:
+            parts.append(f"grove.context={request.context.model_dump_json(exclude_none=True)}")
+        for artifact in request.context_refs:
+            parts.append(f"grove.context_ref={artifact.model_dump_json()}")
+        return history, "\n".join(parts)
 
 
 def _caused_inference_error(error: BaseException) -> InferenceError | None:

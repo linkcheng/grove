@@ -2,7 +2,34 @@
 
 任务状态、依赖和交付进度以 [`ROADMAP.md`](../../ROADMAP.md#work-packages) 为准。
 
-## 目标结果
+## 2026-08-20 范围修订（负责人批准，supersede 原 In Scope 对应条目）
+
+按负责人 2026-08-20 指示（见 ROADMAP“2026-08-20 范围调整”），本任务书收窄为
+**MVP-ready Core freeze**。语义 diff：
+
+**保留（本任务书退出条件）**：
+- 最小 production `TypedInferencePort`/PydanticAI adapter 与其全部深度接口、
+  Manifest 绑定、transport ledger 与 fail-closed 语义（原范围不变）。
+- 本地签发工具 `scripts/ws5_issue_provider_binding.py` 与操作 runbook：以外部持有的
+  root/issuer 密钥产出 authority 目录、candidate、expected facts、issuer signature 与
+  `ProviderBindingManifest`，供 development/test/integration 与 MVP G2 使用。
+- 同一冻结候选上：`make verify`、`make integration`、clean source `make release-check`
+  通过（G0/G1 与本地签名链 G2 证据）。
+
+**移至 WS-7 前置（不再阻塞 WS-6，本任务书不再验收）**：
+- G4～G7 的 production 级矩阵：cross-tenant/credential/injection 安全全矩阵、30 天等效
+  容量/load/soak、PITR/备份恢复全矩阵、Deployment Role 故障/扩缩容全矩阵。
+- G8/POC-H：Evaluation/Publication 完整闭环、trusted issuer attestation、审批与
+  bounded rollout/rollback。
+- 外部 issuer ceremony（真实外部 trust root 签发）与 `make ws-5-check` cleanroom
+  release orchestration。
+- Core `ImplementationAcceptanceRecord` 生成、独立验证与负责人批准；收窄版 WS-5
+  完成不形成 Core/Product release 结论，`business_profile_ref/hash = null` 约束仍适用。
+
+Exit Invariants 中与被移除范围绑定的条款随移除范围一并由 WS-7 承接；与 inference seam、
+ledger、本地签发与 release-check 相关的条款（含第 13 条 transport ledger）保持有效。
+
+## 目标结果（原文，受上述修订约束）
 
 对一个精确且不可变的 Core release candidate，在可复现的 cleanroom reference
 environment 中使用真实 PostgreSQL、真实 PostgresSaver 和执行时选定的真实

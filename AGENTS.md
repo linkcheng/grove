@@ -156,10 +156,11 @@
 - WS-1 保持 canonical/hash、递归闭包、依赖白名单、schema-free/executable seam 分离及持久化 closure proof。
 - WS-3 scope 以 `docs/90_P0_Blockers_and_Acceptance.md` line 1096 为唯一权威：实现 PostgreSQL Execution Driver、claim/lease/fence、LangGraph invocation、PostgresSaver checkpoint 与 crash reconciliation。验收标准是 kill 任一 worker 后只有一个有效写者，已提交 command/checkpoint 不丢失，API 无 Graph 执行能力；对应 N-03、N-05、N-25 与 Gate G2/G5。
 - WS-3 已完成：Execution Driver claim/heartbeat/consume/dead-letter/reconciliation（migrations 0003-0007，678 unit tests），FencedPostgresSaver claim-bound checkpoint adapter，execution contracts/state machine，API submit/query only。这些是 N-25 durable fence 的直接实现。
-- WS-3 未完成：runtime_worker 进程（bounded poll → claim → LangGraph invoke → checkpoint → consume/continue/terminal loop）、minimal deterministic conformance graph、crash recovery 端到端验证。这是当前 WS-3 的唯一缺口。
+- WS-3 runtime_worker 进程（bounded poll → claim → LangGraph invoke → checkpoint → consume/continue/terminal）与 SIGKILL 崩溃恢复矩阵已落地；TypedInferencePort 已注入 worker 构造器，图节点内真实 inference 属于 WS-6 首要里程碑，不在 WS-3 conformance graph 范围内。
 - catalog authority closure (`app/build/catalog_authority.py`) 是 G0 build evidence 工具（构建漂移检测），不是 N-25/WS-3 release gate。它的历史 review cycle 记录已归档到 `docs/archive/BLOCKED_catalog_authority_history_202608.md`，不再作为阻塞项；未来改进走正常的 build tooling 迭代，不需要封闭世界枚举闭包证明。
 - LangGraph execution kernel 的 graph registry、state schema、version binding 采用 minimal viable 实现：一个固定 pure deterministic conformance graph（node_a → yield → node_b → terminal），exact-match runtime build，未知 version/node/type fail closed。Graph/source/descriptor 的 hash binding 在代码中完成，不预建封闭世界 closure 证明。
 - TypedInferencePort 的 PydanticAI production adapter 不在 WS-3 Core 范围内（N-05 定义 port 契约，production adapter 是 G2 integration）。WS-3 worker loop 使用 fixture/deterministic graph，不依赖 provider。
+- 2026-08-20 负责人批准路线调整：WS-5 收窄为 MVP-ready Core freeze（production inference seam、本地签发工具 `scripts/ws5_issue_provider_binding.py`、clean source release-check）；30 天容量、PITR/role 全矩阵、Evaluation/Publication、外部 issuer ceremony 与 Core IAR 移至 WS-7 前置。WS-6 是当前焦点，首要里程碑是图节点内真实 inference。已完成的 RLS/fence/幂等/审计安全核心保持不变，不属于可后置范围。
 - review 流程取消"三轮规则 + 禁止补丁"棘轮：发现问题时按 `修复 → 真实 PostgreSQL 验证 → 复审` 迭代，同一根因连续三轮未关闭才写入 BLOCKED.md，但不禁止新设计周期；优先实现可运行代码并真实验证，而不是冻结设计文档再审查文档。
 - numeric boundary guard 不得回退为转换后检查或单值特例；新增 public entry 必须沿用同一稳定异常边界，并在副作用前拒绝非法输入。
 - 每个 Work Package 开始和结束时重新审计 Manifest schema/version、migration evidence、allowlist、阈值及固定阶段措辞。

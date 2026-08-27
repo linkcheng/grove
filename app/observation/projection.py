@@ -91,16 +91,21 @@ class ProjectionReconciler:
 
     async def run(self) -> None:
         logger.info("projection.start")
-        while not self._shutdown.is_set():
-            try:
-                processed = await self.run_once()
-                if processed == 0:
+        try:
+            while not self._shutdown.is_set():
+                try:
+                    processed = await self.run_once()
+                    if processed == 0:
+                        await self._sleep_or_shutdown()
+                except ProjectionShutdown:
+                    break
+                except Exception:
+                    logger.exception("projection.iteration_error")
                     await self._sleep_or_shutdown()
-            except ProjectionShutdown:
-                break
-            except Exception:
-                logger.exception("projection.iteration_error")
-                await self._sleep_or_shutdown()
+        except ProjectionShutdown:
+            # A shutdown request that arrives during the error-backoff sleep must
+            # stop the loop cleanly; the role entry point does not catch it.
+            pass
         logger.info("projection.stop")
 
     async def _sleep_or_shutdown(self) -> None:

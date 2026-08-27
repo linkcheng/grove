@@ -26,7 +26,7 @@ class InvocationBudget:
     output_tokens: int = field(init=False, default=0)
     _base_spend_micros: int = field(init=False, default=0)
     _base_price_micros: int = field(init=False, default=0)
-    _started: float = field(init=False, default_factory=monotonic)
+    _started: float | None = field(init=False, default=None)
     _lock: asyncio.Lock = field(init=False, default_factory=asyncio.Lock)
 
     def __post_init__(self) -> None:
@@ -51,14 +51,20 @@ class InvocationBudget:
 
     @property
     def elapsed_seconds(self) -> float:
-        return monotonic() - self._started
+        """Elapsed provider-interaction time; local preparation before the first send is not on the clock."""
+
+        return 0.0 if self._started is None else monotonic() - self._started
 
     @property
     def remaining_seconds(self) -> float:
-        return max(0.0, self.deadline_ms / 1000 - self.elapsed_seconds)
+        if self._started is None:
+            return self.deadline_ms / 1000
+        return max(0.0, self.deadline_ms / 1000 - (monotonic() - self._started))
 
     async def reserve_send(self) -> None:
         async with self._lock:
+            if self._started is None:
+                self._started = monotonic()
             if monotonic() - self._started >= self.deadline_ms / 1000:
                 raise InferenceError(InferenceErrorCode.DEADLINE_EXCEEDED)
             if self.physical_sends >= self.max_attempts:

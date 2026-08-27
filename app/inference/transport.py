@@ -36,11 +36,21 @@ def _usage_tokens(response: httpx.Response) -> tuple[int, int]:
         payload: Any = response.json()
     except (ValueError, UnicodeDecodeError):
         return 0, 0
-    if type(payload) is not dict or type(payload.get("usage")) is not dict:
+    if type(payload) is not dict:
         return 0, 0
-    usage = payload["usage"]
-    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens", 0))
-    output_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0))
+    usage = payload.get("usage")
+    successful = 200 <= response.status_code < 300
+    if type(usage) is not dict:
+        if successful:
+            raise InferenceError(InferenceErrorCode.PROVIDER_PERMANENT)
+        return 0, 0
+    input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
+    output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
+    if input_tokens is None or output_tokens is None:
+        if successful:
+            raise InferenceError(InferenceErrorCode.PROVIDER_PERMANENT)
+        input_tokens = input_tokens or 0
+        output_tokens = output_tokens or 0
     if type(input_tokens) is not int or input_tokens < 0 or type(output_tokens) is not int or output_tokens < 0:
         raise InferenceError(InferenceErrorCode.PROVIDER_PERMANENT)
     return input_tokens, output_tokens
