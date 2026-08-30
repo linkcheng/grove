@@ -133,3 +133,63 @@ CAS evidence 和严格 release gate。签名状态
 
 本地可销毁测试卷若出现 PostgreSQL collation 版本漂移，应在确认目标后重建 fresh
 volume。不要只执行 `REFRESH COLLATION VERSION`；未重建相关索引时它会掩盖不一致。
+
+## 本地全套走查（WS-7）
+
+一条命令起 api / runtime-worker / projection / db 全套，配合前端完成
+"提交 → 执行（真实推理）→ 稳定答案 → 历史 → Inspect" 的完整走查；
+验收清单见
+[WS-7-walkthrough-checklist.md](./docs/work-packages/WS-7-walkthrough-checklist.md)。
+
+前置（一次性）：
+
+1. PostgreSQL 镜像就绪（同上节 `GROVE_POSTGRES_IMAGE_ID`）。
+2. 仓库根目录 `.env`（gitignored）准备真实网关凭据与本地参数：
+   `AI_GATEWAY_URL`、`AI_GATEWAY_API_KEY`、`AI_GATEWAY_MODEL`、
+   `AI_GATEWAY_CREDENTIAL_SLOT_ID`、`GROVE_LOCAL_GATEWAY_TOKEN`（自选，
+   ≥16 字符无空白）、`GROVE_LOCAL_TENANT_ID`（默认 default）、
+   `GROVE_LOCAL_CHAIN_DIR`（签发链目录）、以及签发工具 stdout 打印的 9 个
+   `AI_GATEWAY_RELEASE_*` / policy 值。
+3. 按签发 runbook
+   ([ws5-g2-issuance](./docs/runbooks/ws5-g2-issuance.md))
+   以 `--runtime-build-hash
+   0649440505ebb474cc05a6e1e2a787b518adcd85ddf4c5c274b4071b039341a1`
+   （fixture release bundle 的 runtime_build 内容 hash）签发本地链，输出目录
+   即 `GROVE_LOCAL_CHAIN_DIR`。
+
+启动：
+
+```bash
+docker compose -f compose.yaml -f compose.local.yaml up -d --build
+docker compose -f compose.yaml -f compose.local.yaml run --rm migrate   # 升库到 head
+cd frontend && npm ci && npm run dev                                    # 前端开发服
+```
+
+前端在表单里填入与 `.env` 相同的网关令牌 / 租户 / 主体即可提交资产组合；
+worker 的租约上限为 300 秒（真实推理含结构 gate 重试），答案经过运行时结构
+校验，垃圾输出以 typed failure 拒绝而不是展示给用户。用完
+`docker compose -f compose.yaml -f compose.local.yaml down -v`。
+
+评估范围是租户当前的资产组合（`asset_risk_asset_state` 表，由运维维护；
+提交面没有按次选择资产的动词）。走查前用种子 SQL 准备租户、主体与组合
+（tenant_id 与 `GROVE_LOCAL_TENANT_ID` 一致；提交的 run 评估该租户的全部
+资产行，上限 16 条）：
+
+```bash
+docker compose -f compose.yaml -f compose.local.yaml exec -T db \
+  psql -X -v ON_ERROR_STOP=1 -U grove -d grove <<'SQL'
+INSERT INTO tenant (tenant_id) VALUES ('default') ON CONFLICT DO NOTHING;
+INSERT INTO workload_principal (tenant_id, principal_id, principal_kind, workload_ref, scopes, active)
+VALUES ('default', 'walkthrough-portal', 'workload', 'walkthrough',
+        '["execution.submit", "execution.query"]'::jsonb, true)
+ON CONFLICT DO NOTHING;
+INSERT INTO execution_principal (tenant_id, principal_id, principal_kind)
+VALUES ('default', 'walkthrough-portal', 'workload') ON CONFLICT DO NOTHING;
+INSERT INTO asset_risk_asset_state
+  (tenant_id, asset_ref, asset_class, exposure_amount, currency, status, source_revision)
+VALUES
+  ('default', 'asset.demo.credit-1', 'credit', 1200, 'CNY', 'active', 'rev-1'),
+  ('default', 'asset.demo.collateral-1', 'collateral', 800, 'CNY', 'frozen', 'rev-1')
+ON CONFLICT DO NOTHING;
+SQL
+```

@@ -453,7 +453,7 @@ async def test_driver_rejects_unbounded_inputs_before_database_access() -> None:
         ("", "b" * 64, "tenant-a", None),
         ("worker", "latest", "tenant-a", None),
         ("worker", "b" * 64, "", None),
-        ("worker", "b" * 64, "tenant-a", 91),
+        ("worker", "b" * 64, "tenant-a", MAX_LEASE_SECONDS + 1),
     ):
         with pytest.raises(ValueError):
             await driver.claim(*args)
@@ -464,7 +464,7 @@ async def test_driver_rejects_unbounded_inputs_before_database_access() -> None:
         with pytest.raises(ValueError, match="operation_timeout_seconds"):
             PostgresExecutionDriver(factory, operation_timeout_seconds=31)
         with pytest.raises(ValueError, match="lease_seconds"):
-            PostgresExecutionDriver(factory, lease_seconds=91)
+            PostgresExecutionDriver(factory, lease_seconds=MAX_LEASE_SECONDS + 1)
     finally:
         await engine.dispose()
 

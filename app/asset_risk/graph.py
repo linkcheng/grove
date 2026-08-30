@@ -16,6 +16,7 @@ from typing import Any, Literal, TypedDict
 from uuid import UUID
 
 from app.asset_risk.contracts import AssetStateQuery
+from app.asset_risk.output_gate import AnswerStructureError
 from app.asset_risk.read_tool import AssetStateReadTool
 from app.contracts.canonical import KnowledgeRequest
 from app.knowledge.port import KnowledgePort
@@ -168,7 +169,18 @@ def build_asset_risk_graph(
             sort_keys=True,
             ensure_ascii=False,
         )[:7168]
-        result = await infer(state["tenant_id"], UUID(state["run_id"]), context_summary)
+        try:
+            result = await infer(state["tenant_id"], UUID(state["run_id"]), context_summary)
+        except AnswerStructureError as error:
+            # Fail closed (WS-7): a garbage answer (empty/placeholder/format
+            # leak) never reaches the typed report; the kernel already spent
+            # the issued schema-retry budget.
+            return {
+                **state,
+                "stage": "failed",
+                "failure_class": "inference_output_invalid",
+                "failure_message": f"model answer failed the structural gate: {error}",
+            }
         return {**state, "stage": "inferred", "inference_answer": result["answer"]}
 
     def typed_report(state: AssetRiskState) -> AssetRiskState:

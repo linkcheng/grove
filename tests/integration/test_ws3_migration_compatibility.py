@@ -249,7 +249,7 @@ def _assert_published_head_forward_migration(database_url: URL) -> None:
     with psycopg.connect(_raw_url(database_url), autocommit=True) as connection:
         with connection.cursor() as cursor:
             cursor.execute("SELECT version_num FROM alembic_version")
-            assert cursor.fetchone() == ("ws6_domain_view_runtime_event",)
+            assert cursor.fetchone() == ("ws7_message_emit_allowlist",)
             cursor.execute(
                 "SELECT status, consumed_provenance_kind, consumed_worker_id, "
                 "consumed_execution_fence, consumed_lease_until, consumed_claim_provenance_hash "

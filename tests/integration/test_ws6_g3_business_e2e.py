@@ -276,14 +276,20 @@ async def test_g3_vertical_loop_from_gateway_submit_to_inspect() -> None:
                 database_url=RUNTIME_URL.replace("postgresql+psycopg://", "postgresql+asyncpg://"),
                 asset_risk_kernel=kernel,
                 poll_interval=0.01,
-                # The driver caps leases at 90s and invoke+checkpoint is the
-                # unsplittable critical section, so real generation must fit
-                # inside the lease minus a margin; the issued chain's deadline
-                # and retry policy are bounded to match.
-                invoke_budget_seconds=70.0,
+                # The driver caps leases at 300s (WS-7 raised the 90s cap
+                # because real generation regularly exceeded it) and
+                # invoke+checkpoint is the unsplittable critical section, so
+                # real generation must fit inside the lease minus a margin.
+                # The runtime gate may retry the answer up to
+                # 1 + max_schema_retries times (flash chain: 3 attempts,
+                # each a full generation), so the invoke budget spans the
+                # worst case: 3 x ~60s + checkpoint overhead = 200s; the
+                # lease keeps a 10s margin above it. Per-request deadline
+                # stays 80s from the issued chain.
+                invoke_budget_seconds=200.0,
             )
             claim = await driver.claim(
-                worker_id="g3-e2e-worker", runtime_build_hash=run_build_hash, tenant_id=tenant, lease_seconds=90.0
+                worker_id="g3-e2e-worker", runtime_build_hash=run_build_hash, tenant_id=tenant, lease_seconds=240.0
             )
             assert claim is not None
             assert claim.graph_binding.graph_ref == "graph.asset-risk@1"

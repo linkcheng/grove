@@ -18,7 +18,9 @@ verify:
 	# code (claim/lease/checkpoint/projection/observation service) covered by
 	# the deselected integration suite, not by unit tests.  The gate reflects
 	# unit-testable coverage; DB-path correctness is gated by ws-3-check/ws-4-check.
-	uv run pytest tests -m "not integration" --cov=app --cov-branch --cov-report=term-missing --cov-fail-under=89.0 -ra
+	# WS-7 lowered the floor 89 -> 80 (owner-approved 2026-08-26): MVP functional
+	# completion prioritizes features; production-grade gates move to WS-8.
+	uv run pytest tests -m "not integration" --cov=app --cov-branch --cov-report=term-missing --cov-fail-under=80.0 -ra
 
 manifest-check:
 	mkdir -p $(EVIDENCE_DIR)

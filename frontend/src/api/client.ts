@@ -15,6 +15,8 @@ export interface GroveAuth {
   gatewayToken: string;
   tenantId: string;
   principalId: string;
+  /** Gateway-injected principal kind; the MVP walkthrough principal is a workload portal. */
+  principalKind?: "human" | "workload";
 }
 
 export class GroveApiClient {
@@ -29,6 +31,7 @@ export class GroveApiClient {
       "X-Grove-Gateway-Auth": this.auth.gatewayToken,
       "X-Grove-Tenant-ID": this.auth.tenantId,
       "X-Grove-Principal-ID": this.auth.principalId,
+      "X-Grove-Principal-Kind": this.auth.principalKind ?? "workload",
       ...extra,
     };
   }
@@ -48,9 +51,16 @@ export class GroveApiClient {
         },
       }),
     });
-    const body = (await response.json()) as { data?: { run_id?: string; command_id?: string } };
+    const body = (await response.json()) as {
+      code?: number;
+      message?: string;
+      data?: { run_id?: string; command_id?: string };
+    };
     if (!response.ok || !body.data?.run_id || !body.data.command_id) {
-      throw new Error(`submit failed: ${response.status}`);
+      // Business failures arrive as HTTP 200 with a nonzero code; surface
+      // that code instead of masking it with the transport status.
+      const detail = response.ok ? ` code=${body.code ?? "?"} ${body.message ?? ""}` : "";
+      throw new Error(`submit failed: ${response.status}${detail}`.trim());
     }
     return { runId: body.data.run_id, commandId: body.data.command_id };
   }
@@ -155,7 +165,7 @@ function fromApiEvent(row: UIApiEventView): UIProjectionEvent {
 export function interactionAdapter(client: GroveApiClient, runId: string): RunInteractionAdapter {
   return {
     async loadSnapshot(): Promise<SnapshotBundle> {
-      const events = await client.loadEvents(runId, 0, 1000);
+      const events = await client.loadEvents(runId, 0, 200);
       return { view: reduceRunView(events), events };
     },
     loadBatch(afterSeq: number, limit: number) {

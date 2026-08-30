@@ -297,13 +297,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 def _run_runtime_worker(settings: Settings) -> int:
     """Start the bounded runtime worker poll loop."""
     from app.execution import PostgresExecutionDriver
-    from app.worker.loop import run_worker
+    from app.worker.loop import PRODUCTION_INVOKE_BUDGET_SECONDS, PRODUCTION_LEASE_SECONDS, run_worker
 
     engine = create_engine(settings)
     session_maker = session_factory(engine)
     driver = PostgresExecutionDriver(
         session_factory=session_maker,
-        lease_seconds=30.0,
+        lease_seconds=PRODUCTION_LEASE_SECONDS,
     )
     telemetry_runtime = TelemetryExportRuntime()
     telemetry_runtime.start()
@@ -346,6 +346,7 @@ def _run_runtime_worker(settings: Settings) -> int:
                 inference_port=inference_port,
                 inference_request_factory=inference_request_factory,
                 asset_risk_kernel=asset_risk_kernel,
+                invoke_budget_seconds=PRODUCTION_INVOKE_BUDGET_SECONDS,
             )
             await _engine.dispose()
 

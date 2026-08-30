@@ -17,6 +17,8 @@ import {
 
 export const RUN_STATUS_SCHEMA = "grove.ui.run-status-changed.v1";
 export const MESSAGE_STARTED_SCHEMA = "grove.ui.message-started.v1";
+export const MESSAGE_DELTA_SCHEMA = "grove.ui.message-delta.v1";
+export const MESSAGE_COMPLETED_SCHEMA = "grove.ui.message-completed.v1";
 export const INTERACTION_UPSERTED_SCHEMA = "grove.ui.interaction-upserted.v1";
 export const INTERACTION_RESOLVED_SCHEMA = "grove.ui.interaction-resolved.v1";
 export const DOMAIN_VIEW_SCHEMA = "grove.ui.domain-view-accepted.v1";
@@ -112,6 +114,12 @@ function applyEvent(
       messageId: String(event.payload["message_id"] ?? ""),
       role: String(event.payload["role"] ?? "assistant"),
     });
+  } else if (
+    event.payloadSchemaRef === MESSAGE_DELTA_SCHEMA ||
+    event.payloadSchemaRef === MESSAGE_COMPLETED_SCHEMA
+  ) {
+    // Recognized no-ops for the view: the answer text is assembled from the
+    // raw events (model/answerText); recognition keeps completeness honest.
   } else if (event.payloadSchemaRef === INTERACTION_UPSERTED_SCHEMA) {
     const item = event.payload["interaction"] as Record<string, unknown>;
     interactions.set(String(item["interaction_id"] ?? ""), {

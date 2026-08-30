@@ -1,0 +1,74 @@
+# WS-7 本地全套走查 overlay（README "本地全套走查" 一节为权威说明）。
+#
+# 用法（在仓库根目录，.env 已就位）：
+#   docker compose -f compose.yaml -f compose.local.yaml up -d --build
+#   docker compose -f compose.yaml -f compose.local.yaml run --rm migrate
+#
+# 与基础 compose.yaml 的区别：
+#   - api 改用 gateway 认证并绑定 asset_risk fixture graph（提交即资产风险评估）；
+#   - runtime-worker / projection-reconciliation 以持续 poll loop 运行（去掉
+#     self-check 即退出），worker 启用生产推理 lifespan（真实 provider，凭据
+#     与签发链全部来自 .env 与挂载目录，绝不写入镜像或仓库）；
+#   - migrate 一次性把数据库升到 head。
+#
+# .env 额外需要：
+#   GROVE_LOCAL_GATEWAY_TOKEN   本地网关共享令牌（>=16 字符，无空白）
+#   GROVE_LOCAL_TENANT_ID       走查租户（默认 default，与 UI 中填写一致）
+#   GROVE_LOCAL_CHAIN_DIR       宿主机上的签发链目录（挂载为容器内 /chain）
+#   AI_GATEWAY_URL / _API_KEY / _MODEL / _CREDENTIAL_SLOT_ID  真实网关凭据
+#
+# GROVE_RUNTIME_BUILD_HASH 是 fixture release bundle 的 runtime_build 内容
+# hash（与 API 提交时盖章的值一致），本地走查链必须以同一值签发
+# （runbook：scripts/ws5_issue_provider_binding.py --runtime-build-hash）。
+services:
+  api:
+    environment:
+      GROVE_APP_ENV: development
+      GROVE_AUTH_MODE: gateway
+      GROVE_GATEWAY_AUTH_TOKEN: ${GROVE_LOCAL_GATEWAY_TOKEN:?set GROVE_LOCAL_GATEWAY_TOKEN in .env}
+      GROVE_FIXTURE_GRAPH_BINDING: asset_risk
+
+  runtime-worker:
+    command: ["python", "-m", "app.main", "--role", "runtime_worker"]
+    environment:
+      GROVE_ROLE: runtime_worker
+      GROVE_APP_ENV: development
+      GROVE_RUNTIME_BUILD_HASH: 0649440505ebb474cc05a6e1e2a787b518adcd85ddf4c5c274b4071b039341a1
+      GROVE_INFERENCE_MODE: production
+      GROVE_WORKER_TENANT_ID: ${GROVE_LOCAL_TENANT_ID:-default}
+      GROVE_DATABASE_URL: postgresql+psycopg://grove_runtime:grove_runtime_ws0@db:5432/grove
+      AI_GATEWAY_URL: ${AI_GATEWAY_URL:?set AI_GATEWAY_URL in .env}
+      AI_GATEWAY_API_KEY: ${AI_GATEWAY_API_KEY:?set AI_GATEWAY_API_KEY in .env}
+      AI_GATEWAY_MODEL: ${AI_GATEWAY_MODEL:?set AI_GATEWAY_MODEL in .env}
+      AI_GATEWAY_CREDENTIAL_SLOT_ID: ${AI_GATEWAY_CREDENTIAL_SLOT_ID:?set AI_GATEWAY_CREDENTIAL_SLOT_ID in .env}
+      # 签发链以固定容器路径消费（宿主目录挂载为 /chain，只读）。
+      AI_GATEWAY_RELEASE_AUTHORITY_DIR: /chain/authority
+      AI_GATEWAY_RELEASE_CANDIDATE_PATH: /chain/core-release-identity.json
+      AI_GATEWAY_RELEASE_EXPECTED_FACTS_PATH: /chain/core-release-expected-facts.json
+      AI_GATEWAY_RELEASE_SIGNATURE_PATH: /chain/core-release-expected-facts.signature.json
+      AI_GATEWAY_PROVIDER_MANIFEST_PATH: /chain/provider-binding-manifest.json
+      AI_GATEWAY_RELEASE_ROOT_PUBLIC_KEY_SHA256: ${AI_GATEWAY_RELEASE_ROOT_PUBLIC_KEY_SHA256:?chain var required}
+      AI_GATEWAY_RELEASE_POLICY_REF: ${AI_GATEWAY_RELEASE_POLICY_REF:?chain var required}
+      AI_GATEWAY_RELEASE_POLICY_VERSION: ${AI_GATEWAY_RELEASE_POLICY_VERSION:?chain var required}
+      AI_GATEWAY_RELEASE_POLICY_SHA256: ${AI_GATEWAY_RELEASE_POLICY_SHA256:?chain var required}
+    volumes:
+      - ${GROVE_LOCAL_CHAIN_DIR:?set GROVE_LOCAL_CHAIN_DIR in .env}:/chain:ro
+
+  projection-reconciliation:
+    command: ["python", "-m", "app.main", "--role", "projection_reconciliation"]
+    environment:
+      GROVE_ROLE: projection_reconciliation
+      GROVE_APP_ENV: development
+      GROVE_DATABASE_URL: postgresql+psycopg://grove_projection:grove_projection_ws0@db:5432/grove
+
+  migrate:
+    image: grove-ws0:local
+    profiles: ["tools"]
+    environment:
+      GROVE_ROLE: api
+      GROVE_APP_ENV: development
+      GROVE_DATABASE_URL: postgresql+psycopg://grove_migration:grove_migration_ws0@db:5432/grove
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "alembic", "upgrade", "head"]

@@ -49,7 +49,11 @@ from app.observation.facts import (
     build_execution_audit_emit_request,
 )
 
-MAX_LEASE_SECONDS = 90.0
+# WS-7 (owner-approved 2026-08-26): raised from 90.0 because real LLM
+# generation latency regularly exceeded the previous cap and blocked
+# functional validation.  Callers must still keep the invoke budget
+# strictly below lease minus margin; only the ceiling changed.
+MAX_LEASE_SECONDS = 300.0
 
 
 def _bounded_text(value: object, *, label: str, maximum: int) -> str:

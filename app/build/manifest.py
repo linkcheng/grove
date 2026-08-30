@@ -56,7 +56,7 @@ WS2_BUSINESS_RELATIONS = frozenset(
 WS3_CHECKPOINT_RELATIONS = frozenset({"checkpoints", "checkpoint_blobs", "checkpoint_writes"})
 WS3_INFRASTRUCTURE_RELATIONS = frozenset({"checkpoint_migrations"})
 WS3_BUSINESS_RELATIONS = WS2_BUSINESS_RELATIONS | WS3_CHECKPOINT_RELATIONS
-WS3_SCHEMA_CONTRACT_VERSION = "ws3-execution-authority-v9"
+WS3_SCHEMA_CONTRACT_VERSION = "ws3-execution-authority-v10"
 
 # WS-4 adds the observation slice (runtime event/outbox, rebuildable UI
 # projection read model, projection watermark, dead-letter).  These are
@@ -74,6 +74,9 @@ WS4_OBSERVATION_RELATIONS = frozenset(
 WS4_BUSINESS_RELATIONS = WS3_BUSINESS_RELATIONS | WS4_OBSERVATION_RELATIONS
 WS6_PROFILE_RELATIONS = frozenset({"asset_risk_asset_state"})
 WS6_MIGRATION_HEADS = frozenset({"ws6_asset_risk_state", "ws6_domain_view_runtime_event"})
+# WS-7 adds no relations; the 0016/0017 revisions only patch protected
+# function bodies, so their heads map to the WS-6 relation set.
+WS7_MIGRATION_HEADS = frozenset({"ws7_lease_cap_300", "ws7_message_emit_allowlist"})
 WS4_MIGRATION_HEADS = frozenset(
     {
         "ws4_observation_slice",
@@ -709,7 +712,7 @@ WS3_SCHEMA_CONTRACT: dict[str, Any] = {
             "owner": "grove_migration",
             "security_definer": True,
             "settings": ["search_path=pg_catalog, public"],
-            "definition_sha256": "ca835fe6064873712e036727a0785b11ddae6ac7f5e72862774fa0d9ca31b15f",
+            "definition_sha256": "f0c6fc162e0740a99bbb03d982bd3f6e09956f2b9051f67bc90abf72ac8ce917",
         },
         (
             "public.grove_accept_cancel_run("
@@ -761,7 +764,7 @@ WS3_SCHEMA_CONTRACT: dict[str, Any] = {
             "owner": "grove_migration",
             "security_definer": True,
             "settings": ["search_path=pg_catalog, public"],
-            "definition_sha256": "6ad7c5a9681557b772749acaa781e16bfa1133e3e9592c865b4ff80847542c2a",
+            "definition_sha256": "654bb3febcd2a98b2434f5dbb577c8225cc442d96f5f1962f3c23236a0c2f4dc",
         },
         (
             "public.grove_consume_run_command("
@@ -2852,7 +2855,7 @@ def _verify_migration_report(path: Path, manifest: RuntimeBuildManifest) -> None
         else WS4_BUSINESS_RELATIONS
         if report_head in WS4_MIGRATION_HEADS
         else WS4_BUSINESS_RELATIONS | WS6_PROFILE_RELATIONS
-        if report_head in WS6_MIGRATION_HEADS
+        if report_head in WS6_MIGRATION_HEADS | WS7_MIGRATION_HEADS
         else frozenset()
     )
     if set(relations) != expected_relations:

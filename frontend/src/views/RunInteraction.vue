@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { GroveApiClient, interactionAdapter } from "../api/client";
 import { RunInteractionModel } from "../model/runInteractionModel";
 import { type RendererRegistry } from "../model/domainViewRenderer";
-import type { InteractionSnapshot } from "../model/types";
+import { assembleAnswerMessages } from "../model/answerText";
+import type { InteractionSnapshot, UIProjectionEvent } from "../model/types";
 
 const props = defineProps<{
   runId: string | null;
@@ -15,6 +16,7 @@ const snapshot = ref<InteractionSnapshot | null>(null);
 const transport = ref<"idle" | "connected" | "reconnecting">("idle");
 const unknownSchemas = ref<string[]>([]);
 const dispatchOutcome = ref<string | null>(null);
+const answerEvents = ref<UIProjectionEvent[]>([]);
 let model: RunInteractionModel | null = null;
 let stopStream: (() => void) | null = null;
 
@@ -25,6 +27,8 @@ const pendingInteractions = computed(
 const renderedDomainViews = computed(() =>
   (snapshot.value?.view.domainViews ?? []).map((milestone) => props.renderers.render(milestone)),
 );
+
+const answerMessages = computed(() => assembleAnswerMessages(answerEvents.value));
 
 async function open(): Promise<void> {
   close();
@@ -44,11 +48,14 @@ async function open(): Promise<void> {
   });
   await model.open();
   snapshot.value = model.getSnapshot();
+  const backfill = await client.loadEvents(props.runId, 0, 200);
+  answerEvents.value = [...backfill];
   stopStream = client.streamEvents(
     props.runId,
     model.getSnapshot().cursor,
     (event) => {
       void model?.applyEvent(event);
+      answerEvents.value = [...answerEvents.value, event];
     },
     (state) => {
       transport.value = state;
@@ -77,8 +84,18 @@ function close(): void {
   transport.value = "idle";
   unknownSchemas.value = [];
   dispatchOutcome.value = null;
+  answerEvents.value = [];
 }
 
+onMounted(() => {
+  void open();
+});
+watch(
+  () => props.runId,
+  () => {
+    void open();
+  },
+);
 onBeforeUnmount(close);
 </script>
 
@@ -97,11 +114,15 @@ onBeforeUnmount(close);
         <span class="badge">{{ snapshot.view.status ?? "unknown status" }}</span>
         <span class="badge">cursor {{ snapshot.cursor }}</span>
       </div>
-      <ul>
-        <li v-for="message in snapshot?.view.messages ?? []" :key="message.messageId">
-          {{ message.role }}
-        </li>
-      </ul>
+      <div v-if="answerMessages.length > 0" class="answers">
+        <h3>评估答案</h3>
+        <article v-for="message in answerMessages" :key="message.messageId" class="answer">
+          <pre class="answer-text">{{ message.content }}</pre>
+          <p class="answer-meta">
+            {{ message.completed ? "content hash " + (message.contentHash ?? "").slice(0, 12) : "streaming…" }}
+          </p>
+        </article>
+      </div>
       <div v-if="pendingInteractions.length > 0" class="pending">
         <h3>Pending interactions</h3>
         <div v-for="item in pendingInteractions" :key="item.interactionId" class="interaction">

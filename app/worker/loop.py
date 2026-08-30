@@ -47,6 +47,7 @@ from app.execution.inference_graph import (
 )
 from app.inference import TypedInferencePort
 from app.observation.facts import (
+    build_answer_message_emit_requests,
     build_domain_view_emit_request,
     build_lifecycle_emit_request,
     build_node_executed_emit_request,
@@ -59,8 +60,30 @@ POLL_INTERVAL_SECONDS = 0.5
 LEASE_MARGIN_SECONDS = 10.0
 INVOKE_BUDGET_SECONDS = 12.0
 TOTAL_BUDGET_SECONDS = 15.0
+# Production (real-inference) sizing: one asset-risk answer may spend up to
+# 1 + max_schema_retries full generations (flash chain: 3 x ~60s) inside the
+# unsplittable invoke+checkpoint critical section.  The invariant
+# invoke budget < lease - margin must hold; both constants move together.
+PRODUCTION_INVOKE_BUDGET_SECONDS = 200.0
+PRODUCTION_LEASE_SECONDS = 240.0
 
 CONFERENCE_INPUT = "grove-conformance"
+
+
+def _psycopg_conninfo(database_url: str) -> str:
+    """Strip the SQLAlchemy driver prefix for a raw psycopg conninfo string.
+
+    The production role settings use ``postgresql+psycopg://`` (the async
+    engine form proven by the API role) while the E2E harness historically
+    passed ``postgresql+asyncpg://``; the physical checkpoint connection is
+    bare psycopg either way, so both driver prefixes normalize to plain
+    ``postgresql://`` and anything else fails closed in psycopg parsing.
+    """
+
+    for prefix in ("postgresql+asyncpg://", "postgresql+psycopg://"):
+        if database_url.startswith(prefix):
+            return "postgresql://" + database_url[len(prefix) :]
+    return database_url
 
 
 class WorkerShutdown(Exception):
@@ -94,6 +117,12 @@ class RuntimeWorker:
         self._asset_risk_kernel = asset_risk_kernel
         self._poll_interval = poll_interval
         self._invoke_budget_seconds = invoke_budget_seconds
+        # invoke+checkpoint is the unsplittable critical section, so every
+        # claim and heartbeat renewal must carry a lease that covers the
+        # budget plus the margin -- derived here so the invariant holds by
+        # construction instead of depending on call-site constants agreeing
+        # (the walkthrough takeover loop was exactly that disagreement).
+        self._claim_lease_seconds = max(LEASE_SECONDS, invoke_budget_seconds + LEASE_MARGIN_SECONDS)
         self._shutdown = asyncio.Event()
         # Compiled once: the graph is pure and deterministic, so the same
         # compiled kernel serves every claim (per ADR-0001 LangGraph is the
@@ -130,7 +159,7 @@ class RuntimeWorker:
             worker_id=self._worker_id,
             runtime_build_hash=self._runtime_build_hash,
             tenant_id=self._tenant_id,
-            lease_seconds=LEASE_SECONDS,
+            lease_seconds=self._claim_lease_seconds,
         )
         if claim is None:
             return False
@@ -159,7 +188,7 @@ class RuntimeWorker:
         now = datetime.now(UTC)
         remaining = claim.lease_until - now
         if remaining < timedelta(seconds=LEASE_MARGIN_SECONDS + self._invoke_budget_seconds):
-            claim = await self._driver.heartbeat(claim, lease_seconds=LEASE_SECONDS)
+            claim = await self._driver.heartbeat(claim, lease_seconds=self._claim_lease_seconds)
 
         try:
             invoke_started = perf_counter()
@@ -356,6 +385,11 @@ class RuntimeWorker:
         await self._write_checkpoint(claim, dict(terminal))
         occurred = datetime.now(UTC)
         report = terminal.get("report", {})
+        answer_text = report.get("answer")
+        # Exact-type check before the emit seam: a coerced str() here would
+        # let a malformed checkpoint value masquerade as a gated answer.
+        if type(answer_text) is not str or not answer_text:
+            raise ValueError("terminal asset-risk report must carry the gated answer text")
         asset_view = terminal["asset_view"]
         asset_provenance = terminal["asset_provenance"]
         # The accepted, checkpointed typed read view becomes a runtime fact in
@@ -373,6 +407,15 @@ class RuntimeWorker:
                 source_ref=str(asset_provenance["source_ref"]),
                 result_hash=str(asset_provenance["result_content_hash"]),
                 item_count=len(asset_view["assets"]),
+                occurred_at=occurred,
+            ),
+            # The gated typed answer becomes one run-visible assistant
+            # message (started/deltas/completed facts) so the UI projection
+            # can present the report text with its content hash (WS-7).
+            *build_answer_message_emit_requests(
+                run_id=claim.run_id,
+                command_seq=claim.command_seq,
+                answer=answer_text,
                 occurred_at=occurred,
             ),
             build_node_executed_emit_request(
@@ -462,7 +505,7 @@ class RuntimeWorker:
         input source, which is the bounded physical re-read path.
         """
 
-        conninfo = self._database_url.replace("postgresql+asyncpg://", "postgresql://")
+        conninfo = _psycopg_conninfo(self._database_url)
         async with await psycopg.AsyncConnection.connect(conninfo=conninfo) as connection:
             config = RunnableConfig(configurable={"thread_id": str(claim.run_id), "checkpoint_ns": ""})
             saver = FencedPostgresSaver(connection, claim)
@@ -476,7 +519,7 @@ class RuntimeWorker:
 
     async def _write_checkpoint(self, claim: ExecutionClaim, state: Mapping[str, object]) -> None:
         """Write one physical checkpoint through the production fenced saver."""
-        conninfo = self._database_url.replace("postgresql+asyncpg://", "postgresql://")
+        conninfo = _psycopg_conninfo(self._database_url)
         async with await psycopg.AsyncConnection.connect(conninfo=conninfo) as connection:
             checkpoint = empty_checkpoint()
             versions: ChannelVersions = {k: str(v) for k, v in state.items()}
@@ -509,6 +552,7 @@ async def run_worker(
     inference_request_factory: InferenceRequestFactory | None = None,
     asset_risk_kernel: AssetRiskKernel | None = None,
     poll_interval: float = POLL_INTERVAL_SECONDS,
+    invoke_budget_seconds: float = TOTAL_BUDGET_SECONDS,
 ) -> None:
     """Run a bounded worker loop until SIGTERM/SIGINT."""
     worker = RuntimeWorker(
@@ -521,6 +565,7 @@ async def run_worker(
         inference_request_factory=inference_request_factory,
         asset_risk_kernel=asset_risk_kernel,
         poll_interval=poll_interval,
+        invoke_budget_seconds=invoke_budget_seconds,
     )
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):

@@ -79,7 +79,7 @@ def test_ws3_function_contract_uses_complete_schema_identity_keys() -> None:
         for key, value in WS3_SCHEMA_CONTRACT["function_acl"].items()
         if "_internal(" in key
     )
-    assert WS3_SCHEMA_CONTRACT_VERSION == "ws3-execution-authority-v9"
+    assert WS3_SCHEMA_CONTRACT_VERSION == "ws3-execution-authority-v10"
     assert set(WS3_SCHEMA_CONTRACT["authority_relations"]) == {
         "public.asset_risk_asset_state",
         "public.tenant",
@@ -342,7 +342,7 @@ def test_workspace_manifest_has_no_absolute_path_and_missing_lock_fails(tmp_path
     root = Path.cwd()
     generated = build_manifest_from_workspace(root)
     assert verify_manifest(generated, root=root)
-    assert generated["migration"]["head"] == "ws6_domain_view_runtime_event"
+    assert generated["migration"]["head"] == "ws7_message_emit_allowlist"
     assert str(root) not in canonical_bytes(generated).decode()
     assert verify_manifest(RuntimeBuildManifest.model_validate(generated), root=root)
     with pytest.raises(ManifestError, match="uv.lock"):

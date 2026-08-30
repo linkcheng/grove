@@ -200,3 +200,140 @@ class TestProjectionMapping:
         assert meta.contract_name == "ui.projection"
         assert meta.contract_version == "v1"
         assert meta.tenant_id == "tenant-a"
+
+
+class TestAnswerMessageFacts:
+    def test_builder_chunks_deltas_and_hashes_content(self) -> None:
+        import hashlib
+
+        from app.observation.facts import (
+            ANSWER_MESSAGE_CHUNK_CHARS,
+            MESSAGE_COMPLETED_SCHEMA_REF,
+            MESSAGE_DELTA_SCHEMA_REF,
+            MESSAGE_STARTED_SCHEMA_REF,
+            build_answer_message_emit_requests,
+        )
+
+        answer = "评" * (ANSWER_MESSAGE_CHUNK_CHARS * 2 + 17)
+        occurred = datetime.now(UTC)
+        requests = build_answer_message_emit_requests(run_id=RUN_ID, command_seq=0, answer=answer, occurred_at=occurred)
+        assert [request.event_type for request in requests] == [
+            "message.started",
+            "message.delta",
+            "message.delta",
+            "message.delta",
+            "message.completed",
+        ]
+        assert [request.payload_schema_ref for request in requests] == [
+            MESSAGE_STARTED_SCHEMA_REF,
+            MESSAGE_DELTA_SCHEMA_REF,
+            MESSAGE_DELTA_SCHEMA_REF,
+            MESSAGE_DELTA_SCHEMA_REF,
+            MESSAGE_COMPLETED_SCHEMA_REF,
+        ]
+        message_ids = {request.payload.message_id for request in requests}  # type: ignore[attr-defined]
+        assert len(message_ids) == 1
+        deltas = [request.payload for request in requests[1:-1]]
+        assert "".join(delta.safe_delta for delta in deltas) == answer  # type: ignore[attr-defined]
+        assert [delta.delta_seq for delta in deltas] == [0, 1, 2]  # type: ignore[attr-defined]
+        completed = requests[-1].payload
+        assert completed.last_delta_seq == 2  # type: ignore[attr-defined]
+        assert completed.content_hash == hashlib.sha256(answer.encode("utf-8")).hexdigest()  # type: ignore[attr-defined]
+        assert len({request.source_event_id for request in requests}) == len(requests)
+
+    def test_builder_rejects_empty_or_non_string_answer(self) -> None:
+        from app.observation.facts import build_answer_message_emit_requests
+
+        for bad in ("", "  ", b"bytes", 123):
+            with pytest.raises(ValueError):
+                build_answer_message_emit_requests(
+                    run_id=RUN_ID,
+                    command_seq=0,
+                    answer=bad,  # type: ignore[arg-type]
+                    occurred_at=datetime.now(UTC),
+                )
+
+    def test_message_payloads_materialise_through_the_closed_registry(self) -> None:
+        from app.observation.facts import (
+            MESSAGE_COMPLETED_SCHEMA_REF,
+            MESSAGE_DELTA_SCHEMA_REF,
+            MESSAGE_STARTED_SCHEMA_REF,
+            MessageCompletedPayload,
+            MessageDeltaPayload,
+            MessageStartedPayload,
+        )
+
+        started = parse_runtime_payload(
+            MESSAGE_STARTED_SCHEMA_REF,
+            {
+                "kind": "message_started",
+                "run_id": str(RUN_ID),
+                "message_id": str(uuid4()),
+                "content_schema_ref": "text.plain@1",
+            },
+        )
+        assert isinstance(started, MessageStartedPayload) and started.kind == "message_started"
+        delta = parse_runtime_payload(
+            MESSAGE_DELTA_SCHEMA_REF,
+            {
+                "kind": "message_delta",
+                "run_id": str(RUN_ID),
+                "message_id": str(uuid4()),
+                "delta_seq": 0,
+                "safe_delta": "正文",
+            },
+        )
+        assert isinstance(delta, MessageDeltaPayload) and delta.safe_delta == "正文"
+        completed = parse_runtime_payload(
+            MESSAGE_COMPLETED_SCHEMA_REF,
+            {
+                "kind": "message_completed",
+                "run_id": str(RUN_ID),
+                "message_id": str(uuid4()),
+                "last_delta_seq": 0,
+                "content_hash": "0" * 64,
+            },
+        )
+        assert isinstance(completed, MessageCompletedPayload) and completed.content_hash == "0" * 64
+
+    def test_ui_mappers_rename_and_preserve_content(self) -> None:
+        from app.observation.facts import (
+            MessageCompletedPayload,
+            MessageDeltaPayload,
+            MessageStartedPayload,
+            message_completed_to_ui,
+            message_delta_to_ui,
+            message_started_to_ui,
+        )
+
+        message_id = uuid4()
+        started = message_started_to_ui(
+            MessageStartedPayload(
+                kind="message_started",
+                run_id=RUN_ID,
+                message_id=message_id,
+                content_schema_ref="text.plain@1",
+            )
+        )
+        assert started.owner_run_id == RUN_ID
+        assert started.role == "assistant"
+        delta = message_delta_to_ui(
+            MessageDeltaPayload(
+                kind="message_delta",
+                run_id=RUN_ID,
+                message_id=message_id,
+                delta_seq=1,
+                safe_delta="文本",
+            )
+        )
+        assert delta.safe_delta == "文本" and delta.delta_seq == 1
+        completed = message_completed_to_ui(
+            MessageCompletedPayload(
+                kind="message_completed",
+                run_id=RUN_ID,
+                message_id=message_id,
+                last_delta_seq=1,
+                content_hash="0" * 64,
+            )
+        )
+        assert completed.content_hash == "0" * 64 and completed.artifact_ref is None

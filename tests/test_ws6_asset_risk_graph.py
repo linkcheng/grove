@@ -21,6 +21,7 @@ from app.contracts.canonical import (
     RetryOwner,
 )
 from app.knowledge.port import KnowledgeOutcome
+from tests.asset_risk_answer_fixture import GATE_PASSING_FIXTURE_ANSWER
 
 RUN_ID = uuid4()
 TENANT = "tenant-a"
@@ -218,7 +219,7 @@ async def test_inference_request_carries_the_skill_instruction_not_the_g2_sentin
                     canonical.meta, contract_name="canonical.inference.result", causation_id=canonical.meta.message_id
                 ),
                 inference_request_id=canonical.inference_request_id,
-                result=StructuredInferenceOutput(answer="ok"),
+                result=StructuredInferenceOutput(answer=GATE_PASSING_FIXTURE_ANSWER),
                 model_ref="model@2026",
                 usage=ModelUsage(input_tokens=1, output_tokens=1, cost_micros=1),
                 provider_attempts=1,
@@ -228,7 +229,7 @@ async def test_inference_request_carries_the_skill_instruction_not_the_g2_sentin
 
     caller = make_asset_risk_infer_caller(cast(Any, _CapturingPort()), make_inference_request_factory(_manifest()))
     answer = await caller("tenant-a", uuid4(), '{"assets": []}')
-    assert answer == {"answer": "ok"}
+    assert answer is not None and len(answer["answer"]) >= 80
     request = captured["request"]
     contents = [item.content for item in request.instructions]
     assert ASSET_RISK_INSTRUCTION in contents

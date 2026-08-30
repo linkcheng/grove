@@ -11,11 +11,12 @@ API, and the pure mapping from a runtime lifecycle fact to a typed
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, TypeVar
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
@@ -24,6 +25,9 @@ from app.contracts.canonical import (
     CanonicalModel,
     ContractMeta,
     DomainViewAccepted,
+    MessageCompleted,
+    MessageDelta,
+    MessageStarted,
     RunStatusChanged,
 )
 
@@ -51,6 +55,9 @@ RUN_LIFECYCLE_SCHEMA_REF = "grove.runtime.run-lifecycle.v1"
 NODE_EXECUTED_SCHEMA_REF = "grove.runtime.node-executed.v1"
 EXECUTION_AUDIT_SCHEMA_REF = "grove.runtime.execution-audit.v1"
 DOMAIN_VIEW_ACCEPTED_SCHEMA_REF = "grove.runtime.domain-view-accepted.v1"
+MESSAGE_STARTED_SCHEMA_REF = "grove.runtime.message-started.v1"
+MESSAGE_DELTA_SCHEMA_REF = "grove.runtime.message-delta.v1"
+MESSAGE_COMPLETED_SCHEMA_REF = "grove.runtime.message-completed.v1"
 
 RUNTIME_WORKER_SOURCE: Literal["grove.runtime_worker"] = "grove.runtime_worker"
 API_COMMAND_SOURCE: Literal["grove.api.command"] = "grove.api.command"
@@ -79,6 +86,9 @@ KNOWN_RUNTIME_PAYLOAD_SCHEMAS: frozenset[str] = frozenset(
         NODE_EXECUTED_SCHEMA_REF,
         EXECUTION_AUDIT_SCHEMA_REF,
         DOMAIN_VIEW_ACCEPTED_SCHEMA_REF,
+        MESSAGE_STARTED_SCHEMA_REF,
+        MESSAGE_DELTA_SCHEMA_REF,
+        MESSAGE_COMPLETED_SCHEMA_REF,
     }
 )
 
@@ -148,6 +158,42 @@ class DomainViewAcceptedPayload(CanonicalModel):
         return value.astimezone(UTC)
 
 
+class MessageStartedPayload(CanonicalModel):
+    """One run-visible message opened by the runtime (e.g. the typed answer).
+
+    The worker emits the message fact family when a run reaches a terminal
+    typed report; the projection maps it to the UI ``message_*`` payloads.
+    The delta text is the already-gated public surface -- never SQL, tool
+    payloads or provider metadata.
+    """
+
+    kind: Literal["message_started"]
+    run_id: UUID
+    message_id: UUID
+    role: Literal["assistant"] = "assistant"
+    content_schema_ref: str = Field(min_length=1, max_length=256)
+
+
+class MessageDeltaPayload(CanonicalModel):
+    """One ordered, bounded text delta of a run-visible message."""
+
+    kind: Literal["message_delta"]
+    run_id: UUID
+    message_id: UUID
+    delta_seq: int = Field(ge=0)
+    safe_delta: str = Field(min_length=1, max_length=8192)
+
+
+class MessageCompletedPayload(CanonicalModel):
+    """The content-addressed completion marker of a run-visible message."""
+
+    kind: Literal["message_completed"]
+    run_id: UUID
+    message_id: UUID
+    last_delta_seq: int = Field(ge=0)
+    content_hash: str = Field(pattern=SHA256_PATTERN)
+
+
 # Registry of the only schema refs the projection may materialise.  An unknown
 # ref never reaches a Python payload model; the projection dead-letters it.
 RUNTIME_PAYLOAD_REGISTRY: Mapping[str, type[CanonicalModel]] = {
@@ -155,6 +201,9 @@ RUNTIME_PAYLOAD_REGISTRY: Mapping[str, type[CanonicalModel]] = {
     NODE_EXECUTED_SCHEMA_REF: NodeExecutedPayload,
     EXECUTION_AUDIT_SCHEMA_REF: ExecutionAuditPayload,
     DOMAIN_VIEW_ACCEPTED_SCHEMA_REF: DomainViewAcceptedPayload,
+    MESSAGE_STARTED_SCHEMA_REF: MessageStartedPayload,
+    MESSAGE_DELTA_SCHEMA_REF: MessageDeltaPayload,
+    MESSAGE_COMPLETED_SCHEMA_REF: MessageCompletedPayload,
 }
 
 
@@ -364,6 +413,84 @@ def build_domain_view_emit_request(
     )
 
 
+# One run-visible answer message is chunked into bounded deltas so a single
+# fact stays far below MAX_RUNTIME_EVENT_BYTES even for long assessments.
+ANSWER_MESSAGE_CHUNK_CHARS = 4096
+ANSWER_MESSAGE_CONTENT_SCHEMA_REF = "text.plain@1"
+
+
+def build_answer_message_emit_requests(
+    *,
+    run_id: UUID,
+    command_seq: int,
+    answer: str,
+    occurred_at: datetime,
+) -> list[EmitEventRequest]:
+    """Build the started/deltas/completed fact family for the typed answer.
+
+    ``answer`` must already have passed the runtime structural gate; this
+    builder only chunks and content-addresses it.  The completion marker
+    hashes the exact concatenated delta text so the UI can verify assembly.
+    """
+
+    if type(answer) is not str or not answer:
+        raise ValueError("answer must be a non-empty exact str")
+    chunks = [
+        answer[index : index + ANSWER_MESSAGE_CHUNK_CHARS]
+        for index in range(0, len(answer), ANSWER_MESSAGE_CHUNK_CHARS)
+    ]
+    message_id = uuid5(NAMESPACE_URL, f"grove:answer-message:{run_id}:{command_seq}")
+    requests = [
+        EmitEventRequest(
+            event_type="message.started",
+            source=RUNTIME_WORKER_SOURCE,
+            source_event_id=derive_source_event_id(run_id, command_seq, "message.started", 0),
+            payload_schema_ref=MESSAGE_STARTED_SCHEMA_REF,
+            payload=MessageStartedPayload(
+                kind="message_started",
+                run_id=run_id,
+                message_id=message_id,
+                content_schema_ref=ANSWER_MESSAGE_CONTENT_SCHEMA_REF,
+            ),
+            occurred_at=occurred_at,
+        )
+    ]
+    for delta_seq, chunk in enumerate(chunks):
+        requests.append(
+            EmitEventRequest(
+                event_type="message.delta",
+                source=RUNTIME_WORKER_SOURCE,
+                source_event_id=derive_source_event_id(run_id, command_seq, "message.delta", delta_seq),
+                payload_schema_ref=MESSAGE_DELTA_SCHEMA_REF,
+                payload=MessageDeltaPayload(
+                    kind="message_delta",
+                    run_id=run_id,
+                    message_id=message_id,
+                    delta_seq=delta_seq,
+                    safe_delta=chunk,
+                ),
+                occurred_at=occurred_at,
+            )
+        )
+    requests.append(
+        EmitEventRequest(
+            event_type="message.completed",
+            source=RUNTIME_WORKER_SOURCE,
+            source_event_id=derive_source_event_id(run_id, command_seq, "message.completed", 0),
+            payload_schema_ref=MESSAGE_COMPLETED_SCHEMA_REF,
+            payload=MessageCompletedPayload(
+                kind="message_completed",
+                run_id=run_id,
+                message_id=message_id,
+                last_delta_seq=len(chunks) - 1,
+                content_hash=hashlib.sha256("".join(chunks).encode("utf-8")).hexdigest(),
+            ),
+            occurred_at=occurred_at,
+        )
+    )
+    return requests
+
+
 # ---------------------------------------------------------------------------
 # Pure projection mapping: runtime lifecycle fact -> typed UI projection.
 # ---------------------------------------------------------------------------
@@ -418,6 +545,41 @@ def domain_view_to_ui_accepted(payload: DomainViewAcceptedPayload) -> DomainView
         source_ref=payload.source_ref,
         result_hash=payload.result_hash,
         item_count=payload.item_count,
+    )
+
+
+def message_started_to_ui(payload: MessageStartedPayload) -> MessageStarted:
+    """Map a runtime message-started fact to the typed UI projection payload."""
+
+    return MessageStarted(
+        kind="message_started",
+        message_id=payload.message_id,
+        owner_run_id=payload.run_id,
+        role=payload.role,
+        content_schema_ref=payload.content_schema_ref,
+    )
+
+
+def message_delta_to_ui(payload: MessageDeltaPayload) -> MessageDelta:
+    """Map a runtime message-delta fact to the typed UI projection payload."""
+
+    return MessageDelta(
+        kind="message_delta",
+        message_id=payload.message_id,
+        delta_seq=payload.delta_seq,
+        safe_delta=payload.safe_delta,
+    )
+
+
+def message_completed_to_ui(payload: MessageCompletedPayload) -> MessageCompleted:
+    """Map a runtime message-completed fact to the typed UI projection payload."""
+
+    return MessageCompleted(
+        kind="message_completed",
+        message_id=payload.message_id,
+        last_delta_seq=payload.last_delta_seq,
+        content_hash=payload.content_hash,
+        artifact_ref=None,
     )
 
 

@@ -15,7 +15,7 @@
 | WS-4 | Observation Slice | accepted | implemented | WS-3 | 建立不反压运行时的 event/audit、可重建投影、SSE/Inspect 与最小可运维观测闭环 | [任务书](docs/work-packages/WS-4-observation-slice.md) |
 | WS-5 | Core Release Proof | accepted | verified | WS-4 | MVP 收窄版（2026-08-20）：冻结 MVP-ready Core build——production inference seam、本地签发工具与 clean source `release-check`；完整发布证明移至 WS-7 前置。收窄版退出条件 2026-08-20 满足，`verified` 由负责人 2026-08-26 批准（不形成 Core/Product release 结论，完整发布义务在 WS-7 前置） | [任务书](docs/work-packages/WS-5-core-release-proof.md) |
 | WS-6 | Selected Profile E2E | accepted | implemented | WS-5 | Asset Risk Reference（`business-profile.asset-risk@1`）端到端闭环达成：图内真实推理（M1）、gateway 认证、domain-view 全链、typed renderer、golden dataset + 容量 closing record（81）、G3 门控 E2E（Skill 自有指令 + glm-5.3-flash 基线）；human review 按负责人 2026-08-26 批准通过（模型输出稳定性记为已知限制）；M4=implemented，`verified` 待负责人显式批准 | [任务书](docs/work-packages/WS-6-selected-profile-e2e.md) |
-| WS-7 | MVP Functional Completion | draft | not_started | WS-6 | 让 Asset Risk Profile 达到真实可用的 MVP 功能质量：输出稳定性根治、UI 功能补齐、部署可用性、负责人手工走查；不形成 production release 结论 | [任务书](docs/work-packages/WS-7-mvp-functional-completion.md) |
+| WS-7 | MVP Functional Completion | accepted | implemented | WS-6 | 让 Asset Risk Profile 达到真实可用的 MVP 功能质量：输出稳定性根治、UI 功能补齐、部署可用性、负责人手工走查；不形成 production release 结论。2026-08-30 负责人走查通过（含 glm-5.3-flash 多模态机器预筛 6/6）并授权合并；稳定性 Exit Invariant 1 按字面口径成立（四轮零垃圾泄漏），严格成功率口径与 json_object 接线移交 WS-8 | [任务书](docs/work-packages/WS-7-mvp-functional-completion.md) |
 | WS-8 | Production Release Proof | draft | not_started | WS-7 | 承接原 WS-7 的安全/性能/发布治理义务：G4 安全全矩阵、PITR 全矩阵、Role 故障/扩缩容矩阵、30 天等效容量、POC-H Evaluation/Publication、外部 issuer ceremony、Core/Product IAR、bounded rollout/rollback | — |
 
 ## Status Rules

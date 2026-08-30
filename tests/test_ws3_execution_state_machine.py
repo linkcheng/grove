@@ -377,3 +377,14 @@ async def test_fixture_clock_cannot_rollback_an_expired_claim() -> None:
         driver.advance_time(-6)
     with pytest.raises(ExecutionDriverError):
         await driver.heartbeat(claim)
+
+
+def test_ws7_lease_cap_is_300_seconds_in_both_enforcement_modules() -> None:
+    # Owner-approved WS-7 raise (2026-08-26): real LLM generation latency
+    # regularly exceeds the previous 90s cap, which blocked functional
+    # validation.  The correctness invariant (invoke budget strictly below
+    # lease minus margin) is unchanged; only the ceiling moves.
+    from app.execution.postgres import MAX_LEASE_SECONDS as postgres_cap
+
+    assert state_machine.MAX_LEASE_SECONDS == 300.0
+    assert postgres_cap == 300.0

@@ -246,3 +246,38 @@ WS-3 Durable Execution 与 WS-4 Observation Slice 均无未关闭的实现阻塞
 - 本记录关闭 2026-08-20 的构建网络阻塞条目与 6.B.3 的 integration 补跑义务；WS-6 B 线
   （gateway 认证 + 真实 principal 全量联测）至此完整落地。不形成 G3、Core/Product
   release 结论。
+
+## WS-7 已知功能债（2026-08-27，按任务书 Exit Invariant 4 记录）
+
+无未关闭阻塞；以下为本包未消化、显式移交 WS-8 或后续的项：
+
+1. **提交面无按次资产组合选择**：评估范围是租户当前 `asset_risk_asset_state`
+   全量（≤16 条），组合由运维种子 SQL 维护。任务书"资产组合选择 + 预览"降级
+   为"Run 视图展示实际固定的组合"；真正的按次选择需要扩展 intent 契约与
+   graph 输入源，超出本包"先最小"边界。
+2. **答案消息事实族是新增公共契约面**：`message.started/delta/completed`
+   runtime facts + 投影分支为呈现 typed report 而新增；未做的硬化（reducer
+   侧 content 校验、消息事件的重放/幂等测试矩阵）移交 WS-8。
+3. **E2E 预算常量无机制同步**：`invoke_budget_seconds`（200s）与
+   `lease_seconds`（240s）的"预算 < 租约 − margin"关系目前靠数值成立与
+   注释维护，无自动断言。
+4. **gate 阈值与指令阈值不同源**：`MIN_ANSWER_CHARS=80`（结构下限）与指令
+   中"不少于 200 字"（质量目标）有意分离；若负责人定稿不同阈值需同步两处。
+5. **网关限流窗口影响稳定性验收**：连续真机生成会触发 provider 侧
+   transient 限流（第一轮探针第 7 轮起全部 `provider_transient`）；探针已
+   加 `--pause-seconds` 节流，但网关侧配额特性未表征（属 WS-8 性能矩阵）。
+6. **Exit Invariant 1 的量化口径待负责人定夺**（四轮探针，2026-08-27/29）：
+   30 run/轮的 passed_gate 分布为 17 → 29 → 29 → 22，全程结构 gate 零泄漏
+   （无空/乱码/格式泄漏文本到达任何用户）。按不变量字面（"无垃圾到达
+   用户"）四轮全部成立；按"每轮都产出通过校验的好答案"的严格口径最好
+   29/30。剩余失败类集中于 `invalid_result`（模型输出在纠正性重试后仍
+   不可解析）——波动随网关时段变化，根治方向是网关唯一真实的
+   `json_object` 模式接线（adapter + 签发选项扩展），已列入 WS-8 草案
+   范围输入。证据：`ci-evidence/ws7-stability-probe.json`（每轮覆盖）。
+   **裁定（2026-08-30）**：负责人走查通过并授权合并，Exit Invariant 1 按
+   字面口径记为成立；严格成功率口径与 json_object 接线不阻塞本包，随
+   WS-8 处理。
+7. **走查 UX：UI 不展示评估题目与组合输入**（2026-08-30 走查发现）：
+   验收者无法从界面自足判断答案业务质量，需外部判卷标准（组合种子 +
+   冻结政策 + 检查项）。Run 视图展示的是已固定组合的 milestone，但输入
+   侧不可见；属 WS-8 UX 范围输入。

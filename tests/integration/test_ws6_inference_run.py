@@ -374,10 +374,13 @@ async def test_real_asset_risk_run_completes_the_reference_loop() -> None:
                 database_url=RUNTIME_URL.replace("postgresql+psycopg://", "postgresql+asyncpg://"),
                 asset_risk_kernel=kernel,
                 poll_interval=0.01,
-                invoke_budget_seconds=75.0,
+                # The runtime gate may spend 1 + max_schema_retries full
+                # generations (flash chain: 3), so the invoke budget spans
+                # the worst case and the lease keeps its margin (WS-7).
+                invoke_budget_seconds=200.0,
             )
             claim = await driver.claim(
-                worker_id="ar-e2e-worker", runtime_build_hash=BUILD_HASH, tenant_id=tenant, lease_seconds=90.0
+                worker_id="ar-e2e-worker", runtime_build_hash=BUILD_HASH, tenant_id=tenant, lease_seconds=240.0
             )
             assert claim is not None
             assert claim.graph_binding.graph_ref == "graph.asset-risk@1"

@@ -37,6 +37,8 @@ def check(root: Path, database_url: str) -> None:
         "ws6_claim_graph_binding",
         "ws6_asset_risk_state",
         "ws6_domain_view_runtime_event",
+        "ws7_lease_cap_300",
+        "ws7_message_emit_allowlist",
     }
     if expected_head not in _WS3_PREFLIGHT_HEADS:
         raise WS3PreflightError(

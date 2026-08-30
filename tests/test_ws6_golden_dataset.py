@@ -37,6 +37,7 @@ from app.contracts.canonical import (
 )
 from app.knowledge.port import KnowledgeOutcome
 from app.worker.inference import make_inference_request_factory
+from tests.asset_risk_answer_fixture import GATE_PASSING_FIXTURE_ANSWER
 from tests.inference.test_pydantic_ai_adapter import _manifest
 
 
@@ -135,7 +136,7 @@ class _FixturePort:
                 request.meta, contract_name="canonical.inference.result", causation_id=request.meta.message_id
             ),
             inference_request_id=request.inference_request_id,
-            result=StructuredInferenceOutput(answer="golden fixture answer"),
+            result=StructuredInferenceOutput(answer=GATE_PASSING_FIXTURE_ANSWER),
             model_ref="model@2026",
             usage=ModelUsage(input_tokens=1, output_tokens=1, cost_micros=1),
             provider_attempts=1,

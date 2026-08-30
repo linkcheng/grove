@@ -19,9 +19,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from time import perf_counter
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 from uuid import UUID
 
 from sqlalchemy import text
@@ -32,14 +33,26 @@ from app.core.telemetry import default_recorder, record_operation
 from app.observation.facts import (
     DOMAIN_VIEW_ACCEPTED_SCHEMA_REF,
     EXECUTION_AUDIT_SCHEMA_REF,
+    MESSAGE_COMPLETED_SCHEMA_REF,
+    MESSAGE_DELTA_SCHEMA_REF,
+    MESSAGE_STARTED_SCHEMA_REF,
     NODE_EXECUTED_SCHEMA_REF,
     RUN_LIFECYCLE_SCHEMA_REF,
     UI_DOMAIN_VIEW_SCHEMA_REF,
+    UI_MESSAGE_COMPLETED_SCHEMA_REF,
+    UI_MESSAGE_DELTA_SCHEMA_REF,
+    UI_MESSAGE_STARTED_SCHEMA_REF,
     DomainViewAcceptedPayload,
+    MessageCompletedPayload,
+    MessageDeltaPayload,
+    MessageStartedPayload,
     RunLifecyclePayload,
     build_ui_projection_meta,
     domain_view_to_ui_accepted,
     lifecycle_to_run_status_changed,
+    message_completed_to_ui,
+    message_delta_to_ui,
+    message_started_to_ui,
     parse_runtime_payload,
 )
 
@@ -50,6 +63,8 @@ BATCH_SIZE = 100
 UI_TARGET_KIND: Literal["run", "orchestration"] = "run"
 UI_SCHEMA_REF = "grove.ui.run-status-changed.v1"
 _AUDIT_ONLY_SCHEMAS = frozenset({NODE_EXECUTED_SCHEMA_REF, EXECUTION_AUDIT_SCHEMA_REF})
+
+_MessagePayloadT = TypeVar("_MessagePayloadT", bound=CanonicalModel)
 
 
 class ProjectionShutdown(Exception):
@@ -253,6 +268,57 @@ class ProjectionReconciler:
                 causation_id=causation_id,
                 trace_id=trace_id,
             )
+        elif schema_ref == MESSAGE_STARTED_SCHEMA_REF:
+            await self._project_message(
+                session,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                event_id=event_id,
+                run_seq=run_seq,
+                schema_ref=schema_ref,
+                ui_schema_ref=UI_MESSAGE_STARTED_SCHEMA_REF,
+                payload_model=MessageStartedPayload,
+                mapper=message_started_to_ui,
+                payload=payload,
+                occurred_at=occurred_at,
+                correlation_id=correlation_id,
+                causation_id=causation_id,
+                trace_id=trace_id,
+            )
+        elif schema_ref == MESSAGE_DELTA_SCHEMA_REF:
+            await self._project_message(
+                session,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                event_id=event_id,
+                run_seq=run_seq,
+                schema_ref=schema_ref,
+                ui_schema_ref=UI_MESSAGE_DELTA_SCHEMA_REF,
+                payload_model=MessageDeltaPayload,
+                mapper=message_delta_to_ui,
+                payload=payload,
+                occurred_at=occurred_at,
+                correlation_id=correlation_id,
+                causation_id=causation_id,
+                trace_id=trace_id,
+            )
+        elif schema_ref == MESSAGE_COMPLETED_SCHEMA_REF:
+            await self._project_message(
+                session,
+                tenant_id=tenant_id,
+                run_id=run_id,
+                event_id=event_id,
+                run_seq=run_seq,
+                schema_ref=schema_ref,
+                ui_schema_ref=UI_MESSAGE_COMPLETED_SCHEMA_REF,
+                payload_model=MessageCompletedPayload,
+                mapper=message_completed_to_ui,
+                payload=payload,
+                occurred_at=occurred_at,
+                correlation_id=correlation_id,
+                causation_id=causation_id,
+                trace_id=trace_id,
+            )
         elif schema_ref in _AUDIT_ONLY_SCHEMAS:
             pass
         else:
@@ -328,6 +394,41 @@ class ProjectionReconciler:
             run_seq=run_seq,
             ui_schema_ref=UI_DOMAIN_VIEW_SCHEMA_REF,
             ui_payload=domain_view_to_ui_accepted(parsed),
+            source_hash=canonical_hash(parsed),
+            occurred_at=occurred_at,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            trace_id=trace_id,
+        )
+
+    async def _project_message(
+        self,
+        session: AsyncSession,
+        *,
+        tenant_id: str,
+        run_id: UUID,
+        event_id: UUID,
+        run_seq: int,
+        schema_ref: str,
+        ui_schema_ref: str,
+        payload_model: type[_MessagePayloadT],
+        mapper: Callable[[_MessagePayloadT], CanonicalModel],
+        payload: Any,
+        occurred_at: datetime,
+        correlation_id: str,
+        causation_id: UUID,
+        trace_id: str,
+    ) -> None:
+        parsed = parse_runtime_payload(schema_ref, payload)
+        assert isinstance(parsed, payload_model)
+        await self._append_ui_projection(
+            session,
+            tenant_id=tenant_id,
+            run_id=run_id,
+            event_id=event_id,
+            run_seq=run_seq,
+            ui_schema_ref=ui_schema_ref,
+            ui_payload=mapper(parsed),
             source_hash=canonical_hash(parsed),
             occurred_at=occurred_at,
             correlation_id=correlation_id,

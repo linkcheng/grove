@@ -54,7 +54,10 @@ from app.execution.contracts import (
 )
 
 WAIT_KINDS = frozenset({"action_result", "child_result"})
-MAX_LEASE_SECONDS = 90.0
+# WS-7 (owner-approved 2026-08-26): raised from 90.0; keep in sync with
+# app.execution.postgres.MAX_LEASE_SECONDS and the SQL-side guard in
+# migration 0016 (grove_claim_run_command / *_internal wrappers).
+MAX_LEASE_SECONDS = 300.0
 VALID_RUN_STATUSES = frozenset(
     {
         "accepted",
